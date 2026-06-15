@@ -28,18 +28,20 @@ progress lives in `PROGRESS.md`. To get a future agent up to speed:
 
 ## Status
 
-See `PROGRESS.md` for the running log. Current: **Phase 1 (M0+M1) — DONE ✅.**
-A usable standalone SQLite-backed Markdown wiki — sidebar, editor, live preview,
-debounced autosave, persistence — verified on the running app and at the SQLite
-layer. On branch `phase-1-local-wiki` (unmerged; the pipeline stacks each phase
-branch and keeps `main` pristine). **Next: Phase 2 — File Provider projection.**
+See `PROGRESS.md` for the running log. Current: **Phase 2 (M2+M3) — DONE ✅.**
+The File Provider extension serves a read-only SQLite-backed filesystem
+projection (`pages/by-id`, `pages/by-title`) shared via the App Group container;
+`cat pages/by-title/Home--*.md` returns live SQLite content, verified from the
+live mount. On branch `phase-2-file-provider` (stacked on `phase-1-local-wiki`,
+unmerged; the pipeline stacks each phase branch and keeps `main` pristine).
+**Next: Phase 3 — Verify & stay fresh (the v0 ship gate).**
 
 ## Milestones (from `plans/INITIAL.md`)
 
 - **M0 — App skeleton** ✅ build environment + launching SwiftUI window.
 - **M1 — Markdown editor** ✅ sidebar page list, `TextEditor`, preview, autosave, SQLite persistence.
-- **M2 — File Provider domain** extension target, domain registration, static root + `README.md`.
-- **M3 — SQLite-backed page files** `pages/by-id`, `pages/by-title`, content from SQLite.
+- **M2 — File Provider domain** ✅ extension target, domain registration, static root + `README.md`.
+- **M3 — SQLite-backed page files** ✅ `pages/by-id`, `pages/by-title`, content from SQLite.
 - **M4 — Path button** `Copy Unix Path`, verification commands in-app.
 - **M5 — Change signaling** edits increment version; Terminal reads see updates.
 - **M6 — Agent launch** spawn agent with `WIKI_ROOT` env pointing at the projection.
