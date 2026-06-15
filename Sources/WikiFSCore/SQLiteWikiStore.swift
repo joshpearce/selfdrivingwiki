@@ -13,7 +13,7 @@ public final class SQLiteWikiStore: WikiStore {
 
     /// Open (creating if needed) the database at `databaseURL`.
     /// Tests inject a temp-dir or `:memory:` URL; the app injects
-    /// `DatabaseLocation.applicationSupportURL()`.
+    /// `DatabaseLocation.appGroupContainerURL()`.
     public init(databaseURL: URL) throws {
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
@@ -28,6 +28,40 @@ public final class SQLiteWikiStore: WikiStore {
         do {
             try configurePragmas()
             try bootstrapSchema()
+        } catch {
+            sqlite3_close(db)
+            throw error
+        }
+    }
+
+    /// Open the database at `readOnlyURL` as a **read-only** store, for the File
+    /// Provider extension. The extension opens a fresh, short-lived store per
+    /// request (INITIAL §10) and must never write or mutate schema.
+    ///
+    /// Design choice (orchestrator tightening): open a read-WRITE handle and set
+    /// `PRAGMA query_only=ON` rather than `SQLITE_OPEN_READONLY`. A pure
+    /// read-only connection to a WAL DB fails to attach/create the `-shm` when no
+    /// writer has set it up (e.g. the app is closed — relevant for Phase 4
+    /// agents). A same-user read-write handle robustly creates/attaches `-shm`,
+    /// and `query_only=ON` still rejects every write at the SQLite layer (the
+    /// File Provider read-only capabilities reject writes at the FS layer too).
+    /// We skip `bootstrapSchema()` and the WAL-mode assertion: this connection
+    /// must not author the DB, only read whatever the writer has produced.
+    public init(readOnlyURL: URL) throws {
+        var handle: OpaquePointer?
+        // No CREATE: a read-only consumer must never conjure an empty DB.
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+        let rc = sqlite3_open_v2(readOnlyURL.path, &handle, flags, nil)
+        guard rc == SQLITE_OK, let handle else {
+            let msg = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "rc \(rc)"
+            if let handle { sqlite3_close(handle) }
+            throw WikiStoreError.open(msg)
+        }
+        self.db = handle
+
+        do {
+            try exec("PRAGMA busy_timeout=5000;")
+            try exec("PRAGMA query_only=ON;")
         } catch {
             sqlite3_close(db)
             throw error
@@ -112,6 +146,31 @@ public final class SQLiteWikiStore: WikiStore {
                 id: PageID(rawValue: stmt.text(at: 0)),
                 title: stmt.text(at: 1),
                 updatedAt: Date(timeIntervalSince1970: stmt.double(at: 2))
+            ))
+        }
+        return out
+    }
+
+    /// All pages with full bodies, ordered by `id` (ULID == creation order).
+    /// Used by the File Provider projection to enumerate `pages/by-id` and
+    /// `pages/by-title` deterministically (INITIAL §6). Not on the `WikiStore`
+    /// protocol — it is a read-projection helper, not part of the editing API.
+    public func listAllPagesOrderedByID() throws -> [WikiPage] {
+        let stmt = try statement("""
+        SELECT id, title, slug, body_markdown, created_at, updated_at, version
+        FROM pages ORDER BY id ASC;
+        """)
+        defer { stmt.reset() }
+        var out: [WikiPage] = []
+        while try stmt.step() {
+            out.append(WikiPage(
+                id: PageID(rawValue: stmt.text(at: 0)),
+                title: stmt.text(at: 1),
+                slug: stmt.text(at: 2),
+                bodyMarkdown: stmt.text(at: 3),
+                createdAt: Date(timeIntervalSince1970: stmt.double(at: 4)),
+                updatedAt: Date(timeIntervalSince1970: stmt.double(at: 5)),
+                version: Int(stmt.int(at: 6))
             ))
         }
         return out

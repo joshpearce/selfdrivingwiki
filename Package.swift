@@ -30,6 +30,7 @@ let package = Package(
         // .appex bundle under WikiFS.app/Contents/PlugIns and signs it.
         .executableTarget(
             name: "WikiFSFileProvider",
+            dependencies: ["WikiFSCore"],
             path: "Sources/WikiFSFileProvider",
             linkerSettings: [
                 .linkedFramework("FileProvider"),

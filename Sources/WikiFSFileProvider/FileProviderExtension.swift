@@ -18,8 +18,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     func item(for identifier: NSFileProviderItemIdentifier,
               request: NSFileProviderRequest,
               completionHandler: @escaping (NSFileProviderItem?, Error?) -> Void) -> Progress {
-        if let item = Catalog.item(for: identifier) {
-            completionHandler(item, nil)
+        if let node = Projection.node(for: identifier) {
+            completionHandler(WikiFSItem(node: node), nil)
         } else {
             completionHandler(nil, noSuchItem)
         }
@@ -30,15 +30,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                        version requestedVersion: NSFileProviderItemVersion?,
                        request: NSFileProviderRequest,
                        completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void) -> Progress {
-        guard let data = Catalog.content(for: itemIdentifier),
-              let item = Catalog.item(for: itemIdentifier) else {
+        guard let data = Projection.contents(for: itemIdentifier),
+              let node = Projection.node(for: itemIdentifier) else {
             completionHandler(nil, nil, noSuchItem)
             return Progress()
         }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         do {
             try data.write(to: url)
-            completionHandler(url, item, nil)
+            completionHandler(url, WikiFSItem(node: node), nil)
         } catch {
             completionHandler(nil, nil, error)
         }

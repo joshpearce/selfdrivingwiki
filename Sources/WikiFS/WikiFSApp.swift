@@ -9,15 +9,24 @@ import WikiFSCore
 @main
 struct WikiFSApp: App {
     @State private var store: WikiStoreModel
+    @State private var fileProvider = FileProviderSpike()
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
-        // Fall back to an in-memory DB only if Application Support is somehow
+        // Phase 2: the DB lives in the App Group container so the sandboxed File
+        // Provider extension reads the same file. Migrate the Phase 1
+        // Application Support DB across once (best-effort), then open read-write.
+        // Fall back to an in-memory DB only if the container is somehow
         // unavailable, so the app still launches rather than crashing.
         let store: WikiStoreModel
         do {
-            let url = try DatabaseLocation.applicationSupportURL()
-            store = WikiStoreModel(store: try SQLiteWikiStore(databaseURL: url))
+            DatabaseLocation.migrateFromApplicationSupportIfNeeded()
+            let url = try DatabaseLocation.appGroupContainerURL()
+            let sqlite = try SQLiteWikiStore(databaseURL: url)
+            store = WikiStoreModel(store: sqlite)
+            // The projection is empty without at least one page; ensure a Home
+            // exists (covers the fresh-container / failed-migration path).
+            if store.summaries.isEmpty { store.newPage(title: "Home") }
         } catch {
             print("WikiFS: falling back to in-memory store: \(error)")
             // swiftlint:disable:next force_try
@@ -30,6 +39,7 @@ struct WikiFSApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(store: store)
+                .task { await fileProvider.registerIfNeeded() }
         }
         .windowToolbarStyle(.unified)
         .onChange(of: scenePhase) { _, phase in

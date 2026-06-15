@@ -1,44 +1,40 @@
 import FileProvider
 import UniformTypeIdentifiers
 
-/// Minimal read-only `NSFileProviderItem`. Everything the system needs to show
-/// a file/folder in the projection and decide when to re-fetch content.
+/// Read-only `NSFileProviderItem` backed by a resolved `ProjectedNode`.
+/// Everything the system needs to show a file/folder in the projection and
+/// decide when to re-fetch content. Static-but-correct versions so the FIRST
+/// read materializes the right bytes (dynamic change-signaling is Phase 3).
 final class WikiFSItem: NSObject, NSFileProviderItem {
-    let id: NSFileProviderItemIdentifier
-    let parent: NSFileProviderItemIdentifier
-    let name: String
-    let isFolder: Bool
-    let size: Int
+    private let node: ProjectedNode
 
-    init(id: NSFileProviderItemIdentifier, parent: NSFileProviderItemIdentifier,
-         name: String, isFolder: Bool, size: Int) {
-        self.id = id
-        self.parent = parent
-        self.name = name
-        self.isFolder = isFolder
-        self.size = size
+    init(node: ProjectedNode) {
+        self.node = node
     }
 
-    var itemIdentifier: NSFileProviderItemIdentifier { id }
-    var parentItemIdentifier: NSFileProviderItemIdentifier { parent }
-    var filename: String { name }
+    var itemIdentifier: NSFileProviderItemIdentifier { node.id }
+    var parentItemIdentifier: NSFileProviderItemIdentifier { node.parent }
+    var filename: String { node.name }
 
     var contentType: UTType {
-        if isFolder { return .folder }
-        if name.hasSuffix(".md") { return UTType(filenameExtension: "md") ?? .plainText }
+        if node.isFolder { return .folder }
+        if node.name.hasSuffix(".md") { return UTType(filenameExtension: "md") ?? .plainText }
         return .plainText
     }
 
     // Read-only: folders can be enumerated, files can be read. Nothing else.
     var capabilities: NSFileProviderItemCapabilities {
-        isFolder ? [.allowsReading, .allowsContentEnumerating] : .allowsReading
+        node.isFolder ? [.allowsReading, .allowsContentEnumerating] : .allowsReading
     }
 
-    var documentSize: NSNumber? { isFolder ? nil : NSNumber(value: size) }
+    // NEVER nil for files — a wrong/absent size truncates `cat`.
+    var documentSize: NSNumber? { node.isFolder ? nil : NSNumber(value: node.size) }
 
-    // Static content, so a constant version is fine. When SQLite backs this,
-    // contentVersion = page.version and metadataVersion = hash(title, mtime).
+    var creationDate: Date? { node.created }
+    var contentModificationDate: Date? { node.modified }
+
     var itemVersion: NSFileProviderItemVersion {
-        NSFileProviderItemVersion(contentVersion: Data("1".utf8), metadataVersion: Data("1".utf8))
+        NSFileProviderItemVersion(contentVersion: node.contentVersion,
+                                  metadataVersion: node.metadataVersion)
     }
 }
