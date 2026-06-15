@@ -28,13 +28,14 @@ progress lives in `PROGRESS.md`. To get a future agent up to speed:
 
 ## Status
 
-See `PROGRESS.md` for the running log. Current: **Phase 2 (M2+M3) — DONE ✅.**
-The File Provider extension serves a read-only SQLite-backed filesystem
-projection (`pages/by-id`, `pages/by-title`) shared via the App Group container;
-`cat pages/by-title/Home--*.md` returns live SQLite content, verified from the
-live mount. On branch `phase-2-file-provider` (stacked on `phase-1-local-wiki`,
-unmerged; the pipeline stacks each phase branch and keeps `main` pristine).
-**Next: Phase 3 — Verify & stay fresh (the v0 ship gate).**
+See `PROGRESS.md` for the running log. Current: **Phase 3 (M4+M5) — DONE ✅ —
+the v0 definition-of-done loop is proven.** `Copy Unix Path` → read in Terminal →
+edit in the app → re-read sees the update with no relaunch (verified live; the
+edit advanced the File Provider change token `1:5 → 1:6`). On branch
+`phase-3-verify-fresh` (stacked on `phase-2-file-provider`, unmerged; the
+pipeline stacks each phase branch and keeps `main` pristine). **Next: Phase 4 —
+Agent-facing wiki (manifest/JSONL indexes, `[[wiki-links]]`, `WIKI_ROOT`
+launcher) — the agent extension on top of v0.**
 
 ## Milestones (from `plans/INITIAL.md`)
 
@@ -42,8 +43,8 @@ unmerged; the pipeline stacks each phase branch and keeps `main` pristine).
 - **M1 — Markdown editor** ✅ sidebar page list, `TextEditor`, preview, autosave, SQLite persistence.
 - **M2 — File Provider domain** ✅ extension target, domain registration, static root + `README.md`.
 - **M3 — SQLite-backed page files** ✅ `pages/by-id`, `pages/by-title`, content from SQLite.
-- **M4 — Path button** `Copy Unix Path`, verification commands in-app.
-- **M5 — Change signaling** edits increment version; Terminal reads see updates.
+- **M4 — Path button** ✅ `Copy Unix Path`, verification commands in-app.
+- **M5 — Change signaling** ✅ edits increment version; Terminal reads see updates (no relaunch).
 - **M6 — Agent launch** spawn agent with `WIKI_ROOT` env pointing at the projection.
 
 ## Build quick reference
