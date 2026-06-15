@@ -2,6 +2,66 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-15 — Post-v0 feature: System-prompt document (CLAUDE.md / AGENTS.md) — code complete, gate pending
+
+A user-editable singleton "system prompt" document — the instructions the
+managing agent reads each run — projected **read-only at the wiki root under TWO
+names with identical bytes: `CLAUDE.md` and `AGENTS.md`** (the filenames CLI
+agents look for). Edited in-app like a page; read-only on the mount like
+everything else. Branch work stacked on the v0 + Phase-5 line.
+
+**User-chosen scope (locked):** in-app editing via a **pinned sidebar item**
+(above Pages) that opens the document in the main editor pane — i.e. a
+first-class document, not a sheet/settings window.
+
+**Added / changed**
+- **New singleton `system_prompt` table** (`id INTEGER PRIMARY KEY CHECK(id=1)`,
+  `body_markdown`, `updated_at`, `version`). `bootstrapSchema()` gains a stepwise
+  **v2→3 migration** that creates AND **seeds** the row with
+  `SystemPrompt.defaultBody`; existing v1/v2 DBs migrate forward with pages +
+  ingested files preserved (test-proven). `SystemPrompt` value type +
+  `defaultBody` live in `WikiFSCore` (shared by the migration seed and the
+  projection fallback).
+- **Store API** (`SQLiteWikiStore` + `WikiStore` protocol): `getSystemPrompt()`
+  (returns the seeded default if absent) and `updateSystemPrompt(body:)`
+  (**UPSERT**, `version = version + 1`).
+- **⚠️ `changeToken()` now folds in the system-prompt version** →
+  `"pCount:pSum:fCount:fSum:spVersion"`. Editing ONLY the prompt (no page/file
+  change) must still advance the sync anchor or the projected files would never
+  refresh. Resilient to the table being absent on a pre-v3 read connection
+  (→ `0`). All `changeToken` test literals gained the trailing `:1`.
+- **Projection**: `CLAUDE.md` + `AGENTS.md` as root-level files (new
+  `claude-md`/`agents-md` identities), both serving the SAME live body (read like
+  a page in both `node` and `contents`); item version = the row `version`. Added
+  to root children, the working set, and `contents(for:)`; README updated.
+  `systemPromptDocument()` falls back to `SystemPrompt.defaultBody` so the two
+  files ALWAYS exist even pre-migration. **No new signal container needed** — both
+  are root children, so the existing `.rootContainer` + `.workingSet` signals
+  refresh them (same path as `manifest.json`).
+- **Model/UI**: sidebar selection generalized from `PageID?` to a new
+  `WikiSelection` enum (`.page` / `.systemPrompt`); the autosave tests reference
+  selection opaquely so the load-bearing §3.5 logic is untouched. New
+  `draftSystemPrompt` track with its own debounce + `flushPendingSystemPromptSave`
+  (combined `flushPendingSaves()` used on switch + backgrounding). `SidebarView`
+  pins a **"System Prompt"** item above Pages; `ContentView` switches the detail
+  pane; new `SystemPromptDetailView` (header explaining the projection + editor +
+  live preview, semantic Dynamic-Type styles).
+- Tests: 63 → **69** (new `SystemPromptTests`: seed default, update bumps
+  version + persists across reopen, repeated edits, token advances on a
+  prompt-only edit, UPSERT recreates a deleted row, v2→3 migration preserving
+  pages + files). Updated `SQLiteWikiStoreTests` (user_version 3, `system_prompt`
+  table, `:1` token suffix) and the `IngestedFilesTests` migration assertion (→3).
+
+**Notes / known gaps**
+- **Gate still pending**: not yet verified on a live signed mount (`cat
+  CLAUDE.md` / `cat AGENTS.md` byte-identical to the in-app edit, refresh on
+  edit, read-only enforced). Code builds clean and the unit suite is green.
+- Same `files/`-style caveat: on an already-materialized (upgraded) domain the
+  two new root files may need the one-shot `WIKIFS_REENUMERATE=1` launch to
+  appear; fresh installs are fine.
+- Pre-existing flaky test `resolvesDuplicateTitleToLowestULID` (same-millisecond
+  ULID ordering) is unrelated to this change — flagged separately.
+
 ## 2026-06-15 — Post-v0 feature: File ingestion (drag-to-ingest) — DONE ✅
 
 Dragging a file into the app **ingests** it: stores the **raw bytes + metadata**

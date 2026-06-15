@@ -15,7 +15,8 @@ import Observation
 @Observable
 public final class WikiStoreModel {
     public private(set) var summaries: [WikiPageSummary] = []
-    public var selection: PageID?
+    /// The sidebar selection: a page, the system-prompt document, or nothing.
+    public var selection: WikiSelection?
 
     /// The removable list of ingested files (Phase 5). Like `summaries`, this is
     /// ALWAYS rebuilt from `store.listIngestedFiles()` after a change, never
@@ -33,50 +34,74 @@ public final class WikiStoreModel {
     public var draftTitle: String = ""
     public var draftBody: String = ""
 
+    /// Live editing buffer for the system-prompt document (the singleton
+    /// `CLAUDE.md`/`AGENTS.md`). Separate track from the page drafts above so the
+    /// well-tested page autosave path is untouched.
+    public var draftSystemPrompt: String = ""
+
     private let store: WikiStore
     private var autosaveTask: Task<Void, Never>?
+    private var systemPromptAutosaveTask: Task<Void, Never>?
     /// The page whose text currently lives in the draft buffers.
     private var loadedPage: PageID?
+    /// What the drafts currently hold, so a flush saves the RIGHT document even
+    /// after `selection` has advanced (§3.5 read-state-at-save-time).
+    private var loadedSelection: WikiSelection?
 
     public init(store: WikiStore) {
         self.store = store
         reloadSummaries()
         reloadIngestedFiles()
+        // Preload the system-prompt draft so its editor has content immediately;
+        // selecting it later reloads fresh from the store.
+        draftSystemPrompt = (try? store.getSystemPrompt())?.body ?? SystemPrompt.defaultBody
     }
 
     // MARK: - Selection / loading
 
-    /// Switch to a page programmatically. Flushes any pending save
-    /// SYNCHRONOUSLY first (§3.5 immediate-on-switch) so the outgoing page
-    /// can't lose buffered edits, then loads the new page's text.
-    public func select(_ id: PageID?) {
-        guard id != selection else { return }
-        flushPendingSave()
-        selection = id
-        loadDrafts(for: id)
+    /// Switch the selection programmatically. Flushes any pending save
+    /// SYNCHRONOUSLY first (§3.5 immediate-on-switch) so the outgoing document
+    /// can't lose buffered edits, then loads the new selection's text.
+    public func select(_ newValue: WikiSelection?) {
+        guard newValue != selection else { return }
+        flushPendingSaves()
+        selection = newValue
+        loadDrafts(for: newValue)
     }
 
     /// Bridge for SwiftUI's `List(selection:)`, which writes `selection`
     /// DIRECTLY (bypassing `select(_:)`). The view observes the property with
     /// `.onChange(of:)` and calls this. Flushing reads the drafts, which still
-    /// belong to `loadedPage`, so the outgoing page's edits are persisted
-    /// before we load the incoming page (§3.5).
-    public func handleSelectionChange(to newValue: PageID?) {
-        guard newValue != loadedPage else { return }
-        flushPendingSave()      // persists drafts to loadedPage
+    /// belong to `loadedSelection`, so the outgoing document's edits are
+    /// persisted before we load the incoming one (§3.5).
+    public func handleSelectionChange(to newValue: WikiSelection?) {
+        guard newValue != loadedSelection else { return }
+        flushPendingSaves()     // persists drafts to loadedSelection
         loadDrafts(for: newValue)
     }
 
-    private func loadDrafts(for id: PageID?) {
-        guard let id, let page = try? store.getPage(id: id) else {
+    private func loadDrafts(for newValue: WikiSelection?) {
+        loadedSelection = newValue
+        switch newValue {
+        case .page(let id):
+            guard let page = try? store.getPage(id: id) else {
+                draftTitle = ""
+                draftBody = ""
+                loadedPage = nil
+                loadedSelection = nil
+                return
+            }
+            draftTitle = page.title
+            draftBody = page.bodyMarkdown
+            loadedPage = id
+        case .systemPrompt:
+            draftSystemPrompt = (try? store.getSystemPrompt())?.body ?? SystemPrompt.defaultBody
+            loadedPage = nil
+        case nil:
             draftTitle = ""
             draftBody = ""
             loadedPage = nil
-            return
         }
-        draftTitle = page.title
-        draftBody = page.bodyMarkdown
-        loadedPage = id
     }
 
     // MARK: - Editing / autosave
@@ -127,10 +152,51 @@ public final class WikiStoreModel {
         save()
     }
 
+    // MARK: - System prompt editing (singleton document)
+
+    /// Called on each keystroke in the system-prompt editor; debounced like the
+    /// page editor (separate task so the two tracks don't cancel each other).
+    public func systemPromptChanged() {
+        systemPromptAutosaveTask?.cancel()
+        systemPromptAutosaveTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled else { return }
+            self?.saveSystemPrompt()
+        }
+    }
+
+    /// Persist the system-prompt draft. Guarded on `loadedSelection` so a flush
+    /// triggered once selection has moved off the prompt doesn't clobber it with
+    /// stale text (mirrors `save()`'s `loadedPage` guard). Bumps the row version,
+    /// which advances `changeToken()` so `CLAUDE.md`/`AGENTS.md` refresh.
+    public func saveSystemPrompt() {
+        guard loadedSelection == .systemPrompt else { return }
+        do {
+            try store.updateSystemPrompt(body: draftSystemPrompt)
+            onPageDidChange?()
+        } catch {
+            print("WikiStoreModel.saveSystemPrompt failed: \(error)")
+        }
+    }
+
+    /// Cancel the system-prompt debounce and save synchronously.
+    public func flushPendingSystemPromptSave() {
+        systemPromptAutosaveTask?.cancel()
+        systemPromptAutosaveTask = nil
+        saveSystemPrompt()
+    }
+
+    /// Flush BOTH editing tracks. Used on selection switch and app backgrounding
+    /// so neither a page edit nor a system-prompt edit is lost.
+    public func flushPendingSaves() {
+        flushPendingSave()
+        flushPendingSystemPromptSave()
+    }
+
     // MARK: - Mutations
 
     public func newPage(title: String = "Untitled") {
-        flushPendingSave()
+        flushPendingSaves()
         do {
             let page = try store.createPage(title: title)
             // A fresh page has an empty body, so this resolves to no links — but
@@ -138,8 +204,8 @@ public final class WikiStoreModel {
             // create-with-body wouldn't silently skip link indexing).
             try store.replaceLinks(from: page.id, parsedLinks: WikiLinkParser.parse(page.bodyMarkdown))
             reloadSummaries()
-            selection = page.id
-            loadDrafts(for: page.id)
+            selection = .page(page.id)
+            loadDrafts(for: .page(page.id))
             onPageDidChange?()
         } catch {
             print("WikiStoreModel.newPage failed: \(error)")
@@ -153,7 +219,7 @@ public final class WikiStoreModel {
             let page = try store.getPage(id: id)
             try store.updatePage(id: id, title: newTitle, body: page.bodyMarkdown)
             reloadSummaries()
-            if selection == id { draftTitle = newTitle }
+            if selection == .page(id) { draftTitle = newTitle }
             onPageDidChange?()
         } catch {
             print("WikiStoreModel.rename failed: \(error)")
@@ -163,7 +229,7 @@ public final class WikiStoreModel {
     public func delete(_ id: PageID) {
         do {
             try store.deletePage(id: id)
-            if selection == id {
+            if selection == .page(id) {
                 autosaveTask?.cancel()
                 autosaveTask = nil
                 selection = nil

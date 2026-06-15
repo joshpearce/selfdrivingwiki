@@ -40,6 +40,11 @@ enum Projection {
         static let filesByName = NSFileProviderItemIdentifier(WikiFSContainerID.filesByName)
         static let indexFilesJSONL = NSFileProviderItemIdentifier(WikiFSContainerID.indexFilesJSONL)
 
+        // System prompt (v3): the same singleton document under two root-level
+        // names (identical bytes) — `CLAUDE.md` and `AGENTS.md`.
+        static let claudeMD = NSFileProviderItemIdentifier(WikiFSContainerID.claudeMD)
+        static let agentsMD = NSFileProviderItemIdentifier(WikiFSContainerID.agentsMD)
+
         static let byIDPrefix = "page-by-id:"
         static let byTitlePrefix = "page-by-title:"
         // Shared with the app (which resolves a per-file user-visible URL to open
@@ -94,6 +99,7 @@ enum Projection {
 
     Useful paths:
 
+    - `CLAUDE.md` / `AGENTS.md` (the agent system prompt — identical)
     - `pages/by-id/`
     - `pages/by-title/`
     - `files/by-id/`
@@ -206,6 +212,36 @@ enum Projection {
         return try? SQLiteWikiStore(readOnlyURL: url)
     }
 
+    // MARK: - System prompt (CLAUDE.md / AGENTS.md)
+
+    /// The singleton system-prompt document, read live from SQLite. Falls back to
+    /// the seeded default (`version 0`) when the row/table can't be read — e.g. a
+    /// read connection opened against a not-yet-migrated DB — so `CLAUDE.md` and
+    /// `AGENTS.md` ALWAYS exist at the root. Read live in both `node(for:)` (size)
+    /// and `contents(for:)` (bytes), exactly like a page body; the row `version`
+    /// drives the item version so an edit re-fetches.
+    private static func systemPromptDocument() -> SystemPrompt {
+        guard let store = openReadStore(),
+              let prompt = try? store.getSystemPrompt() else {
+            return SystemPrompt(body: SystemPrompt.defaultBody,
+                                updatedAt: Date(timeIntervalSince1970: 0), version: 0)
+        }
+        return prompt
+    }
+
+    /// Build the root-level file node for the system prompt under whichever name
+    /// (`CLAUDE.md` / `AGENTS.md`) the identifier maps to. Both names serve the
+    /// identical bytes and share the row's `version`.
+    private static func systemPromptNode(for id: NSFileProviderItemIdentifier,
+                                         name: String) -> ProjectedNode {
+        let prompt = systemPromptDocument()
+        let body = Data(prompt.body.utf8)
+        let version = Data(String(prompt.version).utf8)
+        return .file(id: id, parent: .rootContainer, name: name, size: body.count,
+                     version: version, metadataVersion: version,
+                     created: nil, modified: prompt.updatedAt)
+    }
+
     // MARK: - Change token (sync anchor)
 
     /// The whole-database change token used as the File Provider sync anchor.
@@ -232,6 +268,10 @@ enum Projection {
                          size: readmeBytes.count, version: staticVersion,
                          metadataVersion: staticVersion,
                          created: nil, modified: nil)
+        case Identity.claudeMD:
+            return systemPromptNode(for: id, name: "CLAUDE.md")
+        case Identity.agentsMD:
+            return systemPromptNode(for: id, name: "AGENTS.md")
         case Identity.pages:
             return .folder(id: id, parent: .rootContainer, name: "pages")
         case Identity.pagesByID:
@@ -327,6 +367,8 @@ enum Projection {
         case .rootContainer:
             return [
                 node(for: Identity.readme),
+                node(for: Identity.claudeMD),
+                node(for: Identity.agentsMD),
                 node(for: Identity.manifest),
                 node(for: Identity.pages),
                 node(for: Identity.files),
@@ -366,7 +408,8 @@ enum Projection {
             return pageNodes(byTitle: false) + pageNodes(byTitle: true)
                 + ingestedFileNodes(byName: false) + ingestedFileNodes(byName: true)
                 + [Identity.manifest, Identity.indexPagesJSONL,
-                   Identity.indexLinksJSONL, Identity.indexFilesJSONL]
+                   Identity.indexLinksJSONL, Identity.indexFilesJSONL,
+                   Identity.claudeMD, Identity.agentsMD]
                     .compactMap { node(for: $0) }
         default:
             return []
@@ -407,6 +450,10 @@ enum Projection {
     /// read the live body from SQLite. Folders return nil.
     static func contents(for id: NSFileProviderItemIdentifier) -> Data? {
         if id == Identity.readme { return readmeBytes }
+        // System prompt: both names serve the same live body (read like a page).
+        if id == Identity.claudeMD || id == Identity.agentsMD {
+            return Data(systemPromptDocument().body.utf8)
+        }
         // Generated index files: serve the SAME token-cached bytes whose length
         // `node(for:)` reported as `documentSize` (else `cat` truncates).
         if id == Identity.manifest || id == Identity.indexPagesJSONL

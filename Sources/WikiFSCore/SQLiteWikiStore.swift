@@ -161,6 +161,34 @@ public final class SQLiteWikiStore: WikiStore {
             try exec("PRAGMA user_version=2;")
             version = 2
         }
+
+        // Step 2 → 3: the singleton `system_prompt` table — the user-editable
+        // "system prompt" document the managing agent reads each run, projected
+        // read-only at the wiki root as `CLAUDE.md` AND `AGENTS.md`. One row,
+        // pinned to `id = 1` by a CHECK so there can only ever be one. Seeded
+        // with `SystemPrompt.defaultBody` so the document exists from day one.
+        if version < 3 {
+            try exec("""
+            CREATE TABLE system_prompt (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                body_markdown TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1
+            );
+            """)
+            // Seed the singleton via a bound statement (the default body has
+            // quotes/newlines — never interpolate it into the DDL string).
+            let seed = try statement("""
+            INSERT INTO system_prompt (id, body_markdown, updated_at, version)
+            VALUES (1, ?1, ?2, 1);
+            """)
+            seed.reset()
+            try seed.bind(SystemPrompt.defaultBody, at: 1)
+            try seed.bind(Date().timeIntervalSince1970, at: 2)
+            _ = try seed.step()
+            try exec("PRAGMA user_version=3;")
+            version = 3
+        }
     }
 
     // MARK: - WikiStore
@@ -227,14 +255,21 @@ public final class SQLiteWikiStore: WikiStore {
     /// parseable string forces a re-emit), so the wider format needs no
     /// enumerator change. `ingested_files` may not exist yet on a not-yet-migrated
     /// read connection, so its part falls back to `0:0`.
+    ///
+    /// System prompt (v3): the token ALSO appends the singleton `system_prompt`
+    /// row's `version` (`"…:\(spVersion)"`). Editing ONLY the prompt (no page or
+    /// file change) must still advance the anchor, or the projected
+    /// `CLAUDE.md`/`AGENTS.md` would never refresh without a relaunch. Falls back
+    /// to `0` on a not-yet-migrated read connection (table absent).
     public func changeToken() throws -> String {
         let pages = try statement("SELECT COUNT(*), COALESCE(SUM(version), 0) FROM pages;")
         defer { pages.reset() }
-        guard try pages.step() else { return "0:0:0:0" }
+        guard try pages.step() else { return "0:0:0:0:0" }
         let pCount = pages.int(at: 0)
         let pSum = pages.int(at: 1)
         let (fCount, fSum) = ingestedFileCountSum()
-        return "\(pCount):\(pSum):\(fCount):\(fSum)"
+        let spVersion = systemPromptVersion()
+        return "\(pCount):\(pSum):\(fCount):\(fSum):\(spVersion)"
     }
 
     /// COUNT/SUM(version) over `ingested_files`, resilient to the table not
@@ -248,6 +283,19 @@ public final class SQLiteWikiStore: WikiStore {
         defer { stmt.reset() }
         guard (try? stmt.step()) == true else { return (0, 0) }
         return (stmt.int(at: 0), stmt.int(at: 1))
+    }
+
+    /// The singleton `system_prompt` row's `version`, resilient to the table not
+    /// existing yet (a read connection opened against a pre-v3 DB). On any
+    /// failure returns `0` so `changeToken()` still answers.
+    private func systemPromptVersion() -> Int64 {
+        guard let stmt = try? statement(
+            "SELECT COALESCE(version, 0) FROM system_prompt WHERE id = 1;") else {
+            return 0
+        }
+        defer { stmt.reset() }
+        guard (try? stmt.step()) == true else { return 0 }
+        return stmt.int(at: 0)
     }
 
     public func getPage(id: PageID) throws -> WikiPage {
@@ -531,6 +579,46 @@ public final class SQLiteWikiStore: WikiStore {
             updatedAt: Date(timeIntervalSince1970: stmt.double(at: 6)),
             version: Int(stmt.int(at: 7))
         )
+    }
+
+    // MARK: - System prompt (singleton document, v3)
+
+    /// Read the singleton system-prompt document. Returns the seeded default if
+    /// no row exists yet (defensive — the v2→3 migration seeds one). The caller
+    /// (read projection) wraps this in `try?` and falls back to the default if
+    /// the table itself is absent on a not-yet-migrated read connection.
+    public func getSystemPrompt() throws -> SystemPrompt {
+        let stmt = try statement(
+            "SELECT body_markdown, updated_at, version FROM system_prompt WHERE id = 1;")
+        defer { stmt.reset() }
+        guard try stmt.step() else {
+            return SystemPrompt(body: SystemPrompt.defaultBody,
+                                updatedAt: Date(timeIntervalSince1970: 0), version: 0)
+        }
+        return SystemPrompt(
+            body: stmt.text(at: 0),
+            updatedAt: Date(timeIntervalSince1970: stmt.double(at: 1)),
+            version: Int(stmt.int(at: 2))
+        )
+    }
+
+    /// Replace the system-prompt body, bumping `version` (so `changeToken()`
+    /// advances and the projected `CLAUDE.md`/`AGENTS.md` refresh) and
+    /// `updated_at`. UPSERT so it works even if the singleton row is somehow
+    /// missing (creates it at version 1; otherwise increments).
+    public func updateSystemPrompt(body: String) throws {
+        let stmt = try statement("""
+        INSERT INTO system_prompt (id, body_markdown, updated_at, version)
+        VALUES (1, ?1, ?2, 1)
+        ON CONFLICT(id) DO UPDATE SET
+            body_markdown = excluded.body_markdown,
+            updated_at = excluded.updated_at,
+            version = system_prompt.version + 1;
+        """)
+        defer { stmt.reset() }
+        try stmt.bind(body, at: 1)
+        try stmt.bind(Date().timeIntervalSince1970, at: 2)
+        _ = try stmt.step()
     }
 
     // MARK: - Slugs

@@ -51,9 +51,13 @@ struct AutosaveStaleSnapshotTests {
         model.bodyChanged()
         model.flushPendingSave()
 
+        // selection is now a WikiSelection; pull the page ids back out to read.
+        guard case let .page(aPageID) = aID, case let .page(bPageID) = bID else {
+            Issue.record("expected page selections"); return
+        }
         let reopened = try SQLiteWikiStore(databaseURL: url)
-        #expect(try reopened.getPage(id: aID).bodyMarkdown == "A-edit")
-        #expect(try reopened.getPage(id: bID).bodyMarkdown == "B-edit")
+        #expect(try reopened.getPage(id: aPageID).bodyMarkdown == "A-edit")
+        #expect(try reopened.getPage(id: bPageID).bodyMarkdown == "B-edit")
     }
 
     @Test func summariesRebuiltFromSourceAfterMutations() throws {
@@ -99,7 +103,9 @@ struct AutosaveStaleSnapshotTests {
     @Test func renameUpdatesSummaryFromSource() throws {
         let model = WikiStoreModel(store: try SQLiteWikiStore(databaseURL: tempURL()))
         model.newPage(title: "Old Name")
-        let id = model.selection!
+        guard case let .page(id)? = model.selection else {
+            Issue.record("expected a page selection"); return
+        }
         model.rename(id, to: "New Name")
         #expect(model.summaries.first { $0.id == id }?.title == "New Name")
         #expect(model.draftTitle == "New Name")

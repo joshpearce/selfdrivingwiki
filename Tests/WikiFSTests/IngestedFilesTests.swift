@@ -136,7 +136,7 @@ struct IngestedFilesTests {
         #expect(sqlite3_exec(raw, v1SQL, nil, nil, nil) == SQLITE_OK)
         sqlite3_close(raw)
 
-        // Open via the store → runs ONLY the v1→2 step.
+        // Open via the store → runs the v1→2 step (and the later v2→3 step).
         let store = try SQLiteWikiStore(databaseURL: url)
 
         // ingested_files now exists and is usable.
@@ -148,7 +148,7 @@ struct IngestedFilesTests {
         #expect(page.title == "Kept")
         #expect(page.bodyMarkdown == "# kept")
 
-        // user_version is now 2.
+        // user_version is now 3 (migration runs through every step to head).
         var check: OpaquePointer?
         #expect(sqlite3_open(url.path, &check) == SQLITE_OK)
         defer { sqlite3_close(check) }
@@ -156,7 +156,7 @@ struct IngestedFilesTests {
         #expect(sqlite3_prepare_v2(check, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK)
         defer { sqlite3_finalize(stmt) }
         #expect(sqlite3_step(stmt) == SQLITE_ROW)
-        #expect(sqlite3_column_int(stmt, 0) == 2)
+        #expect(sqlite3_column_int(stmt, 0) == 3)
         _ = store
     }
 }

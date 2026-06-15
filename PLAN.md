@@ -37,11 +37,17 @@ across four stacked, **unmerged** branches off a pristine `main`
 `phase-4-agent-wiki`) — review and merge locally. See `PROGRESS.md` for each
 gate's evidence and the known v0 gaps.
 
-**Post-v0 features** (also stacked, unmerged): `phase-5-file-ingest` — drag a
-file in to **ingest** it (raw bytes + metadata stored in a new `ingested_files`
-SQLite table, NOT a wiki page; surfaced read-only under `files/by-id` &
-`files/by-name`; removable "Files" list). Verified with a real 8 MB PDF served
-byte-identical from the mount. See `PROGRESS.md`.
+**Post-v0 features** (also stacked, unmerged):
+
+- `phase-5-file-ingest` — drag a file in to **ingest** it (raw bytes + metadata
+  stored in a new `ingested_files` SQLite table, NOT a wiki page; surfaced
+  read-only under `files/by-id` & `files/by-name`; removable "Files" list).
+  Verified with a real 8 MB PDF served byte-identical from the mount.
+- **System-prompt document** — a user-editable singleton "system prompt" (DB
+  `system_prompt` table, v2→3 migration) projected **read-only at the wiki root
+  as both `CLAUDE.md` and `AGENTS.md`** (identical bytes). Edited in-app via a
+  pinned sidebar item. Code complete + unit-tested (69 tests); **live-mount gate
+  pending**. See `PROGRESS.md`.
 
 ## Milestones (from `plans/INITIAL.md`)
 

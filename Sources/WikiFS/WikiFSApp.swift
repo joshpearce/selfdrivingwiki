@@ -53,7 +53,7 @@ struct WikiFSApp: App {
         }
         .windowToolbarStyle(.unified)
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { store.flushPendingSave() }
+            if phase != .active { store.flushPendingSaves() }
         }
     }
 }

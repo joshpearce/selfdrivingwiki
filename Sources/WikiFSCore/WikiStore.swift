@@ -58,4 +58,13 @@ public protocol WikiStore {
 
     /// Remove an ingested file by id.
     func deleteIngestedFile(id: PageID) throws
+
+    // MARK: - System prompt (singleton document, v3)
+
+    /// Read the user-editable singleton system-prompt document (projected at the
+    /// root as `CLAUDE.md` / `AGENTS.md`). Returns the seeded default if absent.
+    func getSystemPrompt() throws -> SystemPrompt
+
+    /// Replace the system-prompt body, bumping its version + `updated_at`.
+    func updateSystemPrompt(body: String) throws
 }

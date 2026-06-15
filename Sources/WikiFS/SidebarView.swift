@@ -14,13 +14,22 @@ struct SidebarView: View {
 
     var body: some View {
         List(selection: $store.selection) {
+            // Pinned at the top: the singleton system-prompt document, projected
+            // at the wiki root as CLAUDE.md / AGENTS.md. Selecting it edits the
+            // doc in the main pane, exactly like a page.
+            Label("System Prompt", systemImage: "sparkles")
+                .font(.body)
+                .lineLimit(1)
+                .tag(WikiSelection.systemPrompt)
+                .help("Agent instructions, projected read-only as CLAUDE.md and AGENTS.md")
+
             Section("Pages") {
                 ForEach(store.summaries) { summary in
                     Text(summary.title.isEmpty ? "Untitled" : summary.title)
                         .font(.body)
                         .lineLimit(1)
                         .truncationMode(.tail)
-                        .tag(summary.id)
+                        .tag(WikiSelection.page(summary.id))
                         .contextMenu {
                             Button("Rename") { beginRename(summary) }
                             Button("Delete", role: .destructive) { store.delete(summary.id) }

@@ -21,7 +21,8 @@ struct ContentView: View {
         NavigationSplitView {
             SidebarView(store: store, fileProvider: fileProvider)
         } detail: {
-            if store.selection == nil {
+            switch store.selection {
+            case .none:
                 ContentUnavailableView {
                     Label("No Page Selected", systemImage: "doc.text")
                 } description: {
@@ -29,7 +30,9 @@ struct ContentView: View {
                 } actions: {
                     Button("New Page", systemImage: "plus") { store.newPage() }
                 }
-            } else {
+            case .systemPrompt:
+                SystemPromptDetailView(store: store)
+            case .page:
                 PageDetailView(store: store)
             }
         }

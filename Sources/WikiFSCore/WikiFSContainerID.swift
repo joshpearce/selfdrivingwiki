@@ -31,6 +31,14 @@ public enum WikiFSContainerID {
     public static let filesByName = "files-by-name"
     public static let indexFilesJSONL = "index-files-jsonl"
 
+    // System prompt (v3). The user-editable singleton document projected
+    // read-only at the wiki ROOT under TWO names with identical bytes:
+    // `CLAUDE.md` and `AGENTS.md`. Both are children of the root, so the app's
+    // `signalChange()` refreshes them by signaling `.rootContainer` (+ the
+    // working set) — exactly as it already does for `manifest.json`.
+    public static let claudeMD = "claude-md"
+    public static let agentsMD = "agents-md"
+
     /// Prefix for a single ingested file's `by-id` LEAF identifier (carries the
     /// full ULID, never the filename — INITIAL §6). Shared so the extension's
     /// `Projection.Identity.fileByID(_:)` and the app's "open this file"
