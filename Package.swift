@@ -8,9 +8,23 @@ let package = Package(
     name: "WikiFS",
     platforms: [.macOS(.v14)],
     targets: [
+        // Non-UI core: page model, ULID, the WikiStore protocol + SQLite
+        // implementation, and the @Observable WikiStoreModel. Depended on by
+        // the executable AND the test target so logic is testable without a
+        // running app (SWIFTUI-RULES §9.1 — model logic in its own target).
+        .target(
+            name: "WikiFSCore",
+            path: "Sources/WikiFSCore"
+        ),
         .executableTarget(
             name: "WikiFS",
+            dependencies: ["WikiFSCore"],
             path: "Sources/WikiFS"
+        ),
+        .testTarget(
+            name: "WikiFSTests",
+            dependencies: ["WikiFSCore"],
+            path: "Tests/WikiFSTests"
         ),
         // The File Provider extension binary. build.sh repackages this into a
         // .appex bundle under WikiFS.app/Contents/PlugIns and signs it.
