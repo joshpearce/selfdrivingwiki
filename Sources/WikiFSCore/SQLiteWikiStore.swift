@@ -1,5 +1,6 @@
 import Foundation
 import SQLite3
+import UniformTypeIdentifiers
 
 /// SQLite-backed `WikiStore`. Hand-wraps the system `SQLite3` C API — no
 /// third-party dependency (per the BRINGUP decision). Owns one serial
@@ -87,50 +88,79 @@ public final class SQLiteWikiStore: WikiStore {
         try exec("PRAGMA busy_timeout=5000;")
     }
 
-    /// Idempotent schema bootstrap guarded by `PRAGMA user_version` (0 → 1).
-    /// Schema is INITIAL.md §3 verbatim: `pages`, `attachments`, `page_links`,
-    /// plus the unique slug index. attachments/page_links are unused this
-    /// phase but created now so Phase 2+ is a drop-in.
+    /// Stepwise, idempotent schema migration keyed on `PRAGMA user_version`.
+    /// Each step runs only when the DB is below that step's target version, so:
+    ///   * a FRESH DB (version 0) runs every step in order;
+    ///   * an EXISTING v1 DB (the live one already holds pages) runs ONLY the
+    ///     v1→2 step — its page data is preserved untouched.
+    /// `user_version` is bumped at the end of each step so re-opening is a no-op.
     private func bootstrapSchema() throws {
-        let version = Int(try queryScalarText("PRAGMA user_version;")) ?? 0
-        guard version < 1 else { return }  // already bootstrapped — no-op
+        var version = Int(try queryScalarText("PRAGMA user_version;")) ?? 0
 
-        try exec("""
-        CREATE TABLE pages (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            slug TEXT NOT NULL,
-            body_markdown TEXT NOT NULL DEFAULT '',
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL,
-            version INTEGER NOT NULL DEFAULT 1
-        );
-        """)
-        try exec("CREATE UNIQUE INDEX pages_slug_unique ON pages(slug);")
-        try exec("""
-        CREATE TABLE attachments (
-            id TEXT PRIMARY KEY,
-            page_id TEXT,
-            filename TEXT NOT NULL,
-            mime_type TEXT,
-            data BLOB NOT NULL,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL,
-            version INTEGER NOT NULL DEFAULT 1,
-            FOREIGN KEY(page_id) REFERENCES pages(id)
-        );
-        """)
-        try exec("""
-        CREATE TABLE page_links (
-            from_page_id TEXT NOT NULL,
-            to_page_id TEXT NOT NULL,
-            link_text TEXT NOT NULL,
-            PRIMARY KEY (from_page_id, to_page_id),
-            FOREIGN KEY(from_page_id) REFERENCES pages(id),
-            FOREIGN KEY(to_page_id) REFERENCES pages(id)
-        );
-        """)
-        try exec("PRAGMA user_version=1;")
+        // Step 0 → 1: the original v0 schema (INITIAL §3 verbatim) — pages, the
+        // unique slug index, attachments, page_links. UNCHANGED from the v0 cut.
+        if version < 1 {
+            try exec("""
+            CREATE TABLE pages (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                body_markdown TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1
+            );
+            """)
+            try exec("CREATE UNIQUE INDEX pages_slug_unique ON pages(slug);")
+            try exec("""
+            CREATE TABLE attachments (
+                id TEXT PRIMARY KEY,
+                page_id TEXT,
+                filename TEXT NOT NULL,
+                mime_type TEXT,
+                data BLOB NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY(page_id) REFERENCES pages(id)
+            );
+            """)
+            try exec("""
+            CREATE TABLE page_links (
+                from_page_id TEXT NOT NULL,
+                to_page_id TEXT NOT NULL,
+                link_text TEXT NOT NULL,
+                PRIMARY KEY (from_page_id, to_page_id),
+                FOREIGN KEY(from_page_id) REFERENCES pages(id),
+                FOREIGN KEY(to_page_id) REFERENCES pages(id)
+            );
+            """)
+            try exec("PRAGMA user_version=1;")
+            version = 1
+        }
+
+        // Step 1 → 2 (Phase 5): the `ingested_files` table holds verbatim dropped
+        // files — raw bytes + metadata, a NEW object kind, NOT tied to a page
+        // (so it does NOT reuse `attachments`, which has a `page_id` FK). Stored
+        // and served byte-for-byte; surfaced read-only under the `files/` tree.
+        if version < 2 {
+            try exec("""
+            CREATE TABLE ingested_files (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                ext TEXT NOT NULL DEFAULT '',
+                mime_type TEXT,
+                byte_size INTEGER NOT NULL,
+                content BLOB NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1
+            );
+            """)
+            try exec("CREATE INDEX ingested_files_created ON ingested_files(created_at);")
+            try exec("PRAGMA user_version=2;")
+            version = 2
+        }
     }
 
     // MARK: - WikiStore
@@ -189,11 +219,35 @@ public final class SQLiteWikiStore: WikiStore {
     /// unchanged and the edit would silently stay stale. With count:sum, every
     /// `update` bumps SUM by 1, and every `create`/`delete` changes COUNT and
     /// SUM — so the token differs on every create, update, or delete of any page.
+    ///
+    /// Phase 5: the token ALSO folds in `ingested_files`
+    /// (`"\(pCount):\(pSum):\(fCount):\(fSum)"`). Without this, ingesting or
+    /// removing a file would NOT advance the anchor and the `files/` tree would
+    /// never refresh. The enumerator treats the anchor as opaque (any non-equal
+    /// parseable string forces a re-emit), so the wider format needs no
+    /// enumerator change. `ingested_files` may not exist yet on a not-yet-migrated
+    /// read connection, so its part falls back to `0:0`.
     public func changeToken() throws -> String {
-        let stmt = try statement("SELECT COUNT(*), COALESCE(SUM(version), 0) FROM pages;")
+        let pages = try statement("SELECT COUNT(*), COALESCE(SUM(version), 0) FROM pages;")
+        defer { pages.reset() }
+        guard try pages.step() else { return "0:0:0:0" }
+        let pCount = pages.int(at: 0)
+        let pSum = pages.int(at: 1)
+        let (fCount, fSum) = ingestedFileCountSum()
+        return "\(pCount):\(pSum):\(fCount):\(fSum)"
+    }
+
+    /// COUNT/SUM(version) over `ingested_files`, resilient to the table not
+    /// existing yet (a read connection opened against a pre-migration DB). On any
+    /// failure returns `(0, 0)` so `changeToken()` still answers.
+    private func ingestedFileCountSum() -> (Int64, Int64) {
+        guard let stmt = try? statement(
+            "SELECT COUNT(*), COALESCE(SUM(version), 0) FROM ingested_files;") else {
+            return (0, 0)
+        }
         defer { stmt.reset() }
-        guard try stmt.step() else { return "0:0" }
-        return "\(stmt.int(at: 0)):\(stmt.int(at: 1))"
+        guard (try? stmt.step()) == true else { return (0, 0) }
+        return (stmt.int(at: 0), stmt.int(at: 1))
     }
 
     public func getPage(id: PageID) throws -> WikiPage {
@@ -344,6 +398,139 @@ public final class SQLiteWikiStore: WikiStore {
             ))
         }
         return out
+    }
+
+    // MARK: - Ingested files (Phase 5)
+
+    /// Reject any single dropped file larger than this. A soft guard so the
+    /// verbatim-bytes-in-SQLite model can't be handed a multi-GB blob that would
+    /// blow up memory on read. 100 MB is generous for notes/PDFs/markdown.
+    public static let ingestByteCap = 100 * 1024 * 1024
+
+    /// Ingest a file's verbatim bytes + metadata as a NEW `ingested_files` row.
+    /// `ext` is the lowercased extension (no dot, `""` if none); `mime_type` is
+    /// the best-effort UTI→MIME for that extension. `byte_size` mirrors
+    /// `length(content)`. The id is a fresh ULID (sortable == ingest order).
+    /// Throws if `data` exceeds `ingestByteCap`.
+    @discardableResult
+    public func ingestFile(filename: String, data: Data) throws -> IngestedFileSummary {
+        guard data.count <= Self.ingestByteCap else {
+            throw WikiStoreError.unexpected(
+                "ingested file \(data.count) bytes exceeds cap \(Self.ingestByteCap)")
+        }
+        let id = PageID(rawValue: ULID.generate())
+        let ext = (filename as NSString).pathExtension.lowercased()
+        let mime = ext.isEmpty ? nil : UTType(filenameExtension: ext)?.preferredMIMEType
+        let now = Date()
+
+        let stmt = try statement("""
+        INSERT INTO ingested_files
+          (id, filename, ext, mime_type, byte_size, content, created_at, updated_at, version)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1);
+        """)
+        defer { stmt.reset() }
+        try stmt.bind(id.rawValue, at: 1)
+        try stmt.bind(filename, at: 2)
+        try stmt.bind(ext, at: 3)
+        if let mime { try stmt.bind(mime, at: 4) }  // else leave NULL
+        try stmt.bind(Int64(data.count), at: 5)
+        try stmt.bind(data, at: 6)
+        try stmt.bind(now.timeIntervalSince1970, at: 7)
+        _ = try stmt.step()
+
+        return IngestedFileSummary(
+            id: id, filename: filename, ext: ext, mimeType: mime,
+            byteSize: data.count, createdAt: now, updatedAt: now, version: 1
+        )
+    }
+
+    /// All ingested-file summaries (NO content blob), most-recent-first for the
+    /// management list. `id` is a ULID so `created_at DESC` orders by ingest.
+    public func listIngestedFiles() throws -> [IngestedFileSummary] {
+        let stmt = try statement("""
+        SELECT id, filename, ext, mime_type, byte_size, created_at, updated_at, version
+        FROM ingested_files ORDER BY created_at DESC, id DESC;
+        """)
+        defer { stmt.reset() }
+        var out: [IngestedFileSummary] = []
+        while try stmt.step() {
+            out.append(ingestedSummary(from: stmt))
+        }
+        return out
+    }
+
+    /// One ingested-file summary (NO content blob). Throws `.notFound` if absent.
+    public func getIngestedFile(id: PageID) throws -> IngestedFileSummary {
+        let stmt = try statement("""
+        SELECT id, filename, ext, mime_type, byte_size, created_at, updated_at, version
+        FROM ingested_files WHERE id = ?1;
+        """)
+        defer { stmt.reset() }
+        try stmt.bind(id.rawValue, at: 1)
+        guard try stmt.step() else { throw WikiStoreError.notFound(id) }
+        return ingestedSummary(from: stmt)
+    }
+
+    /// The verbatim content bytes for one ingested file, fetched on demand (never
+    /// held in the summary list). Throws `.notFound` if absent.
+    public func ingestedFileContent(id: PageID) throws -> Data {
+        let stmt = try statement("SELECT content FROM ingested_files WHERE id = ?1;")
+        defer { stmt.reset() }
+        try stmt.bind(id.rawValue, at: 1)
+        guard try stmt.step() else { throw WikiStoreError.notFound(id) }
+        return stmt.blob(at: 0)
+    }
+
+    public func deleteIngestedFile(id: PageID) throws {
+        let stmt = try statement("DELETE FROM ingested_files WHERE id = ?1;")
+        defer { stmt.reset() }
+        try stmt.bind(id.rawValue, at: 1)
+        _ = try stmt.step()
+    }
+
+    /// All ingested files as `IndexGenerators.FileRow`s, ordered by id (ULID ==
+    /// ingest order) for the deterministic `indexes/files.jsonl` generator.
+    /// Read-side projection helper (like `listAllPagesOrderedByID`).
+    public func listAllIngestedFilesOrderedByID() throws -> [IndexGenerators.FileRow] {
+        let stmt = try statement("""
+        SELECT id, filename, ext, mime_type, byte_size, created_at, updated_at, version
+        FROM ingested_files ORDER BY id ASC;
+        """)
+        defer { stmt.reset() }
+        var out: [IndexGenerators.FileRow] = []
+        while try stmt.step() {
+            let mime = sqlite3_column_type(stmt.handle, 3) == SQLITE_NULL
+                ? nil : stmt.text(at: 3)
+            out.append(IndexGenerators.FileRow(
+                id: stmt.text(at: 0),
+                filename: stmt.text(at: 1),
+                ext: stmt.text(at: 2),
+                mime: mime,
+                byteSize: Int(stmt.int(at: 4)),
+                createdAt: Date(timeIntervalSince1970: stmt.double(at: 5)),
+                updatedAt: Date(timeIntervalSince1970: stmt.double(at: 6)),
+                version: Int(stmt.int(at: 7))
+            ))
+        }
+        return out
+    }
+
+    /// Map the current row of an `ingested_files` SELECT (column order: id,
+    /// filename, ext, mime_type, byte_size, created_at, updated_at, version) to a
+    /// summary. `mime_type` is read as NULL→nil via the column type.
+    private func ingestedSummary(from stmt: SQLiteStatement) -> IngestedFileSummary {
+        let mime = sqlite3_column_type(stmt.handle, 3) == SQLITE_NULL
+            ? nil : stmt.text(at: 3)
+        return IngestedFileSummary(
+            id: PageID(rawValue: stmt.text(at: 0)),
+            filename: stmt.text(at: 1),
+            ext: stmt.text(at: 2),
+            mimeType: mime,
+            byteSize: Int(stmt.int(at: 4)),
+            createdAt: Date(timeIntervalSince1970: stmt.double(at: 5)),
+            updatedAt: Date(timeIntervalSince1970: stmt.double(at: 6)),
+            version: Int(stmt.int(at: 7))
+        )
     }
 
     // MARK: - Slugs

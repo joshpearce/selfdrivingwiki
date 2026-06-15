@@ -17,6 +17,11 @@ public final class WikiStoreModel {
     public private(set) var summaries: [WikiPageSummary] = []
     public var selection: PageID?
 
+    /// The removable list of ingested files (Phase 5). Like `summaries`, this is
+    /// ALWAYS rebuilt from `store.listIngestedFiles()` after a change, never
+    /// incrementally patched (§3.1). Most-recent-first.
+    public private(set) var ingestedFiles: [IngestedFileSummary] = []
+
     /// Invoked on the main actor after any successful persisted mutation
     /// (save / new / rename / delete). The app wires this to the File Provider
     /// `signalChange()` so Terminal reads see edits without relaunch (INITIAL
@@ -36,6 +41,7 @@ public final class WikiStoreModel {
     public init(store: WikiStore) {
         self.store = store
         reloadSummaries()
+        reloadIngestedFiles()
     }
 
     // MARK: - Selection / loading
@@ -170,9 +176,76 @@ public final class WikiStoreModel {
         }
     }
 
+    // MARK: - File ingestion (Phase 5)
+
+    /// Ingest dropped files. For each URL: reject directories (a recursive
+    /// directory ingest is out of scope), read the bytes OFF the main thread
+    /// (big files shouldn't stall the UI), then hop back to the main actor to
+    /// store + reload. Per-file failures are logged and skipped so one bad drop
+    /// doesn't abort the batch. `onPageDidChange?()` fires ONCE at the end so the
+    /// daemon re-enumerates the `files/` tree exactly once for the whole batch.
+    public func ingest(fileURLs: [URL]) async {
+        var didIngestAny = false
+        for url in fileURLs {
+            // Skip directories — only flat files are ingested.
+            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if isDir {
+                print("WikiStoreModel.ingest skipping directory: \(url.lastPathComponent)")
+                continue
+            }
+            let filename = url.lastPathComponent
+            let data: Data
+            do {
+                // Read off the main actor; `Data(contentsOf:)` is blocking I/O.
+                data = try await Task.detached(priority: .userInitiated) {
+                    try Data(contentsOf: url)
+                }.value
+            } catch {
+                print("WikiStoreModel.ingest read failed for \(filename): \(error)")
+                continue
+            }
+            do {
+                _ = try store.ingestFile(filename: filename, data: data)
+                didIngestAny = true
+            } catch {
+                print("WikiStoreModel.ingest store failed for \(filename): \(error)")
+            }
+        }
+        reloadIngestedFiles()
+        if didIngestAny { onPageDidChange?() }
+    }
+
+    /// Synchronous ingest seam used by tests/verifiers (no drag gesture). Stores
+    /// the bytes, rebuilds the list, and signals the daemon.
+    public func ingestFile(filename: String, data: Data) {
+        do {
+            _ = try store.ingestFile(filename: filename, data: data)
+            reloadIngestedFiles()
+            onPageDidChange?()
+        } catch {
+            print("WikiStoreModel.ingestFile failed: \(error)")
+        }
+    }
+
+    /// Remove an ingested file from the list and the store, then signal so the
+    /// `files/` tree drops it.
+    public func deleteIngestedFile(_ id: PageID) {
+        do {
+            try store.deleteIngestedFile(id: id)
+            reloadIngestedFiles()
+            onPageDidChange?()
+        } catch {
+            print("WikiStoreModel.deleteIngestedFile failed: \(error)")
+        }
+    }
+
     // MARK: - Source-of-truth rebuild
 
     private func reloadSummaries() {
         summaries = (try? store.listPages()) ?? []
+    }
+
+    private func reloadIngestedFiles() {
+        ingestedFiles = (try? store.listIngestedFiles()) ?? []
     }
 }

@@ -20,4 +20,14 @@ public enum WikiFSContainerID {
     public static let indexes = "indexes"
     public static let indexPagesJSONL = "index-pages-jsonl"
     public static let indexLinksJSONL = "index-links-jsonl"
+
+    // Ingested files (Phase 5). A brand-new top-level `files/` tree with `by-id`
+    // and `by-name` views serving verbatim dropped-file bytes read-only. The
+    // app's `signalChange()` signals these (plus the files.jsonl index) so an
+    // ingest OR a removal refreshes the projection. `indexFilesJSONL` lives under
+    // the existing `indexes` folder.
+    public static let files = "files"
+    public static let filesByID = "files-by-id"
+    public static let filesByName = "files-by-name"
+    public static let indexFilesJSONL = "index-files-jsonl"
 }

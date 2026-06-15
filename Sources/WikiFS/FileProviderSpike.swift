@@ -84,6 +84,14 @@ final class FileProviderSpike {
             // invalidate them too — signal both their containers (Phase 4).
             .rootContainer,
             NSFileProviderItemIdentifier(WikiFSContainerID.indexes),
+            // Ingested files (Phase 5): a drop OR a removal changes the `files/`
+            // tree and the files.jsonl/manifest indexes. The model fires
+            // `onPageDidChange?()` (wired to this) after ingest AND delete, so
+            // signaling both `files/` views (and `indexes`, already above)
+            // refreshes the projection without relaunch.
+            NSFileProviderItemIdentifier(WikiFSContainerID.files),
+            NSFileProviderItemIdentifier(WikiFSContainerID.filesByID),
+            NSFileProviderItemIdentifier(WikiFSContainerID.filesByName),
             .workingSet,
         ]
         for container in containers {

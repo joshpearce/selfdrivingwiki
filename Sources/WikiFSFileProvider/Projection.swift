@@ -33,8 +33,17 @@ enum Projection {
         static let indexPagesJSONL = NSFileProviderItemIdentifier(WikiFSContainerID.indexPagesJSONL)
         static let indexLinksJSONL = NSFileProviderItemIdentifier(WikiFSContainerID.indexLinksJSONL)
 
+        // Ingested files (Phase 5): a new top-level `files/` tree with `by-id` and
+        // `by-name` views, plus `indexes/files.jsonl`.
+        static let files = NSFileProviderItemIdentifier(WikiFSContainerID.files)
+        static let filesByID = NSFileProviderItemIdentifier(WikiFSContainerID.filesByID)
+        static let filesByName = NSFileProviderItemIdentifier(WikiFSContainerID.filesByName)
+        static let indexFilesJSONL = NSFileProviderItemIdentifier(WikiFSContainerID.indexFilesJSONL)
+
         static let byIDPrefix = "page-by-id:"
         static let byTitlePrefix = "page-by-title:"
+        static let fileByIDPrefix = "file-by-id:"
+        static let fileByNamePrefix = "file-by-name:"
 
         static func pageByID(_ ulid: String) -> NSFileProviderItemIdentifier {
             NSFileProviderItemIdentifier(byIDPrefix + ulid)
@@ -44,12 +53,30 @@ enum Projection {
             NSFileProviderItemIdentifier(byTitlePrefix + ulid)
         }
 
+        static func fileByID(_ ulid: String) -> NSFileProviderItemIdentifier {
+            NSFileProviderItemIdentifier(fileByIDPrefix + ulid)
+        }
+
+        static func fileByName(_ ulid: String) -> NSFileProviderItemIdentifier {
+            NSFileProviderItemIdentifier(fileByNamePrefix + ulid)
+        }
+
         /// Extract the embedded ULID from a `page-by-id:` / `page-by-title:`
         /// identifier, or nil if it isn't a page identifier.
         static func pageULID(from id: NSFileProviderItemIdentifier) -> String? {
             let raw = id.rawValue
             if raw.hasPrefix(byIDPrefix) { return String(raw.dropFirst(byIDPrefix.count)) }
             if raw.hasPrefix(byTitlePrefix) { return String(raw.dropFirst(byTitlePrefix.count)) }
+            return nil
+        }
+
+        /// Extract the embedded ULID from a `file-by-id:` / `file-by-name:`
+        /// identifier, or nil if it isn't an ingested-file identifier. The full
+        /// ULID is in the identifier — never the filename (INITIAL §6).
+        static func fileULID(from id: NSFileProviderItemIdentifier) -> String? {
+            let raw = id.rawValue
+            if raw.hasPrefix(fileByIDPrefix) { return String(raw.dropFirst(fileByIDPrefix.count)) }
+            if raw.hasPrefix(fileByNamePrefix) { return String(raw.dropFirst(fileByNamePrefix.count)) }
             return nil
         }
     }
@@ -67,9 +94,12 @@ enum Projection {
 
     - `pages/by-id/`
     - `pages/by-title/`
+    - `files/by-id/`
+    - `files/by-name/`
     - `manifest.json`
     - `indexes/pages.jsonl`
     - `indexes/links.jsonl`
+    - `indexes/files.jsonl`
 
     """.utf8)
 
@@ -131,13 +161,21 @@ enum Projection {
         switch id {
         case Identity.manifest:
             guard let pages = try? store.listAllPagesOrderedByID() else { return nil }
-            return IndexGenerators.manifest(pages: pages, generatedAt: Date())
+            // file_count must be resilient to a pre-migration `ingested_files`:
+            // a `nil` read → 0, so the manifest still generates.
+            let fileCount = (try? store.listAllIngestedFilesOrderedByID())?.count ?? 0
+            return IndexGenerators.manifest(pages: pages, fileCount: fileCount, generatedAt: Date())
         case Identity.indexPagesJSONL:
             guard let pages = try? store.listAllPagesOrderedByID() else { return nil }
             return IndexGenerators.pagesJSONL(pages: pages)
         case Identity.indexLinksJSONL:
             guard let links = try? store.listAllLinks() else { return nil }
             return IndexGenerators.linksJSONL(links: links)
+        case Identity.indexFilesJSONL:
+            // Resilient to the table not existing yet → empty index, never nil,
+            // so enumeration of `indexes/` never errors pre-migration.
+            let files = (try? store.listAllIngestedFilesOrderedByID()) ?? []
+            return IndexGenerators.filesJSONL(files: files)
         default:
             return nil
         }
@@ -206,8 +244,26 @@ enum Projection {
             return indexFileNode(for: id, name: "pages.jsonl", parent: Identity.indexes)
         case Identity.indexLinksJSONL:
             return indexFileNode(for: id, name: "links.jsonl", parent: Identity.indexes)
+        case Identity.indexFilesJSONL:
+            return indexFileNode(for: id, name: "files.jsonl", parent: Identity.indexes)
+        case Identity.files:
+            return .folder(id: id, parent: .rootContainer, name: "files")
+        case Identity.filesByID:
+            return .folder(id: id, parent: Identity.files, name: "by-id")
+        case Identity.filesByName:
+            return .folder(id: id, parent: Identity.files, name: "by-name")
         default:
             break
+        }
+        // Ingested-file leaf (file-by-id: / file-by-name:). Resolve the embedded
+        // ULID and look up the summary; resilient to a missing table (the read
+        // throws → nil → the node simply isn't found, never an enumeration error).
+        if let ulid = Identity.fileULID(from: id) {
+            guard let store = openReadStore(),
+                  let file = try? store.getIngestedFile(id: PageID(rawValue: ulid)) else {
+                return nil
+            }
+            return ingestedFileNode(for: id, file: file)
         }
         guard let ulid = Identity.pageULID(from: id),
               let store = openReadStore(),
@@ -215,6 +271,29 @@ enum Projection {
             return nil
         }
         return pageFileNode(for: id, page: page)
+    }
+
+    /// Build a file node for an ingested-file row, under whichever view `id`
+    /// belongs to. Size is the stored `byteSize` (NEVER nil → no truncated
+    /// `cat`); contentVersion is the row `version`; metadataVersion folds in the
+    /// filename + updated_at so a re-ingest under the same id would re-fetch.
+    private static func ingestedFileNode(for id: NSFileProviderItemIdentifier,
+                                         file: IngestedFileSummary) -> ProjectedNode {
+        let raw = id.rawValue
+        let isByName = raw.hasPrefix(Identity.fileByNamePrefix)
+        let name = isByName
+            ? FilenameEscaping.byNameIngestedFilename(
+                filename: file.filename, ext: file.ext, fileID: file.id.rawValue)
+            : FilenameEscaping.byIDIngestedFilename(fileID: file.id.rawValue, ext: file.ext)
+        let parent = isByName ? Identity.filesByName : Identity.filesByID
+        return .file(
+            id: id, parent: parent, name: name, size: file.byteSize,
+            version: Data(String(file.version).utf8),
+            metadataVersion: Data(
+                "\(file.filename)|\(file.updatedAt.timeIntervalSince1970)|\(file.version)".utf8),
+            created: file.createdAt, modified: file.updatedAt,
+            ingestedExt: file.ext
+        )
     }
 
     /// Build a file node for a page row, under whichever view `id` belongs to.
@@ -248,6 +327,7 @@ enum Projection {
                 node(for: Identity.readme),
                 node(for: Identity.manifest),
                 node(for: Identity.pages),
+                node(for: Identity.files),
                 node(for: Identity.indexes),
             ].compactMap { $0 }
         case Identity.pages:
@@ -255,24 +335,36 @@ enum Projection {
                 node(for: Identity.pagesByID),
                 node(for: Identity.pagesByTitle),
             ].compactMap { $0 }
+        case Identity.files:
+            return [
+                node(for: Identity.filesByID),
+                node(for: Identity.filesByName),
+            ].compactMap { $0 }
         case Identity.indexes:
             return [
                 node(for: Identity.indexPagesJSONL),
                 node(for: Identity.indexLinksJSONL),
+                node(for: Identity.indexFilesJSONL),
             ].compactMap { $0 }
         case Identity.pagesByID:
             return pageNodes(byTitle: false)
         case Identity.pagesByTitle:
             return pageNodes(byTitle: true)
+        case Identity.filesByID:
+            return ingestedFileNodes(byName: false)
+        case Identity.filesByName:
+            return ingestedFileNodes(byName: true)
         case .workingSet:
             // The working set is the set of items the daemon actively tracks for
-            // change. Re-emit ALL page nodes (both views) PLUS the 3 generated
-            // index nodes so a working-set `enumerateChanges` after a signal
-            // carries the new itemVersions and the daemon invalidates its
-            // materialized copies (the index bytes derive from page content, so
-            // an edit must invalidate them too).
+            // change. Re-emit ALL page nodes (both views) and ALL ingested-file
+            // nodes (both views) PLUS the generated index nodes so a working-set
+            // `enumerateChanges` after a signal carries the new itemVersions and
+            // the daemon invalidates its materialized copies (the index bytes
+            // derive from page + file content, so a mutation must invalidate them).
             return pageNodes(byTitle: false) + pageNodes(byTitle: true)
-                + [Identity.manifest, Identity.indexPagesJSONL, Identity.indexLinksJSONL]
+                + ingestedFileNodes(byName: false) + ingestedFileNodes(byName: true)
+                + [Identity.manifest, Identity.indexPagesJSONL,
+                   Identity.indexLinksJSONL, Identity.indexFilesJSONL]
                     .compactMap { node(for: $0) }
         default:
             return []
@@ -291,6 +383,22 @@ enum Projection {
         }
     }
 
+    /// All ingested-file rows projected as file nodes under the given view,
+    /// ordered by id (ULID == ingest order). Resilient to the table not existing
+    /// yet (pre-migration) → empty, so enumeration never errors.
+    private static func ingestedFileNodes(byName: Bool) -> [ProjectedNode] {
+        guard let store = openReadStore(),
+              let files = try? store.listAllIngestedFilesOrderedByID() else { return [] }
+        return files.map { row in
+            let id = byName ? Identity.fileByName(row.id) : Identity.fileByID(row.id)
+            let summary = IngestedFileSummary(
+                id: PageID(rawValue: row.id), filename: row.filename, ext: row.ext,
+                mimeType: row.mime, byteSize: row.byteSize,
+                createdAt: row.createdAt, updatedAt: row.updatedAt, version: row.version)
+            return ingestedFileNode(for: id, file: summary)
+        }
+    }
+
     // MARK: - Content
 
     /// Materialize the bytes for a file identifier. README is static; page files
@@ -300,8 +408,17 @@ enum Projection {
         // Generated index files: serve the SAME token-cached bytes whose length
         // `node(for:)` reported as `documentSize` (else `cat` truncates).
         if id == Identity.manifest || id == Identity.indexPagesJSONL
-            || id == Identity.indexLinksJSONL {
+            || id == Identity.indexLinksJSONL || id == Identity.indexFilesJSONL {
             return indexData(for: id)
+        }
+        // Ingested files: serve the verbatim bytes from SQLite (raw, no
+        // conversion). Resilient to a missing row/table → nil (noSuchItem).
+        if let fileULID = Identity.fileULID(from: id) {
+            guard let store = openReadStore(),
+                  let data = try? store.ingestedFileContent(id: PageID(rawValue: fileULID)) else {
+                return nil
+            }
+            return data
         }
         guard let ulid = Identity.pageULID(from: id),
               let store = openReadStore(),
@@ -324,6 +441,11 @@ struct ProjectedNode {
     let metadataVersion: Data
     let created: Date?
     let modified: Date?
+    /// Set ONLY for ingested-file leaves: the original lowercased extension (no
+    /// dot, `""` if none). `WikiFSItem.contentType` uses it to derive the file's
+    /// UTType for ingested files WITHOUT touching the page/index branches. `nil`
+    /// for every other node kind (pages, folders, generated indexes).
+    let ingestedExt: String?
 
     static func folder(id: NSFileProviderItemIdentifier,
                        parent: NSFileProviderItemIdentifier,
@@ -331,16 +453,17 @@ struct ProjectedNode {
         ProjectedNode(id: id, parent: parent, name: name, isFolder: true, size: 0,
                       contentVersion: Projection.staticVersion,
                       metadataVersion: Projection.staticVersion,
-                      created: nil, modified: nil)
+                      created: nil, modified: nil, ingestedExt: nil)
     }
 
     static func file(id: NSFileProviderItemIdentifier,
                      parent: NSFileProviderItemIdentifier,
                      name: String, size: Int,
                      version: Data, metadataVersion: Data,
-                     created: Date?, modified: Date?) -> ProjectedNode {
+                     created: Date?, modified: Date?,
+                     ingestedExt: String? = nil) -> ProjectedNode {
         ProjectedNode(id: id, parent: parent, name: name, isFolder: false, size: size,
                       contentVersion: version, metadataVersion: metadataVersion,
-                      created: created, modified: modified)
+                      created: created, modified: modified, ingestedExt: ingestedExt)
     }
 }

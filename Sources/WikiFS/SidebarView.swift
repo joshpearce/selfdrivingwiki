@@ -12,19 +12,33 @@ struct SidebarView: View {
 
     var body: some View {
         List(selection: $store.selection) {
-            ForEach(store.summaries) { summary in
-                Text(summary.title.isEmpty ? "Untitled" : summary.title)
-                    .font(.body)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .tag(summary.id)
-                    .contextMenu {
-                        Button("Rename") { beginRename(summary) }
-                        Button("Delete", role: .destructive) { store.delete(summary.id) }
+            Section("Pages") {
+                ForEach(store.summaries) { summary in
+                    Text(summary.title.isEmpty ? "Untitled" : summary.title)
+                        .font(.body)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .tag(summary.id)
+                        .contextMenu {
+                            Button("Rename") { beginRename(summary) }
+                            Button("Delete", role: .destructive) { store.delete(summary.id) }
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button("Delete", role: .destructive) { store.delete(summary.id) }
+                        }
+                }
+            }
+            // Files section appears only once at least one file is ingested. The
+            // rows are management-only (no `.tag`), so they never feed the page
+            // selection binding above — clicking one is a no-op on the detail pane.
+            if !store.ingestedFiles.isEmpty {
+                Section("Files") {
+                    ForEach(store.ingestedFiles) { file in
+                        IngestedFileRow(file: file) {
+                            store.deleteIngestedFile(file.id)
+                        }
                     }
-                    .swipeActions(edge: .trailing) {
-                        Button("Delete", role: .destructive) { store.delete(summary.id) }
-                    }
+                }
             }
         }
         .listStyle(.inset)

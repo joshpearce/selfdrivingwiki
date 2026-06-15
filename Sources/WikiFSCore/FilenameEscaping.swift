@@ -61,5 +61,28 @@ public enum FilenameEscaping {
         "\(pageID).md"
     }
 
+    // MARK: - Ingested files (Phase 5)
+
+    /// The canonical `files/by-id` filename: `<full-ulid>.<ext>`, preserving the
+    /// dropped file's original extension. The dot is omitted when `ext` is empty
+    /// (extension-less drops): `01ABC…` → `01ABC…` (no trailing dot).
+    public static func byIDIngestedFilename(fileID: String, ext: String) -> String {
+        ext.isEmpty ? fileID : "\(fileID).\(ext)"
+    }
+
+    /// The human-readable `files/by-name` filename:
+    /// `<escaped-stem>--<short-id>.<ext>`. The original filename is split into
+    /// its stem and extension; the STEM is escaped via `escapeTitle` (an
+    /// empty/weird stem becomes `untitled`), the short id disambiguates
+    /// collisions, and the ORIGINAL `ext` is preserved (dot omitted if empty).
+    /// `Trip Report.PDF` + ext `pdf` → `Trip Report--01ABCDEF.pdf`.
+    public static func byNameIngestedFilename(filename: String, ext: String, fileID: String) -> String {
+        let ns = filename as NSString
+        let stem = ns.deletingPathExtension
+        let escapedStem = escapeTitle(stem)
+        let base = "\(escapedStem)--\(shortID(fileID))"
+        return ext.isEmpty ? base : "\(base).\(ext)"
+    }
+
     private static let controlCharacters = CharacterSet.controlCharacters
 }

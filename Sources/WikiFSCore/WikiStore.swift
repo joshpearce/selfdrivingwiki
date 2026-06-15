@@ -39,4 +39,23 @@ public protocol WikiStore {
     /// `parsedLinks`, in one transaction. Targets that don't resolve to a page
     /// are omitted (the schema forbids a NULL `to_page_id`). Self-links allowed.
     func replaceLinks(from pageID: PageID, parsedLinks: [WikiLinkParser.ParsedLink]) throws
+
+    // MARK: - Ingested files (Phase 5)
+    //
+    // Only the three methods `WikiStoreModel` actually calls live on the
+    // protocol. The read-projection helpers (listAllIngestedFilesOrderedByID,
+    // getIngestedFile, ingestedFileContent) stay concrete on `SQLiteWikiStore` —
+    // the File Provider extension uses the concrete read store, exactly as it
+    // does for `listAllPagesOrderedByID` / `listAllLinks`.
+
+    /// Store a dropped file's verbatim bytes + metadata as a new ingested-file
+    /// row, returning its summary. Throws if the data exceeds the soft size cap.
+    @discardableResult
+    func ingestFile(filename: String, data: Data) throws -> IngestedFileSummary
+
+    /// Ingested-file summaries (no content blob), most-recent-first.
+    func listIngestedFiles() throws -> [IngestedFileSummary]
+
+    /// Remove an ingested file by id.
+    func deleteIngestedFile(id: PageID) throws
 }

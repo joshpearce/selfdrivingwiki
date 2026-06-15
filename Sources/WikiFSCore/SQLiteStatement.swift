@@ -47,6 +47,18 @@ final class SQLiteStatement {
         try check(sqlite3_bind_int64(handle, index, value))
     }
 
+    /// Bind raw bytes as a BLOB. `SQLITE_TRANSIENT` makes SQLite copy the bytes
+    /// immediately (same reasoning as the text binder): the `Data` buffer the
+    /// closure exposes is only valid for the call, so SQLite must not retain a
+    /// pointer into it past `sqlite3_step`.
+    func bind(_ data: Data, at index: Int32) throws {
+        let rc = data.withUnsafeBytes { raw -> Int32 in
+            sqlite3_bind_blob(handle, index, raw.baseAddress,
+                              Int32(raw.count), SQLITE_TRANSIENT)
+        }
+        try check(rc)
+    }
+
     // MARK: - Stepping
 
     /// Step once. Returns true on `SQLITE_ROW`, false on `SQLITE_DONE`.
@@ -72,6 +84,17 @@ final class SQLiteStatement {
 
     func int(at column: Int32) -> Int64 {
         sqlite3_column_int64(handle, column)
+    }
+
+    /// Read a BLOB column as `Data`. Returns empty `Data` for a NULL/zero-length
+    /// column. The bytes are copied out of SQLite's buffer immediately (the
+    /// pointer is only valid until the next step/reset).
+    func blob(at column: Int32) -> Data {
+        let count = Int(sqlite3_column_bytes(handle, column))
+        guard count > 0, let ptr = sqlite3_column_blob(handle, column) else {
+            return Data()
+        }
+        return Data(bytes: ptr, count: count)
     }
 
     private func check(_ rc: Int32) throws {

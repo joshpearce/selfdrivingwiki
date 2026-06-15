@@ -11,6 +11,11 @@ struct ContentView: View {
     @Bindable var agentLauncher: AgentLauncher
     @State private var showingPathPopover = false
     @State private var showingAgentSheet = false
+    /// Driven by `.dropDestination`'s `isTargeted` callback to fade in a subtle
+    /// accent border while a drag hovers the window (set via the closure param —
+    /// no `Binding(get:set:)`).
+    @State private var isDropTargeted = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         NavigationSplitView {
@@ -27,6 +32,26 @@ struct ContentView: View {
             } else {
                 PageDetailView(store: store)
             }
+        }
+        // Drop a file anywhere on the window to ingest it (raw bytes → SQLite →
+        // the read-only `files/` projection). The whole content is the target.
+        .dropDestination(for: URL.self) { urls, _ in
+            Task { await store.ingest(fileURLs: urls) }
+            return true
+        } isTargeted: { targeted in
+            // Fade, not bounce; skip the animation entirely under Reduce Motion.
+            if reduceMotion {
+                isDropTargeted = targeted
+            } else {
+                withAnimation(.easeInOut(duration: 0.15)) { isDropTargeted = targeted }
+            }
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.accentColor, lineWidth: 2)
+                .opacity(isDropTargeted ? 1 : 0)
+                .allowsHitTesting(false)
+                .ignoresSafeArea()
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
