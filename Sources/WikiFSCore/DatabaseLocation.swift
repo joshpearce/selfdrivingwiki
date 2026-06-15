@@ -17,31 +17,64 @@ import SQLite3
 public enum DatabaseLocation {
     public static let appGroupID = "group.org.sockpuppet.wiki"
 
-    private static let databaseFileName = "WikiFS.sqlite"
+    /// The single v0 / pre-multi-wiki database filename. Phase 0 migrates this
+    /// file into the registry as wiki #1; new wikis are named `<ulid>.sqlite`.
+    public static let legacyDatabaseFileName = "WikiFS.sqlite"
 
-    /// The App Group database URL as seen by the **un-sandboxed app**.
+    /// The App Group container directory as seen by the **un-sandboxed app**.
     ///
     /// Built from the LITERAL path
-    /// `~/Library/Group Containers/group.org.sockpuppet.wiki/WikiFS.sqlite`
-    /// (NOT `containerURL(...)`), so the writer needs no app-groups entitlement.
-    /// Creates the containing directory if needed.
-    public static func appGroupContainerURL() throws -> URL {
+    /// `~/Library/Group Containers/group.org.sockpuppet.wiki/` (NOT
+    /// `containerURL(...)`), so the writer needs no app-groups entitlement.
+    /// Creates the directory if needed.
+    public static func appGroupContainerDirectory() throws -> URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let dir = home
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Group Containers", isDirectory: true)
             .appendingPathComponent(appGroupID, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(databaseFileName, isDirectory: false)
+        return dir
     }
 
-    /// The App Group database URL as seen by the **sandboxed extension**, via the
-    /// security API. Resolves to the same inode as `appGroupContainerURL()`.
-    /// Returns `nil` if the entitlement/container is unavailable.
-    public static func extensionContainerURL() -> URL? {
+    /// The legacy single-wiki App Group database URL as seen by the
+    /// **un-sandboxed app** (`…/group.org.sockpuppet.wiki/WikiFS.sqlite`). Kept
+    /// for the one-time v0→registry migration.
+    public static func appGroupContainerURL() throws -> URL {
+        try appGroupContainerDirectory()
+            .appendingPathComponent(legacyDatabaseFileName, isDirectory: false)
+    }
+
+    /// The App Group DB URL for a SPECIFIC wiki as seen by the **un-sandboxed
+    /// app**. The filename is the wiki's ULID (`<ulid>.sqlite`) — never its
+    /// display name — so a rename never orphans the file.
+    public static func appGroupContainerURL(forWikiID id: String) throws -> URL {
+        try appGroupContainerDirectory()
+            .appendingPathComponent("\(id).sqlite", isDirectory: false)
+    }
+
+    /// The App Group container directory as seen by the **sandboxed extension**,
+    /// via the security API. Resolves to the same directory as
+    /// `appGroupContainerDirectory()`. Returns `nil` if the entitlement/container
+    /// is unavailable.
+    public static func extensionContainerDirectory() -> URL? {
         FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: appGroupID)?
-            .appendingPathComponent(databaseFileName, isDirectory: false)
+            .containerURL(forSecurityApplicationGroupIdentifier: appGroupID)
+    }
+
+    /// The legacy single-wiki App Group DB URL as seen by the **sandboxed
+    /// extension**. Resolves to the same inode as `appGroupContainerURL()`.
+    public static func extensionContainerURL() -> URL? {
+        extensionContainerDirectory()?
+            .appendingPathComponent(legacyDatabaseFileName, isDirectory: false)
+    }
+
+    /// The App Group DB URL for a SPECIFIC wiki as seen by the **sandboxed
+    /// extension** (the File Provider). The extension derives the wiki ULID
+    /// straight from `domain.identifier`, so it needs no registry read.
+    public static func extensionContainerURL(forWikiID id: String) -> URL? {
+        extensionContainerDirectory()?
+            .appendingPathComponent("\(id).sqlite", isDirectory: false)
     }
 
     /// The legacy Phase 1 database URL in per-user Application Support
@@ -57,7 +90,7 @@ public enum DatabaseLocation {
         )
         let dir = base.appendingPathComponent("WikiFS", isDirectory: true)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(databaseFileName, isDirectory: false)
+        return dir.appendingPathComponent(legacyDatabaseFileName, isDirectory: false)
     }
 
     /// One-time migration of the Phase 1 Application Support DB into the App
