@@ -97,6 +97,38 @@ struct SQLiteWikiStoreTests {
         #expect(summaries.contains { $0.id == b.id })
     }
 
+    // MARK: - Change token (Phase 3 sync anchor)
+
+    @Test func changeTokenAdvancesOnEveryMutation() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+
+        // Empty DB → "0:0".
+        #expect(try store.changeToken() == "0:0")
+
+        // Create bumps COUNT and SUM (version starts at 1) → "1:1".
+        let a = try store.createPage(title: "Alpha")
+        #expect(try store.changeToken() == "1:1")
+
+        // Update bumps that row's version by 1 → SUM increments → "1:2".
+        try store.updatePage(id: a.id, title: "Alpha", body: "edited")
+        #expect(try store.changeToken() == "1:2")
+
+        // A SECOND page that is NOT the global-max version must STILL advance the
+        // token — this is the MAX-vs-SUM correctness lock. b starts at version 1
+        // (< a's version 2), yet count:sum changes (2 pages, sum 2+1=3).
+        let b = try store.createPage(title: "Beta")
+        #expect(try store.changeToken() == "2:3")
+
+        // Editing b (version 1 → 2, still not the global max if a were edited
+        // more) advances SUM by exactly 1 → "2:4".
+        try store.updatePage(id: b.id, title: "Beta", body: "beta edit")
+        #expect(try store.changeToken() == "2:4")
+
+        // Delete changes COUNT and SUM → "1:2" (only a's version 2 remains).
+        try store.deletePage(id: b.id)
+        #expect(try store.changeToken() == "1:2")
+    }
+
     // MARK: - ULID ordering
 
     @Test func ulidsSortLexicographicallyInCreationOrder() {

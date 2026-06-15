@@ -176,6 +176,26 @@ public final class SQLiteWikiStore: WikiStore {
         return out
     }
 
+    /// A whole-database change token that advances on ANY page mutation.
+    ///
+    /// Returns `"\(count):\(sumVersions)"` from
+    /// `SELECT COUNT(*), COALESCE(SUM(version),0) FROM pages`. Used as the File
+    /// Provider sync anchor (INITIAL §6 — "notify File Provider that the item
+    /// changed").
+    ///
+    /// Why count:sum and NOT `MAX(version)`: `version` is PER-PAGE
+    /// (`updatePage` does `version = version + 1` on that row only), so editing a
+    /// page that doesn't hold the global maximum would leave `MAX(version)`
+    /// unchanged and the edit would silently stay stale. With count:sum, every
+    /// `update` bumps SUM by 1, and every `create`/`delete` changes COUNT and
+    /// SUM — so the token differs on every create, update, or delete of any page.
+    public func changeToken() throws -> String {
+        let stmt = try statement("SELECT COUNT(*), COALESCE(SUM(version), 0) FROM pages;")
+        defer { stmt.reset() }
+        guard try stmt.step() else { return "0:0" }
+        return "\(stmt.int(at: 0)):\(stmt.int(at: 1))"
+    }
+
     public func getPage(id: PageID) throws -> WikiPage {
         let stmt = try statement("""
         SELECT id, title, slug, body_markdown, created_at, updated_at, version

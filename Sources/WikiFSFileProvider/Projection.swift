@@ -20,8 +20,11 @@ enum Projection {
     enum Identity {
         static let readme = NSFileProviderItemIdentifier("readme")
         static let pages = NSFileProviderItemIdentifier("pages")
-        static let pagesByID = NSFileProviderItemIdentifier("pages-by-id")
-        static let pagesByTitle = NSFileProviderItemIdentifier("pages-by-title")
+        // Container ids come from the shared `WikiFSContainerID` constants so the
+        // extension and the app's `signalChange()` can't drift (a mismatch would
+        // leave the page list stale after an edit).
+        static let pagesByID = NSFileProviderItemIdentifier(WikiFSContainerID.pagesByID)
+        static let pagesByTitle = NSFileProviderItemIdentifier(WikiFSContainerID.pagesByTitle)
 
         static let byIDPrefix = "page-by-id:"
         static let byTitlePrefix = "page-by-title:"
@@ -71,6 +74,19 @@ enum Projection {
         guard let url = DatabaseLocation.extensionContainerURL() else { return nil }
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         return try? SQLiteWikiStore(readOnlyURL: url)
+    }
+
+    // MARK: - Change token (sync anchor)
+
+    /// The whole-database change token used as the File Provider sync anchor.
+    /// Advances on ANY page create/update/delete (count:sum — see
+    /// `SQLiteWikiStore.changeToken()`). Opens a short-lived read store; returns
+    /// a safe `"0:0"` default if the DB is unavailable so the enumerator can
+    /// still answer (and a later real token simply differs → re-sync).
+    static func changeToken() -> String {
+        guard let store = openReadStore(),
+              let token = try? store.changeToken() else { return "0:0" }
+        return token
     }
 
     // MARK: - Metadata resolution
@@ -143,6 +159,12 @@ enum Projection {
             return pageNodes(byTitle: false)
         case Identity.pagesByTitle:
             return pageNodes(byTitle: true)
+        case .workingSet:
+            // The working set is the set of items the daemon actively tracks for
+            // change. Re-emit ALL page nodes (both views) so a working-set
+            // `enumerateChanges` after a signal carries the new itemVersions and
+            // the daemon invalidates its materialized copies.
+            return pageNodes(byTitle: false) + pageNodes(byTitle: true)
         default:
             return []
         }

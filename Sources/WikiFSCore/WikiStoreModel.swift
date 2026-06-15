@@ -17,6 +17,13 @@ public final class WikiStoreModel {
     public private(set) var summaries: [WikiPageSummary] = []
     public var selection: PageID?
 
+    /// Invoked on the main actor after any successful persisted mutation
+    /// (save / new / rename / delete). The app wires this to the File Provider
+    /// `signalChange()` so Terminal reads see edits without relaunch (INITIAL
+    /// §6/§10). Nil-safe: tests leave it unset, and `WikiFSCore` never imports
+    /// `FileProvider` — the closure is injected from the app layer.
+    @ObservationIgnored public var onPageDidChange: (@MainActor () -> Void)?
+
     /// Live editing buffers — the single source of in-flight text.
     public var draftTitle: String = ""
     public var draftBody: String = ""
@@ -93,6 +100,7 @@ public final class WikiStoreModel {
         do {
             try store.updatePage(id: id, title: draftTitle, body: draftBody)
             reloadSummaries()
+            onPageDidChange?()
         } catch {
             // Phase 1: log to console; a save-error surface lands later.
             print("WikiStoreModel.save failed: \(error)")
@@ -116,6 +124,7 @@ public final class WikiStoreModel {
             reloadSummaries()
             selection = page.id
             loadDrafts(for: page.id)
+            onPageDidChange?()
         } catch {
             print("WikiStoreModel.newPage failed: \(error)")
         }
@@ -129,6 +138,7 @@ public final class WikiStoreModel {
             try store.updatePage(id: id, title: newTitle, body: page.bodyMarkdown)
             reloadSummaries()
             if selection == id { draftTitle = newTitle }
+            onPageDidChange?()
         } catch {
             print("WikiStoreModel.rename failed: \(error)")
         }
@@ -144,6 +154,7 @@ public final class WikiStoreModel {
                 loadDrafts(for: nil)
             }
             reloadSummaries()
+            onPageDidChange?()
         } catch {
             print("WikiStoreModel.delete failed: \(error)")
         }

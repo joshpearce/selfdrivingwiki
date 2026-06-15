@@ -1,9 +1,10 @@
 import FileProvider
 import Observation
+import WikiFSCore
 
-/// Drives the File Provider spike from the app: register the domain, resolve
-/// the user-visible Unix path (always asked of the system — never hardcoded),
-/// and tear it down. Phase 4's real path button grows out of this.
+/// Drives the File Provider domain from the app: register it, resolve the
+/// user-visible Unix path (always asked of the system — never hardcoded), and
+/// signal the daemon when the wiki changes so Terminal reads stay fresh.
 @MainActor
 @Observable
 final class FileProviderSpike {
@@ -15,48 +16,28 @@ final class FileProviderSpike {
     var status = "Not registered"
     var path: String?
 
-    /// Idempotent launch-time registration. Adding an already-registered domain
-    /// must not crash, so we check the existing domains first and only add when
-    /// ours is absent; any duplicate-add race is caught and ignored. Then we
-    /// resolve the user-visible path.
+    /// Idempotent launch-time registration: ADD-IF-ABSENT. Query the existing
+    /// domains and add ours only when it's missing, then resolve the path.
+    ///
+    /// Phase 2 used `remove(_, mode: .removeAll)` + re-add on every launch as a
+    /// blunt cache-buster. Phase 3 replaces that with real change signaling
+    /// (`signalChange()`), so we keep the domain — and its materialized tree —
+    /// across launches instead of tearing it down each time.
     func registerIfNeeded() async {
-        // Clean re-registration on launch: remove any existing domain (which
-        // discards the daemon's cached/materialized tree) and add it fresh, so
-        // the projection always reflects the current extension + SQLite content.
-        // The projection is read-only and cheap to re-enumerate; Phase 3 will
-        // replace this coarse refresh with fine-grained per-edit change
-        // signaling. add() never crashes here because we removed first.
-        if let existing = try? await NSFileProviderManager.domains() {
-            for domain in existing where domain.identifier == Self.domain.identifier {
-                // .removeAll discards the daemon's replicated/materialized tree
-                // (a plain remove keeps it cached), so the re-add re-enumerates
-                // cleanly from the SQLite-backed extension. No async variant of
-                // this overload, so bridge the completion handler.
-                _ = await withCheckedContinuation { continuation in
-                    NSFileProviderManager.remove(domain, mode: .removeAll) { _, error in
-                        continuation.resume(returning: error)
-                    }
-                }
+        let alreadyRegistered = (try? await NSFileProviderManager.domains())?
+            .contains { $0.identifier == Self.domain.identifier } ?? false
+
+        if !alreadyRegistered {
+            do {
+                try await NSFileProviderManager.add(Self.domain)
+                status = "Domain registered — resolving path…"
+            } catch {
+                // A racing add can still report "already exists"; treat as benign
+                // and fall through to resolve the path.
+                status = "add(domain): \(error.localizedDescription)"
             }
         }
-        do {
-            try await NSFileProviderManager.add(Self.domain)
-            status = "Domain registered — resolving path…"
-            await resolvePath()
-        } catch {
-            status = "add(domain): \(error.localizedDescription)"
-            await resolvePath()
-        }
-    }
-
-    func register() async {
-        do {
-            try await NSFileProviderManager.add(Self.domain)
-            status = "Domain registered — resolving path…"
-            await resolvePath()
-        } catch {
-            status = "add(domain) failed: \(error.localizedDescription)"
-        }
+        await resolvePath()
     }
 
     func resolvePath() async {
@@ -70,6 +51,30 @@ final class FileProviderSpike {
             status = "Mounted"
         } catch {
             status = "getUserVisibleURL failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Tell the daemon the wiki changed so it re-runs `enumerateChanges` and
+    /// re-fetches the edited page's bytes (INITIAL §6/§10). Signals BOTH page
+    /// containers AND the working set:
+    /// - signaling only the root would NOT refresh the page-list children (root
+    ///   never lists page files), so the edited file would stay stale;
+    /// - the working set is the daemon's actively-tracked materialized set.
+    /// Best-effort + non-throwing: signaling is advisory, not load-bearing for
+    /// correctness (the version bump is). Awaited so callers may show a status.
+    func signalChange() async {
+        guard let manager = NSFileProviderManager(for: Self.domain) else { return }
+        let containers: [NSFileProviderItemIdentifier] = [
+            NSFileProviderItemIdentifier(WikiFSContainerID.pagesByTitle),
+            NSFileProviderItemIdentifier(WikiFSContainerID.pagesByID),
+            .workingSet,
+        ]
+        for container in containers {
+            await withCheckedContinuation { continuation in
+                manager.signalEnumerator(for: container) { _ in
+                    continuation.resume()
+                }
+            }
         }
     }
 

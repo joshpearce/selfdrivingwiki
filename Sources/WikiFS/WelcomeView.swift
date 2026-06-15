@@ -28,7 +28,7 @@ struct WelcomeView: View {
 
             HStack(spacing: 12) {
                 Button("Register & Mount", systemImage: "play.fill") {
-                    Task { await spike.register() }
+                    Task { await spike.registerIfNeeded() }
                 }
                 .keyboardShortcut(.defaultAction)
 

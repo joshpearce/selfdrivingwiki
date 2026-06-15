@@ -38,8 +38,17 @@ struct WikiFSApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView(store: store)
-                .task { await fileProvider.registerIfNeeded() }
+            ContentView(store: store, fileProvider: fileProvider)
+                .task {
+                    // Wire change signaling: every persisted edit asks the File
+                    // Provider daemon to re-enumerate so Terminal reads see the
+                    // update without relaunch (INITIAL §6/§10). Set before the
+                    // first edit can fire; registration resolves the path.
+                    store.onPageDidChange = { [fileProvider] in
+                        Task { await fileProvider.signalChange() }
+                    }
+                    await fileProvider.registerIfNeeded()
+                }
         }
         .windowToolbarStyle(.unified)
         .onChange(of: scenePhase) { _, phase in
