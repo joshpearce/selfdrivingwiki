@@ -28,14 +28,14 @@ progress lives in `PROGRESS.md`. To get a future agent up to speed:
 
 ## Status
 
-See `PROGRESS.md` for the running log. Current: **Phase 3 (M4+M5) — DONE ✅ —
-the v0 definition-of-done loop is proven.** `Copy Unix Path` → read in Terminal →
-edit in the app → re-read sees the update with no relaunch (verified live; the
-edit advanced the File Provider change token `1:5 → 1:6`). On branch
-`phase-3-verify-fresh` (stacked on `phase-2-file-provider`, unmerged; the
-pipeline stacks each phase branch and keeps `main` pristine). **Next: Phase 4 —
-Agent-facing wiki (manifest/JSONL indexes, `[[wiki-links]]`, `WIKI_ROOT`
-launcher) — the agent extension on top of v0.**
+See `PROGRESS.md` for the running log. Current: **🎉 v0 DONE ✅ — all four
+phases gate-passed (M0–M6).** A native macOS SwiftUI wiki, SQLite-backed,
+projected read-only onto the filesystem via a File Provider extension, kept
+fresh on edit, and traversable by an agent launched with `WIKI_ROOT`. Delivered
+across four stacked, **unmerged** branches off a pristine `main`
+(`phase-1-local-wiki` → `phase-2-file-provider` → `phase-3-verify-fresh` →
+`phase-4-agent-wiki`) — review and merge locally. See `PROGRESS.md` for each
+gate's evidence and the known v0 gaps.
 
 ## Milestones (from `plans/INITIAL.md`)
 
@@ -45,7 +45,7 @@ launcher) — the agent extension on top of v0.**
 - **M3 — SQLite-backed page files** ✅ `pages/by-id`, `pages/by-title`, content from SQLite.
 - **M4 — Path button** ✅ `Copy Unix Path`, verification commands in-app.
 - **M5 — Change signaling** ✅ edits increment version; Terminal reads see updates (no relaunch).
-- **M6 — Agent launch** spawn agent with `WIKI_ROOT` env pointing at the projection.
+- **M6 — Agent launch** ✅ spawn agent with `WIKI_ROOT` env pointing at the projection.
 
 ## Build quick reference
 

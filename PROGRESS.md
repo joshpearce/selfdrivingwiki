@@ -2,6 +2,94 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-15 — 🎉 v0 DONE ✅ — all four phases gate-passed
+
+WikiFS v0 is complete: a native macOS SwiftUI wiki, SQLite-backed, projected
+read-only onto the filesystem via a File Provider extension, kept fresh on edit,
+and traversable by an agent launched with `WIKI_ROOT`. Built across four stacked,
+unmerged branches off a pristine `main` (review/merge locally):
+
+- `phase-1-local-wiki` — **Phase 1 (M0+M1)**: SQLite wiki + editor. Gate: create
+  Home, type Markdown, live preview, quit/relaunch persistence, matching SQLite
+  row. (computer-use)
+- `phase-2-file-provider` — **Phase 2 (M2+M3)**: read-only SQLite projection.
+  Gate: `find .` shows the tree, `cat pages/by-title/Home--*.md` returns live
+  SQLite bytes from both by-title and by-id, read-only enforced. (live mount)
+- `phase-3-verify-fresh` — **Phase 3 (M4+M5)**: Copy Unix Path + change-signaling.
+  Gate: copy path → cat → edit in app (token `1:5→1:6`) → re-cat shows new bytes,
+  NO relaunch. Closes INITIAL §12. (computer-use)
+- `phase-4-agent-wiki` — **Phase 4 (M6 + generated views)**: indexes, wiki-links,
+  agent launcher. Gate below.
+
+**Verification method note:** Phases 1–3 and most of Phase 4 were driven via
+computer-use/Bash by dedicated verifier subagents. The Phase-4 index/link/
+read-only/freshness checks were validated directly via Bash (no screen
+disruption); the in-app agent-launcher output panel was confirmed by the user
+(GUI automation was repeatedly stealing focus, so we stopped fighting it).
+
+**What is stubbed / deferred (known v0 gaps):**
+- `enumerateChanges` deletion semantics (`didDeleteItems`) not implemented.
+- A brand-new top-level projection folder (e.g. `indexes/`) needs a one-shot
+  domain re-enumeration on an already-materialized (upgraded) domain — handled
+  by a gated `WIKIFS_REENUMERATE=1` launch hatch; fresh installs don't need it.
+- Rename does not re-resolve the whole wiki-link graph (stale cross-page links
+  self-heal on the linking page's next save).
+- Read-after-write is eventually-consistent (~5 s) — a `cat` within ~1 s of a
+  save can briefly show stale bytes before refreshing (no relaunch needed).
+- macOS-26 TCC "access data from other apps" prompt fires in `App.init()` and
+  re-prompts per re-signed install (cleanup idea: move the DB open off init).
+- Optional post-v0 views skipped: by-created/updated-date, tags/backlinks/
+  attachments JSONL.
+
+## 2026-06-15 — Phase 4 (M6 + generated views): Agent-facing wiki — DONE ✅ (gate passed)
+
+Branch `phase-4-agent-wiki` (stacked on `phase-3-verify-fresh`, unmerged).
+Layers the agent surface on top of the v0 loop.
+
+**Added / changed**
+- **Wiki-links (INITIAL §4).** `WikiFSCore/WikiLinkParser.swift` (pure, tested):
+  `[[Title]]` + `[[Target|alias]]`, whitespace-collapse, dedupe, skip empty.
+  `SQLiteWikiStore` gains `resolveTitleToID` (lowest ULID on duplicate titles),
+  `replaceLinks` (one txn: delete-then-`INSERT OR IGNORE` the resolved subset;
+  **unresolved links omitted** — `page_links.to_page_id` is NOT NULL/FK; self-
+  links allowed), `listAllLinks`. `WikiStoreModel.save()`/`newPage()` re-parse +
+  rewrite that page's links. **`deletePage` now clears `page_links` rows
+  referencing the page (source OR target) first** — required under
+  `foreign_keys=ON` or deleting a linked page throws (orchestrator-caught;
+  regression-tested).
+- **Generated indexes (INITIAL §5).** `WikiFSCore/IndexGenerators.swift` (pure,
+  deterministic, tested): `manifest.json` (`name/version/generated_at/
+  page_count/paths`), `indexes/pages.jsonl` (one line/page, by id), `indexes/
+  links.jsonl` (one line/link from `page_links`). `Projection` adds the four
+  identities + a **token-keyed (`count:sum(version)`) byte cache** so a node's
+  `documentSize` and its `contents` bytes always come from the same snapshot
+  (a mismatch truncates `cat`). `signalChange()` now also signals `.rootContainer`
+  + `indexes` so edits invalidate the generated files.
+- **Agent launcher (INITIAL §8 / M6).** `WikiFS/AgentLauncher.swift`
+  (`@MainActor @Observable`) spawns `/bin/zsh -lc <command>` with `WIKI_ROOT` =
+  the live mount (resolved via `getUserVisibleURL` at click time, never
+  hardcoded), streaming stdout+stderr into the UI via pipe `readabilityHandler`s
+  (non-blocking; `terminationHandler` for exit status). `AgentLauncherView.swift`
+  is the sheet (editable command, Run/Stop, scrolling output). Works because the
+  app is **un-sandboxed** (the Phase-2 Option-B call) — a sandboxed app couldn't
+  `Process`-spawn. Before spawning, `await signalChange()` so the agent sees
+  current content (no fixed-sleep correctness dependency).
+- Tests: 24 → **47** (WikiLinkParser, replaceLinks/resolve/listAllLinks,
+  deletePage-with-links FK regression, index generators).
+
+**Verified (Bash by the orchestrator + user-confirmed GUI)**
+- `manifest.json` valid, `page_count: 2` == `select count(*) from pages`.
+- `indexes/pages.jsonl`: 2 valid JSON lines == 2 pages. `indexes/links.jsonl`:
+  the **cross-page link** `Home→Target` (`{"from","to","link_text":"Target"}`),
+  valid, == the one `page_links` row — `[[Target]]` in Home's body parsed through
+  to the index end to end.
+- Read-only: `manifest.json` overwrite → "operation not permitted"; SQLite
+  untouched. Phase-3 freshness intact (Home body served fresh, no relaunch).
+- 47/47 tests; real-signed `make install`.
+- **Agent launcher: user confirmed** the in-app output panel populated with the
+  `find` tree + manifest + both JSONL files when clicking Run Agent (WIKI_ROOT =
+  the live `~/Library/CloudStorage/WikiFS-WikiFS` mount).
+
 ## 2026-06-15 — Phase 3 (M4+M5): Verify & stay fresh — DONE ✅ (v0 ship-gate loop passed)
 
 **This closes the v0 definition of done (INITIAL §12):** copy a Unix path → read
