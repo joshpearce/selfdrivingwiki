@@ -1,0 +1,7 @@
+.build/
+build/
+dist/
+.agents/
+*.swiftpm
+.DS_Store
+signing/*.provisionprofile
