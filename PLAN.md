@@ -37,6 +37,12 @@ across four stacked, **unmerged** branches off a pristine `main`
 `phase-4-agent-wiki`) — review and merge locally. See `PROGRESS.md` for each
 gate's evidence and the known v0 gaps.
 
+**Post-v0 features** (also stacked, unmerged): `phase-5-file-ingest` — drag a
+file in to **ingest** it (raw bytes + metadata stored in a new `ingested_files`
+SQLite table, NOT a wiki page; surfaced read-only under `files/by-id` &
+`files/by-name`; removable "Files" list). Verified with a real 8 MB PDF served
+byte-identical from the mount. See `PROGRESS.md`.
+
 ## Milestones (from `plans/INITIAL.md`)
 
 - **M0 — App skeleton** ✅ build environment + launching SwiftUI window.
