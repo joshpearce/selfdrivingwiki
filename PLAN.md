@@ -41,15 +41,27 @@ with a plain-folder export, even though that would dodge the signing requirement
 
 ## Status
 
-See `PROGRESS.md` for the running log. Current: **LLM Wiki Phase A (Write path +
-change bridge) DONE ✅ — live gate passed.** The `wikictl` CLI
-(`page list/get/upsert/delete`, selecting a wiki via `--wiki`/`WIKI_DB`) writes
-straight to a wiki's `<ulid>.sqlite`; a shared `PageUpsert` op keeps the
-`[[link]]` graph identical across the app and the CLI; `wikictl` posts a per-wiki
-Darwin notification and the app's debounced change bridge rebuilds the sidebar +
-`signalChange()`s that wiki's mount. 113 tests; clean signed bundle (app + appex +
-`wikictl`). Branch `llmwiki/phase-a-write-path` (stacked on
-`llmwiki/phase-0-many-wikis`, unmerged). Next: Phase B (`log.md` + `index.md`).
+See `PROGRESS.md` for the running log. Current: **LLM Wiki Phase B (`log.md` +
+`index.md`) DRAFT — built, tests green; live gate pending.** Two stepwise DB
+migrations (v3→4 `log` table, v4→5 `wiki_index` singleton seeded like
+`system_prompt`); `wikictl log append --kind … --title … [--note …]` and
+`wikictl index set --body-file <path|->` (both select the wiki via
+`--wiki`/`WIKI_DB` and post the same per-wiki Darwin notification as Phase A);
+both projected read-only at the wiki ROOT — `log.md` as grep-able
+`## [YYYY-MM-DD] <kind> | <title>` lines, `index.md` as the singleton body
+verbatim; `changeToken()` extended to `…:logCount:idxVersion` so a log-only or
+index-only write still advances the sync anchor. 135 tests; clean signed bundle.
+Branch `llmwiki/phase-b-index-log` (stacked on `llmwiki/phase-a-write-path`,
+unmerged). Next: Phase C (`claude -p` operations).
+
+**Prior: LLM Wiki Phase A (Write path + change bridge) DONE ✅ — live gate
+passed.** The `wikictl` CLI (`page list/get/upsert/delete`, selecting a wiki via
+`--wiki`/`WIKI_DB`) writes straight to a wiki's `<ulid>.sqlite`; a shared
+`PageUpsert` op keeps the `[[link]]` graph identical across the app and the CLI;
+`wikictl` posts a per-wiki Darwin notification and the app's debounced change
+bridge rebuilds the sidebar + `signalChange()`s that wiki's mount. 113 tests;
+clean signed bundle (app + appex + `wikictl`). Branch `llmwiki/phase-a-write-path`
+(stacked on `llmwiki/phase-0-many-wikis`, unmerged).
 
 **Prior: LLM Wiki Phase 0 (Many wikis) DONE ✅ — live gate passed.** One SQLite DB
 + one File Provider domain **per wiki**, a `wikis.json` registry, an in-app
