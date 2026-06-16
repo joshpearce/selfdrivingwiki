@@ -134,6 +134,14 @@ final class FileProviderSpike {
     /// v0 signaled, now scoped to the active wiki's domain. Best-effort.
     func signalChange() async {
         guard let wikiID = activeWikiID else { return }
+        await signalChange(forWikiID: wikiID)
+    }
+
+    /// Signal a SPECIFIC wiki's domain (Phase A change bridge): a `wikictl` write
+    /// can land in a wiki that is NOT the one on screen, and that wiki's mount
+    /// must still refresh. Signals the same container set as the active-wiki
+    /// path, scoped to the named wiki's domain. Best-effort.
+    func signalChange(forWikiID wikiID: String) async {
         let domain = domain(id: wikiID, displayName: wikiID)
         guard let manager = NSFileProviderManager(for: domain) else { return }
         let containers: [NSFileProviderItemIdentifier] = [

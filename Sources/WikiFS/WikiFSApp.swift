@@ -15,6 +15,9 @@ struct WikiFSApp: App {
     @State private var manager: WikiManager
     @State private var fileProvider = FileProviderSpike()
     @State private var agentLauncher = AgentLauncher()
+    /// Built lazily after `bootstrap` (it needs the registered wikis) — see the
+    /// `.task` below. The change bridge observes `wikictl`'s Darwin notifications.
+    @State private var changeBridge: WikiChangeBridge?
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -47,11 +50,22 @@ struct WikiFSApp: App {
                        let descriptor = manager.wikis.first(where: { $0.id == active }) {
                         await fileProvider.activate(id: descriptor.id, displayName: descriptor.displayName)
                     }
+                    // Stand up the change bridge now that the registry is loaded,
+                    // then observe every wiki's `wikictl` Darwin notification.
+                    let bridge = WikiChangeBridge(manager: manager, fileProvider: fileProvider)
+                    bridge.refreshObservations()
+                    changeBridge = bridge
                 }
         }
         .windowToolbarStyle(.unified)
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { manager.activeStore?.flushPendingSaves() }
+        }
+        // Keep the bridge's Darwin observations in lockstep with the wiki set:
+        // a freshly-created wiki's CLI writes must be heard; a deleted wiki's
+        // notification name released.
+        .onChange(of: manager.wikis) { _, _ in
+            changeBridge?.refreshObservations()
         }
     }
 }
