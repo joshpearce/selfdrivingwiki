@@ -39,6 +39,12 @@ public final class WikiStoreModel {
     /// well-tested page autosave path is untouched.
     public var draftSystemPrompt: String = ""
 
+    /// True while a `claude -p` operation is running against THIS wiki (Phase C /
+    /// decision #6). The editor binds this to go read-only with a banner, and
+    /// autosave is paused — so in-app edits can't clobber the agent's `wikictl`
+    /// writes (last-writer-wins race). Set via `beginAgentRun` / `endAgentRun`.
+    public private(set) var isAgentRunning = false
+
     private let store: WikiStore
     private var autosaveTask: Task<Void, Never>?
     private var systemPromptAutosaveTask: Task<Void, Never>?
@@ -112,6 +118,9 @@ public final class WikiStoreModel {
     public func titleChanged() { scheduleAutosave() }
 
     private func scheduleAutosave() {
+        // Paused while an agent runs (decision #6): an in-app autosave must never
+        // clobber the agent's concurrent `wikictl` writes.
+        guard !isAgentRunning else { return }
         autosaveTask?.cancel()
         autosaveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(500))
@@ -158,6 +167,8 @@ public final class WikiStoreModel {
     /// Called on each keystroke in the system-prompt editor; debounced like the
     /// page editor (separate task so the two tracks don't cancel each other).
     public func systemPromptChanged() {
+        // Paused while an agent runs (decision #6), same as the page autosave.
+        guard !isAgentRunning else { return }
         systemPromptAutosaveTask?.cancel()
         systemPromptAutosaveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(500))
@@ -192,6 +203,29 @@ public final class WikiStoreModel {
     public func flushPendingSaves() {
         flushPendingSave()
         flushPendingSystemPromptSave()
+    }
+
+    // MARK: - Agent run lock (Phase C, decision #6)
+
+    /// Enter the edit-locked state for the duration of a `claude -p` run: flush any
+    /// pending edits FIRST (so nothing in-flight is lost), then mark the model
+    /// running so the editor goes read-only and autosave is paused. Pausing
+    /// autosave is what prevents the in-app save from clobbering the agent's
+    /// `wikictl` writes. The live change-bridge `reloadFromStore()` is unaffected —
+    /// the sidebar still fills in as the agent's writes land.
+    public func beginAgentRun() {
+        flushPendingSaves()
+        isAgentRunning = true
+    }
+
+    /// Exit the edit-locked state (from the spawn's `terminationHandler`, so a
+    /// killed agent still re-enables editing). Rebuilds the lists from the store so
+    /// the sidebar reflects everything the agent wrote, and reloads the open
+    /// document's draft from the (possibly agent-rewritten) source.
+    public func endAgentRun() {
+        isAgentRunning = false
+        reloadFromStore()
+        loadDrafts(for: loadedSelection)
     }
 
     // MARK: - Mutations
@@ -304,6 +338,14 @@ public final class WikiStoreModel {
         } catch {
             print("WikiStoreModel.deleteIngestedFile failed: \(error)")
         }
+    }
+
+    /// The current `system_prompt` singleton body from the store (the seeded
+    /// default if absent) — the agent run passes this verbatim via
+    /// `--append-system-prompt`. Read fresh from the store, not from the draft, so
+    /// it reflects the last persisted edit even if the prompt editor isn't open.
+    public func currentSystemPromptBody() -> String {
+        (try? store.getSystemPrompt())?.body ?? SystemPrompt.defaultBody
     }
 
     // MARK: - Source-of-truth rebuild
