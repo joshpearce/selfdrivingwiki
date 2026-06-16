@@ -5,7 +5,6 @@ import SwiftUI
 /// silent lock state.
 struct AgentTranscriptSidebar: View {
     @Bindable var launcher: AgentLauncher
-    let isExpanded: Bool
     let onCollapse: () -> Void
 
     var body: some View {
@@ -15,28 +14,39 @@ struct AgentTranscriptSidebar: View {
             AgentActivityView(launcher: launcher)
                 .padding(AgentTranscriptMetrics.padding)
         }
-        .frame(width: isExpanded ? AgentTranscriptMetrics.width : 0)
+        .frame(width: AgentTranscriptMetrics.width)
         .frame(maxHeight: .infinity)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipped()
-        .accessibilityHidden(!isExpanded)
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            Label("Transcript", systemImage: "text.bubble")
-                .font(.headline)
-            Spacer()
-            if launcher.isRunning {
-                ProgressView()
-                    .controlSize(.small)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Label("Transcript", systemImage: "text.bubble")
+                    .font(.headline)
+                Spacer()
+                if launcher.isRunning {
+                    ProgressView()
+                        .controlSize(.small)
+                    Button("Stop Run", systemImage: "stop.fill") {
+                        launcher.stop()
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.red)
+                    .help("Stop the running agent")
+                }
+                Button("Hide Transcript", systemImage: "sidebar.trailing") {
+                    onCollapse()
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.borderless)
+                .help("Hide transcript")
             }
-            Button("Hide Transcript", systemImage: "sidebar.trailing") {
-                onCollapse()
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                AgentRunStatusView(launcher: launcher, now: context.date)
             }
-            .labelStyle(.iconOnly)
-            .buttonStyle(.borderless)
-            .help("Hide transcript")
         }
         .padding(.horizontal, AgentTranscriptMetrics.padding)
         .padding(.vertical, 10)

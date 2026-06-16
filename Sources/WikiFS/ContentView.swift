@@ -33,14 +33,14 @@ struct ContentView: View {
                     onIngestFile: runIngest
                 )
 
-                Divider()
-                    .opacity(isTranscriptExpanded ? 1 : 0)
-
-                AgentTranscriptSidebar(
-                    launcher: agentLauncher,
-                    isExpanded: isTranscriptExpanded,
-                    onCollapse: collapseTranscript
-                )
+                if isTranscriptExpanded {
+                    Divider()
+                    AgentTranscriptSidebar(
+                        launcher: agentLauncher,
+                        onCollapse: collapseTranscript
+                    )
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
             }
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: isTranscriptExpanded)
         }
