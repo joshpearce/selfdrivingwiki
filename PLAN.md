@@ -41,18 +41,20 @@ with a plain-folder export, even though that would dodge the signing requirement
 
 ## Status
 
-See `PROGRESS.md` for the running log. Current: **LLM Wiki Phase B (`log.md` +
-`index.md`) DONE ✅ — live gate passed.** Two stepwise DB
-migrations (v3→4 `log` table, v4→5 `wiki_index` singleton seeded like
-`system_prompt`); `wikictl log append --kind … --title … [--note …]` and
-`wikictl index set --body-file <path|->` (both select the wiki via
-`--wiki`/`WIKI_DB` and post the same per-wiki Darwin notification as Phase A);
-both projected read-only at the wiki ROOT — `log.md` as grep-able
-`## [YYYY-MM-DD] <kind> | <title>` lines, `index.md` as the singleton body
-verbatim; `changeToken()` extended to `…:logCount:idxVersion` so a log-only or
-index-only write still advances the sync anchor. 135 tests; clean signed bundle.
-Branch `llmwiki/phase-b-index-log` (stacked on `llmwiki/phase-a-write-path`,
-unmerged). Next: Phase C (`claude -p` operations).
+See `PROGRESS.md` for the running log. Current: **LLM Wiki Phase C (`claude -p`
+operations) DONE ✅ — live gate passed.** The app runs three discrete, scoped
+`claude -p` operations against the selected wiki — **Ingest** (summarize a
+dropped source into pages + index + log), **Query** (cited answer), **Lint**
+(health report) — each spawned with `--append-system-prompt` (the wiki's
+`CLAUDE.md`), `--dangerously-skip-permissions`, and the wiki layout injected up
+front (+ a projected `TREE.md`), writing only via `wikictl`. A **live activity
+panel** streams the agent's tool calls/text in real time (`--output-format
+stream-json`) with a **backend `run.jsonl`** per run; the in-app editor is
+**locked** during a run; the sidebar refreshes live as writes land; and
+`[[wiki-links]]` are now **clickable** in the preview. 207 tests; clean signed
+bundle (app + appex + `wikictl`). Branch `llmwiki/phase-c-claude-ops` (stacked on
+`llmwiki/phase-b-index-log`, unmerged). Next: Phase D (the real `CLAUDE.md`
+schema — and slim the now-duplicated inline prompt preamble).
 
 **Prior: LLM Wiki Phase A (Write path + change bridge) DONE ✅ — live gate
 passed.** The `wikictl` CLI (`page list/get/upsert/delete`, selecting a wiki via

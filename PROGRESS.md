@@ -2,7 +2,7 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
-## 2026-06-16 — Preview polish: clickable `[[wiki-links]]` — DRAFT (live-check pending)
+## 2026-06-16 — Preview polish: clickable `[[wiki-links]]` — DONE ✅ (live-checked)
 
 Surfaced during the Phase C gate: the in-app Markdown preview rendered
 `[[Photosynthesis]]` as literal dead text because `AttributedString(markdown:)`
@@ -38,7 +38,7 @@ What landed:
 Still DRAFT until the live check: click a resolved `[[link]]` in the running app
 and confirm it selects that page; confirm a missing link reads dimmed and inert.
 
-## 2026-06-16 — Phase C gate fix: skip-permissions + layout-up-front + `TREE.md` — DRAFT (re-gate pending)
+## 2026-06-16 — Phase C gate fix: skip-permissions + layout-up-front + `TREE.md` — DONE ✅ (folded into the Phase C gate pass below)
 
 The first live Phase-C gate FAILED with two real defects (still DRAFT — re-gate
 pending). Fixing exactly these on `llmwiki/phase-c-claude-ops`:
@@ -93,14 +93,55 @@ green at **184**; `make` produces a clean signed bundle.
 (Original Phase-C build notes below — the parts about `--allowedTools` are
 superseded by the skip-permissions switch above.)
 
-## 2026-06-16 — LLM Wiki Phase C: `claude -p` operations (Ingest / Query / Lint) — DRAFT (gate pending)
+## 2026-06-16 — LLM Wiki Phase C: `claude -p` operations (Ingest / Query / Lint) — DONE ✅ (gate passed)
 
 Branch `llmwiki/phase-c-claude-ops` (stacked on `llmwiki/phase-b-index-log`).
 Implements `plans/llm-wiki.md` Phase C: generalizes the v0 agent launcher into
 three discrete `claude -p` operations scoped to the active wiki, the per-wiki
 edit lock, and the live-sidebar refresh during a run. The deterministic seams
 (prompt/command/env construction, PATH preflight, edit-lock state machine) are
-unit-tested; the real agent run is verified live by the independent gate.
+unit-tested; the real agent run was verified live. This phase took **three
+gate-driven course-corrections** (the two entries above + this one are the
+sub-stories): (1) the streaming UI + backend logs were missing → built them
+(without live visibility the agent "just sits there"); (2) the least-privilege
+`--allowedTools` allowlist rejected EVERY command (it can't match a command
+containing the `$WIKI_ROOT`/`$WIKI_DB` expansion, and `-p` has no approval
+prompt) → switched to `--dangerously-skip-permissions` + inject the wiki layout
+up front (`TREE.md` + in-prompt map) so the agent acts instead of probing; (3)
+ingested `[[wiki-links]]` rendered as dead text in the preview → made them
+clickable/navigable.
+
+**Verified (live gate — user drove the app UI, orchestrator verified via Bash; real `make clean && make install`, real-signed, on a freshly-created wiki `GateCFresh`)**
+- **Ingest (structural pass):** a real `claude -p` Ingest of `photosynthesis.txt`
+  took the wiki from **1 page → 6** (Photosynthesis + Chloroplast, Chlorophyll,
+  Light-Dependent Reactions, Calvin Cycle), appended an **`ingest` log row**,
+  rewrote **`index.md` (v2→v3)**, and built a **9-edge `[[link]]` graph**
+  (`page_links` + `indexes/links.jsonl`) — all written via `wikictl`, the
+  read-only mount untouched. The gate is structural (the agent is
+  non-deterministic), and all three required artifacts (≥1 page, ≥1 log entry,
+  index changed) landed.
+- **Query:** returns a cited answer in the panel + a `query` log row.
+- **Live streaming + backend logs:** the activity panel showed real tool-call
+  rows (`printf … | wikictl page upsert`, etc.), assistant text, and the green
+  terminal result **as they streamed**; **4 `run.jsonl`** backend logs captured
+  the full NDJSON event stream (system init → assistant → tool_use → tool_result
+  → result) under `~/Library/Caches/WikiFS-agent/<uuid>/`, with `run.stderr.log`
+  sibling and a "Reveal Log" button.
+- **Edit lock:** the in-app editor was read-only with the "Agent is updating the
+  wiki…" banner for the run's duration and re-enabled on completion (per-wiki).
+- **Clickable wiki-links:** in the preview, `[[Photosynthesis]]` etc. render as
+  accent links and navigate to the target page on click; unresolved links render
+  dimmed + inert. (On-disk/mount bytes stay literal `[[…]]`.)
+- **Tests 161 → 207** across the phase (operations seams, `AgentEvent` parser,
+  `WikiTreeRenderer`, `WikiLinkMarkdown` linkifier + navigation), all green and
+  deterministic — also fixed three pre-existing same-millisecond ULID-ordering
+  flakes (log order; duplicate-title resolve; link order) surfaced along the way.
+
+**Carry-forward to Phase D:** the operation `-p` prompts currently INLINE the
+schema (layout + `wikictl` cheatsheet + read-after-write rule) as a stopgap,
+because today's `system_prompt`/`CLAUDE.md` is still the Phase-D stub. Phase D
+puts the real schema in `CLAUDE.md`; the `-p` prompts should then slim down to
+just the per-op task (the inline preamble becomes the duplication to remove).
 
 **Flag surface confirmed (claude-api skill + installed CLI `2.1.178`)**
 - `claude --help` confirms `-p`/`--print`, `--append-system-prompt <prompt>`,
