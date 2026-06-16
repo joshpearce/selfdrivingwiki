@@ -5,111 +5,227 @@ import Foundation
 /// **Query**, and **Lint**.
 ///
 /// This is a PURE value type — it carries only the per-run inputs (the ingest
-/// source, the query text) and knows how to render the operation's **own prompt**.
-/// It deliberately does NOT spawn anything: command/env/cwd assembly lives in
-/// `OperationCommand` (also pure), and the actual `Process` spawn lives in the
-/// app's `AgentLauncher`. Keeping the prompt/command construction pure is what
-/// makes the Phase-C deterministic seams unit-testable without a real agent run.
+/// source, the query text, the staged scratch paths) and knows how to render the
+/// operation's **own prompt**. It deliberately does NOT spawn anything:
+/// command/env/cwd assembly lives in `OperationCommand` (also pure), and the actual
+/// `Process` spawn lives in the app's `AgentLauncher`. Keeping the prompt/command
+/// construction pure is what makes the Phase-C deterministic seams unit-testable
+/// without a real agent run.
 ///
-/// **DRY against the schema.** The maintainer schema (`SystemPrompt.defaultBody`,
-/// projected as `CLAUDE.md`/`AGENTS.md`) is delivered on every run via
-/// `--append-system-prompt`, and it documents the layout, the `wikictl` command
-/// reference, the read-after-write rule, and the Ingest/Query/Lint workflows. So
-/// each operation's `-p` prompt carries only the per-op task plus the dynamic,
-/// per-run facts the system prompt cannot contain: the resolved absolute
-/// `WIKI_ROOT`, and (for Ingest) the source file's absolute path / (for Query) the
-/// question. It does NOT restate the layout map or the `wikictl` cheatsheet — that
-/// would duplicate the schema and drift from it.
+/// **The static/dynamic/operational split.** The maintainer schema
+/// (`SystemPrompt.defaultBody`, projected as `CLAUDE.md`/`AGENTS.md`) is delivered
+/// every run via `--append-system-prompt` and documents the LAYOUT and CONVENTIONS
+/// (page shapes, the `[[link]]` rule, the workflows). Each operation's `-p` prompt
+/// carries (a) the OPERATIONAL write rule + the exact `wikictl` write commands —
+/// load-bearing enough that the schema-only placement got under-weighted (the agent
+/// probed the read-only mount; `feature/ingest-fewer-turns` problem #1) — plus (b)
+/// the dynamic per-run facts the schema can't contain: the resolved absolute
+/// `WIKI_ROOT` and the absolute scratch paths of the staged source / wiki-state
+/// snapshot. It does NOT restate the layout map (DRY against the schema).
 public enum WikiOperation: Equatable, Sendable {
-    /// Summarize one already-ingested source file into the wiki. `sourcePath` is
-    /// the source's mount-relative path under `$WIKI_ROOT` (e.g.
-    /// `files/by-id/<ulid>.<ext>`), so the agent can `Read` it directly.
-    case ingest(sourcePath: String)
+  /// Summarize one already-ingested source file into the wiki.
+  ///
+  /// - `sourcePath`: the source's mount-relative path under `$WIKI_ROOT` (kept for
+  ///   reference / the rare mount fallback).
+  /// - `stagedSourcePath`: the ABSOLUTE scratch path the app staged the raw source
+  ///   bytes to (read from SQLite, not the laggy mount) — what the agent actually
+  ///   reads.
+  /// - `stateFilePath`: the ABSOLUTE scratch path of the staged `WIKI_STATE.md`
+  ///   snapshot (titles + index.md + log tail) — so the agent skips orientation.
+  /// - `plan`: the model-tiering decision (single Sonnet pass vs Opus planner +
+  ///   Sonnet workers), which selects between the single-pass and plan-and-fan-out
+  ///   prompt.
+  case ingest(
+    sourcePath: String,
+    stagedSourcePath: String,
+    stateFilePath: String,
+    plan: IngestPlan
+  )
 
-    /// Answer a question from the wiki's contents, returning a cited answer.
-    case query(question: String)
+  /// Answer a question from the wiki's contents, returning a cited answer.
+  /// `stateFilePath` is the staged `WIKI_STATE.md` snapshot.
+  case query(question: String, stateFilePath: String)
 
-    /// Health-check the wiki (contradictions, stale claims, orphan pages, missing
-    /// cross-refs, concepts lacking a page) and report findings.
+  /// Health-check the wiki and report findings. `stateFilePath` is the staged
+  /// `WIKI_STATE.md` snapshot.
+  case lint(stateFilePath: String)
+
+  /// A short, stable identifier for the operation kind (logging / UI).
+  public var kind: Kind {
+    switch self {
+    case .ingest: .ingest
+    case .query: .query
+    case .lint: .lint
+    }
+  }
+
+  public enum Kind: String, CaseIterable, Sendable {
+    case ingest
+    case query
     case lint
 
-    /// A short, stable identifier for the operation kind (logging / UI).
-    public var kind: Kind {
-        switch self {
-        case .ingest: .ingest
-        case .query: .query
-        case .lint: .lint
-        }
+    /// User-facing title for the operation.
+    public var title: String {
+      switch self {
+      case .ingest: "Ingest"
+      case .query: "Query"
+      case .lint: "Lint"
+      }
     }
+  }
 
-    public enum Kind: String, CaseIterable, Sendable {
-        case ingest
-        case query
-        case lint
-
-        /// User-facing title for the operation.
-        public var title: String {
-            switch self {
-            case .ingest: "Ingest"
-            case .query: "Query"
-            case .lint: "Lint"
-            }
-        }
+  /// The top-level `--model` alias for this operation. Ingest tiers by its plan
+  /// (cheap Sonnet for a tiny source, Opus for the planner); Query and Lint stay on
+  /// Opus (light, single-agent, judgement-heavy).
+  public var topLevelModelAlias: String {
+    switch self {
+    case .ingest(_, _, _, let plan): plan.topLevelModelAlias
+    case .query, .lint: "opus"
     }
+  }
+
+  /// The `--agents` JSON for this operation, or nil when it runs single-agent.
+  /// Only a planned Ingest defines subagents (the Sonnet `ingest-worker`); Query
+  /// and Lint never do.
+  public var agentsJSON: String? {
+    switch self {
+    case .ingest(_, _, _, let plan): plan.agentsJSON()
+    case .query, .lint: nil
+    }
+  }
 }
 
 extension WikiOperation {
-    /// The operation's OWN prompt — the `-p` argument handed to `claude`. Slim by
-    /// design: the maintainer schema (layout, `wikictl` reference, read-after-write
-    /// rule, and the full Ingest/Query/Lint workflows) arrives every run via
-    /// `--append-system-prompt`, so this prompt carries only the per-op task and the
-    /// dynamic per-run facts the schema can't contain.
-    ///
-    /// - Parameter wikiRoot: the wiki's LIVE mount path, RESOLVED at click time and
-    ///   passed in (NOT `$WIKI_ROOT` for the agent to expand). Injecting the
-    ///   concrete path is load-bearing: the live Phase-C gate showed the agent
-    ///   burning turns discovering the layout and (under the old allowlist) getting
-    ///   every `$WIKI_ROOT`-expanded command rejected.
-    public func prompt(wikiRoot: String) -> String {
-        switch self {
-        case .ingest(let sourcePath):
-            return Self.ingestPrompt(wikiRoot: wikiRoot, sourcePath: sourcePath)
-        case .query(let question):
-            return Self.queryPrompt(wikiRoot: wikiRoot, question: question)
-        case .lint:
-            return Self.lintPrompt(wikiRoot: wikiRoot)
-        }
+  /// The operation's OWN `-p` prompt. Leads with the unmissable write rule + the
+  /// exact `wikictl` write commands (problem #1), then the "don't rediscover"
+  /// directive naming the staged files (problem #2), then the per-op task. The
+  /// schema (delivered via `--append-system-prompt`) still carries the layout map
+  /// and conventions — this prompt does NOT restate those (DRY).
+  ///
+  /// - Parameters:
+  ///   - wikiRoot: the wiki's LIVE mount path, RESOLVED at click time and passed in
+  ///     (NOT `$WIKI_ROOT` for the agent to expand).
+  public func prompt(wikiRoot: String) -> String {
+    switch self {
+    case .ingest(_, let stagedSourcePath, let stateFilePath, let plan):
+      switch plan {
+      case .singleSonnet:
+        return Self.ingestSinglePrompt(
+          wikiRoot: wikiRoot,
+          stagedSourcePath: stagedSourcePath,
+          stateFilePath: stateFilePath)
+      case .opusPlanner:
+        return Self.ingestPlannerPrompt(
+          wikiRoot: wikiRoot,
+          stagedSourcePath: stagedSourcePath,
+          stateFilePath: stateFilePath)
+      }
+    case .query(let question, let stateFilePath):
+      return Self.queryPrompt(
+        wikiRoot: wikiRoot, question: question, stateFilePath: stateFilePath)
+    case .lint(let stateFilePath):
+      return Self.lintPrompt(wikiRoot: wikiRoot, stateFilePath: stateFilePath)
     }
+  }
 
-    private static func ingestPrompt(wikiRoot: String, sourcePath: String) -> String {
-        """
-        Follow the Ingest workflow from your instructions to bring one source into \
-        this wiki. Act immediately; do not explore the layout first.
+  // MARK: - Ingest prompts
 
-        WIKI_ROOT (resolved, read-only mount): \(wikiRoot)
-        Source to ingest (absolute path): \(wikiRoot)/\(sourcePath)
+  /// Single-pass Ingest (tiny source): one Sonnet agent does the whole ingest via
+  /// `wikictl`.
+  private static func ingestSinglePrompt(
+    wikiRoot: String,
+    stagedSourcePath: String,
+    stateFilePath: String
+  ) -> String {
+    """
+    \(IngestWriteRule.writes)
 
-        Work autonomously to completion — do not ask for confirmation. The live app \
-        shows your changes as they land.
-        """
-    }
+    \(IngestWriteRule.dontRediscover(stateFilePath: stateFilePath, sourceFilePath: stagedSourcePath))
 
-    private static func queryPrompt(wikiRoot: String, question: String) -> String {
-        """
-        Follow the Query workflow from your instructions to answer a question from \
-        this wiki, citing the pages or files/ paths your answer draws on.
+    TASK — Ingest this one source into the wiki, following the Ingest workflow from \
+    your instructions. Act immediately; do not explore the mount first. Read the \
+    staged source, write one or more summary/entity/concept pages via \
+    `wikictl page upsert` (cross-linking with [[wiki links]]), rewrite index.md via \
+    `wikictl index set`, and record it with `wikictl log append --kind ingest`. \
+    Work autonomously to completion; the live app shows your changes as they land.
 
-        WIKI_ROOT (resolved, read-only mount): \(wikiRoot)
-        Question: \(question)
-        """
-    }
+    WIKI_ROOT (resolved, read-only mount — reference only): \(wikiRoot)
+    """
+  }
 
-    private static func lintPrompt(wikiRoot: String) -> String {
-        """
-        Follow the Lint workflow from your instructions to health-check this wiki \
-        and print a clear findings report.
+  /// Planned Ingest (non-tiny source): an Opus planner plans the page set, fans out
+  /// to Sonnet `ingest-worker` subagents, then synthesizes index.md + the log entry.
+  /// The 2..19 worker guardrail is stated prompt-level.
+  private static func ingestPlannerPrompt(
+    wikiRoot: String,
+    stagedSourcePath: String,
+    stateFilePath: String
+  ) -> String {
+    """
+    \(IngestWriteRule.writes)
 
-        WIKI_ROOT (resolved, read-only mount): \(wikiRoot)
-        """
-    }
+    \(IngestWriteRule.dontRediscover(stateFilePath: stateFilePath, sourceFilePath: stagedSourcePath))
+
+    TASK — Ingest this one source into the wiki, following the Ingest workflow from \
+    your instructions. You are the PLANNER. Act immediately; do not explore the \
+    mount first.
+
+    1. Read the staged source and the staged WIKI_STATE.md to understand the \
+       material and the existing pages.
+    2. PLAN the set of wiki pages this ingest should produce (summary pages plus the \
+       entity/concept pages it mentions), reusing existing titles where they fit.
+    3. Fan out the page-writing to `ingest-worker` subagents via the Task tool — \
+       use MORE THAN 1 and FEWER THAN 20 workers (between 2 and 19). Size the \
+       fan-out to the material: do NOT spawn 15 workers for 3 pages; one worker can \
+       own several closely-related pages. In each worker's task, give it the staged \
+       source path (\(stagedSourcePath)) and the exact page title(s) it must write.
+    4. After the workers finish, YOU synthesize: rewrite index.md wholesale via \
+       `wikictl index set` so it catalogs the new pages, then append the log entry \
+       with `wikictl log append --kind ingest`.
+
+    Work autonomously to completion; the live app shows changes as they land.
+
+    WIKI_ROOT (resolved, read-only mount — reference only): \(wikiRoot)
+    """
+  }
+
+  // MARK: - Query / Lint prompts
+
+  /// Query stays single-agent Opus, but still gets the write rule (it may file an
+  /// answer page) + the staged-state / don't-rediscover directive.
+  private static func queryPrompt(
+    wikiRoot: String,
+    question: String,
+    stateFilePath: String
+  ) -> String {
+    """
+    \(IngestWriteRule.writes)
+
+    \(IngestWriteRule.dontRediscover(stateFilePath: stateFilePath))
+
+    TASK — Answer a question from this wiki, following the Query workflow from your \
+    instructions. Cite the page titles or files/ paths your answer draws on. If you \
+    file a useful answer back as a page, write it via `wikictl page upsert` and log \
+    it with `wikictl log append --kind query`.
+
+    WIKI_ROOT (resolved, read-only mount — reference only): \(wikiRoot)
+    Question: \(question)
+    """
+  }
+
+  /// Lint stays single-agent Opus, with the write rule (it logs and may file a
+  /// report) + the staged-state / don't-rediscover directive.
+  private static func lintPrompt(wikiRoot: String, stateFilePath: String) -> String {
+    """
+    \(IngestWriteRule.writes)
+
+    \(IngestWriteRule.dontRediscover(stateFilePath: stateFilePath))
+
+    TASK — Health-check this wiki and print a clear findings report, following the \
+    Lint workflow from your instructions. Record it with \
+    `wikictl log append --kind lint`.
+
+    WIKI_ROOT (resolved, read-only mount — reference only): \(wikiRoot)
+    """
+  }
 }

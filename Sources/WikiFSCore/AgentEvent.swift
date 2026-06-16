@@ -27,6 +27,15 @@ public enum AgentEvent: Equatable, Sendable {
     /// the (possibly truncated) result text; `isError` flags a failed tool.
     case toolResult(isError: Bool, summary: String)
 
+    /// A subagent delegation lifecycle event (`{"type":"system",
+    /// "subtype":"task_started" | "task_completed"}`), emitted when the Opus planner
+    /// fans out to a Sonnet `ingest-worker` via the Task/Agent tool. Surfacing these
+    /// makes the Opus→Sonnet fan-out visible in the panel as distinct rows rather
+    /// than an opaque `Agent` tool call. `subagentType` is the worker name
+    /// (`ingest-worker`); `description` is the planner's one-line task label;
+    /// `isCompletion` distinguishes the start row from the finish row.
+    case subagent(subagentType: String, description: String, isCompletion: Bool)
+
     /// The terminal `{"type":"result"}` event — the run's final answer/report.
     /// `isError` is the run-level error flag.
     case result(isError: Bool, text: String)
@@ -66,6 +75,23 @@ public enum AgentEventParser {
         switch envelope.type {
         case "system" where envelope.subtype == "init":
             return .systemInit(model: envelope.model ?? "claude")
+
+        // Subagent fan-out: the planner delegating to a Sonnet worker emits a
+        // `task_started` (the delegation begins) and a terminal `task_notification`
+        // (the worker finished). Surface both so the Opus→Sonnet fan-out is visible.
+        // `task_updated` is an intermediate status patch we skip (the notification
+        // already conveys completion).
+        case "system" where envelope.subtype == "task_started":
+            return .subagent(
+                subagentType: envelope.subagentType ?? "subagent",
+                description: envelope.description ?? envelope.summary ?? "",
+                isCompletion: false)
+
+        case "system" where envelope.subtype == "task_notification" && envelope.status == "completed":
+            return .subagent(
+                subagentType: envelope.subagentType ?? "subagent",
+                description: envelope.summary ?? envelope.description ?? "",
+                isCompletion: true)
 
         case "assistant":
             // An assistant event with no renderable text/tool_use block (e.g. a
@@ -138,10 +164,16 @@ extension AgentEventParser {
         let message: Message?
         let result: String?
         let isError: Bool?
+        // Subagent (Task) lifecycle fields — present on `system`/`task_*` events.
+        let subagentType: String?
+        let description: String?
+        let status: String?
+        let summary: String?
 
         enum CodingKeys: String, CodingKey {
-            case type, subtype, model, message, result
+            case type, subtype, model, message, result, description, status, summary
             case isError = "is_error"
+            case subagentType = "subagent_type"
         }
     }
 
@@ -254,6 +286,13 @@ public enum ToolInputSummary {
             summary = input["pattern"]?.scalarString ?? fallback(input)
         case "Grep":
             summary = input["pattern"]?.scalarString ?? fallback(input)
+        // The delegation tool (the CLI names it `Agent`; `Task` is the historical
+        // alias). Render `<subagent_type>: <description>` so a fan-out row reads like
+        // `Agent  ingest-worker: Write the Calvin Cycle page` instead of a JSON blob.
+        case "Agent", "Task":
+            let worker = input["subagent_type"]?.scalarString
+            let detail = input["description"]?.scalarString ?? input["prompt"]?.scalarString
+            summary = [worker, detail].compactMap { $0 }.joined(separator: ": ")
         default:
             summary = fallback(input)
         }

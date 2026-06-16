@@ -757,6 +757,33 @@ public final class SQLiteWikiStore: WikiStore {
         return out
     }
 
+    /// The most recent `limit` log rows in chronological order (oldest-of-the-tail
+    /// first), for the operation prompts' live state snapshot. Selects the newest
+    /// `limit` by `ts`/`rowid` DESC (same deterministic ordering as
+    /// `listAllLogEntriesOrderedByID`, just bounded) and reverses to chronological
+    /// so the rendered tail matches `log.md`'s `tail`. A non-positive `limit`, or an
+    /// empty log, yields `[]`.
+    public func recentLogEntries(limit: Int) throws -> [LogEntry] {
+        guard limit > 0 else { return [] }
+        let stmt = try statement("""
+        SELECT id, ts, kind, title, note FROM log ORDER BY ts DESC, rowid DESC LIMIT ?1;
+        """)
+        defer { stmt.reset() }
+        try stmt.bind(Int64(limit), at: 1)
+        var out: [LogEntry] = []
+        while try stmt.step() {
+            let note = sqlite3_column_type(stmt.handle, 4) == SQLITE_NULL ? nil : stmt.text(at: 4)
+            out.append(LogEntry(
+                id: PageID(rawValue: stmt.text(at: 0)),
+                timestamp: Date(timeIntervalSince1970: stmt.double(at: 1)),
+                kind: LogEntry.Kind(rawValue: stmt.text(at: 2)) ?? .ingest,
+                title: stmt.text(at: 3),
+                note: note
+            ))
+        }
+        return out.reversed()  // newest-first query → chronological for the tail.
+    }
+
     // MARK: - Wiki index (singleton catalog document, Phase B)
 
     /// Read the singleton `wiki_index` document. Returns the seeded default if no

@@ -118,6 +118,42 @@ struct AgentEventParserTests {
         #expect(AgentEventParser.parse(line: line) == nil)
     }
 
+    // MARK: - Subagent fan-out (Opus→Sonnet)
+
+    @Test func taskStartedBecomesSubagentDelegation() {
+        // Real shape captured from the --agents smoke test (CLI 2.1.178): the system
+        // `task_started` event carries subagent_type + description.
+        let line = #"{"type":"system","subtype":"task_started","task_id":"a25","subagent_type":"ingest-worker","description":"Write the Calvin Cycle page","task_type":"local_agent"}"#
+        #expect(
+            AgentEventParser.parse(line: line)
+                == .subagent(subagentType: "ingest-worker", description: "Write the Calvin Cycle page", isCompletion: false)
+        )
+    }
+
+    @Test func taskNotificationCompletedBecomesSubagentCompletion() {
+        let line = #"{"type":"system","subtype":"task_notification","task_id":"a25","status":"completed","summary":"Wrote Calvin Cycle"}"#
+        #expect(
+            AgentEventParser.parse(line: line)
+                == .subagent(subagentType: "subagent", description: "Wrote Calvin Cycle", isCompletion: true)
+        )
+    }
+
+    @Test func taskUpdatedIntermediateIsSkipped() {
+        // The intermediate status patch is noise; only start + terminal notification
+        // are surfaced.
+        let line = #"{"type":"system","subtype":"task_updated","task_id":"a25","patch":{"status":"completed"}}"#
+        #expect(AgentEventParser.parse(line: line) == nil)
+    }
+
+    @Test func agentToolUseSummarizesSubagentTypeAndDescription() {
+        // The delegation tool itself (the CLI names it `Agent`).
+        let line = #"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Agent","input":{"subagent_type":"ingest-worker","description":"Write the Calvin Cycle page","prompt":"…"}}]}}"#
+        #expect(
+            AgentEventParser.parse(line: line)
+                == .toolUse(name: "Agent", inputSummary: "ingest-worker: Write the Calvin Cycle page")
+        )
+    }
+
     // MARK: - ToolInputSummary
 
     @Test func toolInputSummaryFallsBackToSortedKeyValueForUnknownTool() {

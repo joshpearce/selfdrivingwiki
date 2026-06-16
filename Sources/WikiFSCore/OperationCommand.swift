@@ -60,13 +60,21 @@ public struct OperationCommand: Equatable, Sendable {
         let existingPath = baseEnvironment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         environment["PATH"] = wikictlDirectory + ":" + existingPath
 
-        let arguments = [
+        var arguments = [
             // The prompt carries the RESOLVED absolute wikiRoot (not `$WIKI_ROOT`
-            // for the agent to expand) so it has a concrete map of the wiki and the
-            // exact source path up front — the live gate showed the agent burning
-            // turns probing for structure and getting every `$WIKI_ROOT`-expanded
-            // command rejected by the permission allowlist.
+            // for the agent to expand) plus the staged source / state file paths, so
+            // it has the load-bearing write rule, a concrete map, and the local
+            // source up front — the live gate showed the agent burning turns probing
+            // for structure and (under the old allowlist) getting every
+            // `$WIKI_ROOT`-expanded command rejected.
             "-p", operation.prompt(wikiRoot: wikiRoot),
+            // Model tiering (problem #3, verified against CLI 2.1.178): `--model`
+            // sets the TOP-LEVEL model. Ingest tiers it (`sonnet` for the single
+            // pass, `opus` for the planner); Query/Lint stay on `opus`. A planned
+            // Ingest also passes `--agents` (below) defining a Sonnet `ingest-worker`
+            // — the workers inherit the process env (WIKI_DB, PATH) but NOT
+            // `--append-system-prompt`, so the worker prompt is self-sufficient.
+            "--model", operation.topLevelModelAlias,
             // Stream the run as NDJSON so the UI can render activity in real time
             // instead of staring at a silent panel until the final result. The
             // installed CLI (2.1.178) REQUIRES `--verbose` alongside
@@ -85,12 +93,21 @@ public struct OperationCommand: Equatable, Sendable {
             // can't statically verify a command containing a shell expansion, so it
             // demands approval, and in `-p` mode there is no approval prompt: the
             // run is dead on arrival (the live gate produced ZERO output for exactly
-            // this reason). The app is local, un-sandboxed, and user-initiated, and
-            // the agent only has `wikictl` + read-only shell intent, so we bypass
-            // permission checks entirely. Verified accepted by the installed CLI
-            // (2.1.178 — `permissionMode":"bypassPermissions"`).
+            // this reason). It is ALSO required for the Task tool that drives the
+            // Opus→Sonnet fan-out. The app is local, un-sandboxed, and
+            // user-initiated, and the agent only has `wikictl` + read-only shell
+            // intent, so we bypass permission checks entirely. Verified accepted by
+            // the installed CLI (2.1.178 — `permissionMode":"bypassPermissions"`).
             "--dangerously-skip-permissions",
         ]
+
+        // A planned Ingest fans out to a Sonnet `ingest-worker` subagent defined
+        // inline. The JSON shape (`description`/`prompt`/`model`/`tools`) and that
+        // the worker actually runs on `claude-sonnet-4-6` were verified by a real
+        // `--agents` smoke test against CLI 2.1.178.
+        if let agentsJSON = operation.agentsJSON {
+            arguments.append(contentsOf: ["--agents", agentsJSON])
+        }
 
         return OperationCommand(
             executable: claudeExecutable,

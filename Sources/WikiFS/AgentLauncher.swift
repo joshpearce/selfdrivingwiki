@@ -61,8 +61,17 @@ final class AgentLauncher {
     /// Append-only handle to the per-run `run.stderr.log`.
     private var stderrLogHandle: FileHandle?
 
-    /// Run `operation` against one wiki. No-op if a process is already running.
+    /// Run an operation `request` against one wiki. No-op if a process is already
+    /// running.
     ///
+    /// The launcher OWNS the per-run scratch dir, so it also owns STAGING: it creates
+    /// scratch, writes `WIKI_STATE.md` (and, for Ingest, `source.<ext>`) from the
+    /// bytes the caller read from SQLite, then finalizes the `WikiOperation` with the
+    /// resulting absolute scratch paths so the `-p` prompt points the agent at
+    /// reliable local disk — never the ~5s-laggy read-only mount.
+    ///
+    /// - `request` carries the per-op intent + the source bytes/state text gathered
+    ///   at click time.
     /// - `wikiID`/`wikiRoot`/`systemPrompt` come from the active wiki at click time
     ///   (`wikiRoot` resolved from the FP manager — never hardcoded).
     /// - `wikictlDirectory` is the dir holding the embedded `wikictl`
@@ -72,7 +81,7 @@ final class AgentLauncher {
     ///   spawn, `onUnlock` from the `terminationHandler` (so a killed agent still
     ///   releases). Both run on the main actor.
     func run(
-        operation: WikiOperation,
+        request: OperationRequest,
         wikiID: String,
         wikiRoot: String,
         systemPrompt: String,
@@ -97,6 +106,18 @@ final class AgentLauncher {
 
         guard let scratch = makeScratchDirectory() else {
             preflightError = "Could not create a scratch working directory for the agent."
+            return
+        }
+
+        // Stage inputs into scratch from reliable local disk, then finalize the
+        // operation with the staged absolute paths. A staging failure aborts the run
+        // (a run that couldn't stage would fall back to probing the laggy mount).
+        let operation: WikiOperation
+        do {
+            operation = try request.stage(into: scratch)
+        } catch {
+            preflightError = "Could not stage the agent's inputs: \(error.localizedDescription)"
+            try? FileManager.default.removeItem(at: scratch)
             return
         }
 

@@ -233,7 +233,6 @@ struct OperationsView: View {
 
     private func run() {
         guard let wikiID = manager.activeWikiID else { return }
-        guard let operation = makeOperation() else { return }
 
         Task {
             // Refresh the mount + resolve WIKI_ROOT at click time (never hardcoded),
@@ -241,10 +240,16 @@ struct OperationsView: View {
             await fileProvider.signalChange()
             guard let root = fileProvider.path else { return }
 
+            // Gather the live wiki state HERE, at click time (§3.5), and render it as
+            // the WIKI_STATE.md the launcher stages — so the agent reads the CURRENT
+            // titles / index.md / log tail from local disk and skips orientation.
+            let stateMarkdown = store.currentStateSnapshot().renderStateFile()
+            guard let request = makeRequest(stateMarkdown: stateMarkdown) else { return }
+
             let systemPrompt = store.currentSystemPromptBody()
 
             launcher.run(
-                operation: operation,
+                request: request,
                 wikiID: wikiID,
                 wikiRoot: root,
                 systemPrompt: systemPrompt,
@@ -255,19 +260,27 @@ struct OperationsView: View {
         }
     }
 
-    /// Build the `WikiOperation` from the current selection + input.
-    private func makeOperation() -> WikiOperation? {
+    /// Build the `OperationRequest` from the current selection + input. For Ingest,
+    /// reads the source bytes from SQLite (not the mount) so the launcher can stage
+    /// them; the model tier (single Sonnet pass vs Opus planner) is decided from the
+    /// staged source size at stage time.
+    private func makeRequest(stateMarkdown: String) -> OperationRequest? {
         switch selectedKind {
         case .ingest:
             guard let id = selectedSourceID,
-                  let file = store.ingestedFiles.first(where: { $0.id == id })
+                  let file = store.ingestedFiles.first(where: { $0.id == id }),
+                  let bytes = store.ingestedSourceBytes(id: id)
             else { return nil }
-            return .ingest(sourcePath: ingestSourcePath(for: file))
+            return .ingest(
+                sourceBytes: bytes,
+                ext: file.ext,
+                sourcePath: ingestSourcePath(for: file),
+                stateMarkdown: stateMarkdown)
         case .query:
             let trimmed = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : .query(question: trimmed)
+            return trimmed.isEmpty ? nil : .query(question: trimmed, stateMarkdown: stateMarkdown)
         case .lint:
-            return .lint
+            return .lint(stateMarkdown: stateMarkdown)
         }
     }
 

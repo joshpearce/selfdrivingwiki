@@ -406,6 +406,36 @@ public final class WikiStoreModel {
         (try? store.getSystemPrompt())?.body ?? SystemPrompt.defaultBody
     }
 
+    /// A LIVE snapshot of THIS wiki's current state — page titles, the `index.md`
+    /// body, and a recent-log tail — gathered fresh from the store at agent-run
+    /// click time (§3.5 read-state-at-the-latest-moment). Injected into the
+    /// operation `-p` prompt's `CURRENT WIKI STATE` block so the agent skips the
+    /// orientation turns (`page list`, re-reading `index.md`/`log.md`, pulling a
+    /// sample page) it would otherwise spend rediscovering what the app already
+    /// knows. Read directly from the store (not the cached `summaries`) so it can't
+    /// lag a concurrent external write. All reads are `try?`-guarded so a transient
+    /// read failure degrades to an emptier-but-valid snapshot rather than blocking
+    /// the run.
+    public func currentStateSnapshot() -> WikiStateSnapshot {
+        let titles = ((try? store.listPages()) ?? []).map(\.title)
+        let indexBody = (try? store.getWikiIndex())?.body ?? WikiIndex.defaultBody
+        let logEntries = (try? store.recentLogEntries(limit: WikiStateSnapshot.maxLogEntries)) ?? []
+        // Render each tail entry with the SAME formatter the `log.md` projection
+        // uses, so the snapshot lines are byte-identical to what `tail log.md`
+        // shows (no second, drifting log format).
+        let logLines = logEntries.map { LogRenderer.line(for: $0) }
+        return WikiStateSnapshot.make(allTitles: titles, indexBody: indexBody, logLines: logLines)
+    }
+
+    /// The verbatim bytes of one ingested source, read from SQLite at click time so
+    /// the agent run can STAGE it onto reliable local disk (`source.<ext>`) rather
+    /// than reading from the ~5s-laggy read-only mount. `nil` if the read fails;
+    /// the caller surfaces that as a preflight error instead of launching a run that
+    /// would fall back to probing the mount.
+    public func ingestedSourceBytes(id: PageID) -> Data? {
+        try? store.ingestedFileContent(id: id)
+    }
+
     // MARK: - Source-of-truth rebuild
 
     /// Rebuild the sidebar lists from the store — used by the Phase A change

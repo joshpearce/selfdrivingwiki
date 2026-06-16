@@ -138,6 +138,9 @@ private struct AgentEventRow: View {
         case .toolResult(let isError, let summary):
             toolResultRow(isError: isError, summary: summary)
 
+        case .subagent(let subagentType, let description, let isCompletion):
+            subagentRow(subagentType: subagentType, description: description, isCompletion: isCompletion)
+
         case .result(let isError, let text):
             resultRow(isError: isError, text: text)
 
@@ -172,6 +175,34 @@ private struct AgentEventRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// A subagent fan-out row: the Opus planner delegating to (or hearing back from)
+    /// a Sonnet `ingest-worker`. Indented + tinted so the fan-out reads as a distinct
+    /// nested activity, making the Opus→Sonnet hand-off visible in the panel.
+    private func subagentRow(subagentType: String, description: String, isCompletion: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: isCompletion ? "checkmark.circle" : "person.2.fill")
+                .font(.caption)
+                .foregroundStyle(isCompletion ? Color.green : Color.purple)
+                .frame(width: 16)
+            Text(subagentType)
+                .font(.system(.caption, design: .monospaced))
+                .fontWeight(.semibold)
+                .foregroundStyle(.purple)
+            Text(isCompletion ? "finished" : "delegated")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if !description.isEmpty {
+                Text(description)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
                     .textSelection(.enabled)
             }
             Spacer(minLength: 0)
@@ -221,6 +252,7 @@ private struct AgentEventRow: View {
         case "Edit": return "pencil"
         case "Glob": return "magnifyingglass"
         case "Grep": return "text.magnifyingglass"
+        case "Agent", "Task": return "person.2.fill"
         default: return "wrench.and.screwdriver"
         }
     }

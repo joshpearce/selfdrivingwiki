@@ -2,254 +2,368 @@ import Foundation
 import Testing
 @testable import WikiFSCore
 
-/// Tests for Phase C's deterministic seams: the `WikiOperation` prompts, the
-/// `OperationCommand` env/argv/cwd construction (the EXACT `claude -p` flag
-/// surface + `wikictl`-on-PATH), and the `PathPreflight`. These are the seams the
-/// structural gate verifier relies on — kept pure/injectable so they test without
-/// a real `claude -p` run.
+/// Tests for Phase C / `feature/ingest-fewer-turns` deterministic seams: the
+/// `WikiOperation` prompts (the write rule + staged paths + don't-rediscover), the
+/// `OperationCommand` env/argv/cwd construction (the EXACT `claude -p` flag surface
+/// incl. `--model` tiering and the `--agents` Sonnet worker), the `IngestPlan`
+/// tiny-vs-non-tiny decision, and the `PathPreflight`. These are the seams the
+/// structural gate verifier relies on — kept pure/injectable so they test without a
+/// real `claude -p` run.
 struct OperationCommandTests {
 
-    // MARK: - OperationCommand construction
+  // MARK: - Fixtures
 
-    private func buildIngest(
-        wikictlDir: String = "/Apps/WikiFS.app/Contents/Helpers",
-        basePATH: String = "/usr/bin:/bin"
-    ) -> OperationCommand {
-        OperationCommand.build(
-            operation: .ingest(sourcePath: "files/by-id/01ABC.pdf"),
-            wikiRoot: "/Users/me/Library/CloudStorage/WikiFS-Research",
-            wikiID: "01WIKIULID",
-            systemPrompt: "You are the maintainer.",
-            scratchDirectory: "/tmp/scratch-xyz",
-            wikictlDirectory: wikictlDir,
-            claudeExecutable: "/opt/homebrew/bin/claude",
-            baseEnvironment: ["PATH": basePATH, "HOME": "/Users/me"]
-        )
+  private static let resolvedRoot = "/Users/me/Library/CloudStorage/WikiFS-Research"
+  private static let stagedSource = "/tmp/scratch-xyz/source.pdf"
+  private static let stateFile = "/tmp/scratch-xyz/WIKI_STATE.md"
+
+  /// A planned (non-tiny) ingest operation — Opus planner + Sonnet workers.
+  private static func plannedIngest() -> WikiOperation {
+    .ingest(
+      sourcePath: "files/by-id/01ABC.pdf",
+      stagedSourcePath: stagedSource,
+      stateFilePath: stateFile,
+      plan: .opusPlanner)
+  }
+
+  /// A tiny ingest operation — single Sonnet pass.
+  private static func tinyIngest() -> WikiOperation {
+    .ingest(
+      sourcePath: "files/by-id/01ABC.txt",
+      stagedSourcePath: "/tmp/scratch-xyz/source.txt",
+      stateFilePath: stateFile,
+      plan: .singleSonnet)
+  }
+
+  private func build(
+    operation: WikiOperation = OperationCommandTests.plannedIngest(),
+    wikictlDir: String = "/Apps/WikiFS.app/Contents/Helpers",
+    basePATH: String = "/usr/bin:/bin"
+  ) -> OperationCommand {
+    OperationCommand.build(
+      operation: operation,
+      wikiRoot: OperationCommandTests.resolvedRoot,
+      wikiID: "01WIKIULID",
+      systemPrompt: "You are the maintainer.",
+      scratchDirectory: "/tmp/scratch-xyz",
+      wikictlDirectory: wikictlDir,
+      claudeExecutable: "/opt/homebrew/bin/claude",
+      baseEnvironment: ["PATH": basePATH, "HOME": "/Users/me"])
+  }
+
+  // MARK: - OperationCommand construction
+
+  @Test func usesResolvedClaudeExecutable() {
+    #expect(build().executable == "/opt/homebrew/bin/claude")
+  }
+
+  @Test func argumentsCarryPromptModelStreamFlagsAppendSystemPromptAndSkipPermissions() {
+    let cmd = build(operation: Self.tinyIngest())
+    // -p <prompt> --model <alias> --output-format stream-json --verbose
+    //   --include-partial-messages --append-system-prompt <prompt>
+    //   --dangerously-skip-permissions
+    #expect(cmd.arguments[0] == "-p")
+    #expect(cmd.arguments[1] == Self.tinyIngest().prompt(wikiRoot: Self.resolvedRoot))
+    #expect(cmd.arguments[2] == "--model")
+    #expect(cmd.arguments[3] == "sonnet")  // tiny → single Sonnet pass
+    #expect(cmd.arguments[4] == "--output-format")
+    #expect(cmd.arguments[5] == "stream-json")
+    #expect(cmd.arguments[6] == "--verbose")
+    #expect(cmd.arguments[7] == "--include-partial-messages")
+    #expect(cmd.arguments[8] == "--append-system-prompt")
+    #expect(cmd.arguments[9] == "You are the maintainer.")
+    #expect(cmd.arguments[10] == "--dangerously-skip-permissions")
+    #expect(!cmd.arguments.contains("--allowedTools"))
+  }
+
+  // MARK: - Model tiering (problem #3)
+
+  @Test func tinyIngestRunsSingleSonnetPassWithNoAgents() {
+    let cmd = build(operation: Self.tinyIngest())
+    // Tiny source → top-level model is sonnet, and NO --agents (single agent).
+    let modelIndex = cmd.arguments.firstIndex(of: "--model")!
+    #expect(cmd.arguments[modelIndex + 1] == "sonnet")
+    #expect(!cmd.arguments.contains("--agents"))
+  }
+
+  @Test func plannedIngestRunsOpusWithASonnetWorkerAgent() {
+    let cmd = build(operation: Self.plannedIngest())
+    // Non-tiny → top-level model is opus, plus --agents defining a sonnet worker.
+    let modelIndex = cmd.arguments.firstIndex(of: "--model")!
+    #expect(cmd.arguments[modelIndex + 1] == "opus")
+    #expect(cmd.arguments.contains("--agents"))
+    let agentsIndex = cmd.arguments.firstIndex(of: "--agents")!
+    let json = cmd.arguments[agentsIndex + 1]
+    // The agents JSON defines the ingest-worker on the sonnet model.
+    #expect(json.contains("ingest-worker"))
+    #expect(json.contains("\"model\":\"sonnet\""))
+    // It must be valid JSON with the verified shape (description/prompt/model/tools).
+    let data = json.data(using: .utf8)!
+    let parsed = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+    let worker = parsed["ingest-worker"] as! [String: Any]
+    #expect(worker["model"] as? String == "sonnet")
+    #expect((worker["tools"] as? [String]) == ["Bash", "Read"])
+    #expect((worker["description"] as? String)?.isEmpty == false)
+    #expect((worker["prompt"] as? String)?.isEmpty == false)
+  }
+
+  @Test func queryAndLintStayOpusSingleAgent() {
+    for operation: WikiOperation in [
+      .query(question: "How does X work?", stateFilePath: Self.stateFile),
+      .lint(stateFilePath: Self.stateFile),
+    ] {
+      let cmd = build(operation: operation)
+      let modelIndex = cmd.arguments.firstIndex(of: "--model")!
+      #expect(cmd.arguments[modelIndex + 1] == "opus")
+      #expect(!cmd.arguments.contains("--agents"))
     }
+  }
 
-    @Test func usesResolvedClaudeExecutable() {
-        #expect(buildIngest().executable == "/opt/homebrew/bin/claude")
+  // MARK: - Worker prompt is self-sufficient (does NOT inherit --append-system-prompt)
+
+  @Test func workerPromptCarriesTheWriteRuleAndWikictlCommands() {
+    // The custom agent's prompt does NOT inherit --append-system-prompt, so it must
+    // carry the read-only rule + the wikictl write commands on its own.
+    let json = IngestPlan.opusPlanner.agentsJSON()!
+    let data = json.data(using: .utf8)!
+    let parsed = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+    let worker = parsed["ingest-worker"] as! [String: Any]
+    let prompt = worker["prompt"] as! String
+    #expect(prompt.contains("READ-ONLY BY DESIGN"))
+    #expect(prompt.contains("wikictl page upsert"))
+    #expect(prompt.contains("$WIKI_DB"))
+    // The worker writes pages but must NOT touch index.md / the log (the planner does).
+    #expect(prompt.lowercased().contains("do not rewrite index.md"))
+  }
+
+  // MARK: - Env / PATH / cwd (unchanged surface)
+
+  @Test func environmentExportsWikiRootAndWikiDB() {
+    let cmd = build()
+    #expect(cmd.environment["WIKI_ROOT"] == Self.resolvedRoot)
+    #expect(cmd.environment["WIKI_DB"] == "01WIKIULID")
+  }
+
+  @Test func prependsWikictlDirectoryToChildPATH() {
+    let cmd = build(wikictlDir: "/Apps/WikiFS.app/Contents/Helpers", basePATH: "/usr/bin:/bin")
+    #expect(cmd.environment["PATH"] == "/Apps/WikiFS.app/Contents/Helpers:/usr/bin:/bin")
+  }
+
+  @Test func cwdIsTheWritableScratchDirNotTheMount() {
+    let cmd = build()
+    #expect(cmd.currentDirectoryPath == "/tmp/scratch-xyz")
+    #expect(cmd.currentDirectoryPath != Self.resolvedRoot)
+  }
+
+  @Test func inheritsBaseEnvironment() {
+    #expect(build().environment["HOME"] == "/Users/me")
+  }
+
+  @Test func usesSkipPermissionsNotAFineGrainedAllowlist() {
+    let cmd = build()
+    #expect(cmd.arguments.contains("--dangerously-skip-permissions"))
+    #expect(!cmd.arguments.contains("--allowedTools"))
+    #expect(!cmd.arguments.contains("--allowed-tools"))
+    #expect(!cmd.arguments.contains { $0.contains("Bash(wikictl") })
+  }
+
+  @Test func eachOperationKindBuildsAValidCommand() {
+    for operation: WikiOperation in [
+      Self.tinyIngest(),
+      Self.plannedIngest(),
+      .query(question: "How does X compare to Y?", stateFilePath: Self.stateFile),
+      .lint(stateFilePath: Self.stateFile),
+    ] {
+      let cmd = OperationCommand.build(
+        operation: operation,
+        wikiRoot: "/mount",
+        wikiID: "01W",
+        systemPrompt: "schema",
+        scratchDirectory: "/scratch",
+        wikictlDirectory: "/helpers",
+        claudeExecutable: "claude",
+        baseEnvironment: [:])
+      #expect(cmd.arguments[0] == "-p")
+      #expect(cmd.arguments[1] == operation.prompt(wikiRoot: "/mount"))
+      #expect(cmd.arguments.contains("--model"))
+      #expect(cmd.arguments.contains("--dangerously-skip-permissions"))
+      #expect(cmd.environment["WIKI_DB"] == "01W")
     }
+  }
 
-    @Test func argumentsCarryPromptStreamFlagsAppendSystemPromptAndSkipPermissions() {
-        let cmd = buildIngest()
-        // -p <prompt> --output-format stream-json --verbose --include-partial-messages
-        //   --append-system-prompt <prompt> --dangerously-skip-permissions
-        #expect(cmd.arguments[0] == "-p")
-        #expect(cmd.arguments[1] == WikiOperation.ingest(sourcePath: "files/by-id/01ABC.pdf")
-            .prompt(wikiRoot: "/Users/me/Library/CloudStorage/WikiFS-Research"))
-        #expect(cmd.arguments[2] == "--output-format")
-        #expect(cmd.arguments[3] == "stream-json")
-        #expect(cmd.arguments[4] == "--verbose")
-        #expect(cmd.arguments[5] == "--include-partial-messages")
-        #expect(cmd.arguments[6] == "--append-system-prompt")
-        #expect(cmd.arguments[7] == "You are the maintainer.")
-        // Frictionless mode: bypass permission checks entirely (the fine-grained
-        // allowlist is incompatible with the env-var paths and compound commands the
-        // design depends on, and `-p` mode has no approval prompt). Verified accepted
-        // by the installed CLI (2.1.178).
-        #expect(cmd.arguments[8] == "--dangerously-skip-permissions")
-        // The old fine-grained allowlist pair is gone.
-        #expect(!cmd.arguments.contains("--allowedTools"))
+  // MARK: - IngestPlan decision (the tiny-vs-non-tiny threshold)
+
+  @Test func tinySourceUnderThresholdPicksSingleSonnet() {
+    #expect(IngestPlan.decide(sourceByteSize: 0) == .singleSonnet)
+    #expect(IngestPlan.decide(sourceByteSize: IngestPlan.tinySourceByteThreshold - 1) == .singleSonnet)
+  }
+
+  @Test func sourceAtOrAboveThresholdPicksOpusPlanner() {
+    #expect(IngestPlan.decide(sourceByteSize: IngestPlan.tinySourceByteThreshold) == .opusPlanner)
+    #expect(IngestPlan.decide(sourceByteSize: 5_000_000) == .opusPlanner)
+  }
+
+  @Test func thresholdIsAround4KB() {
+    // A sensible named constant: text under ~4 KB is tiny.
+    #expect(IngestPlan.tinySourceByteThreshold == 4096)
+  }
+
+  @Test func planModelAliasesMatchTheTier() {
+    #expect(IngestPlan.singleSonnet.topLevelModelAlias == "sonnet")
+    #expect(IngestPlan.opusPlanner.topLevelModelAlias == "opus")
+    #expect(IngestPlan.singleSonnet.agentsJSON() == nil)
+    #expect(IngestPlan.opusPlanner.agentsJSON() != nil)
+  }
+
+  // MARK: - Prompts: the write rule (problem #1)
+
+  @Test func everyOperationPromptLeadsWithTheUnmissableWriteRule() {
+    for operation: WikiOperation in [
+      Self.tinyIngest(),
+      Self.plannedIngest(),
+      .query(question: "q", stateFilePath: Self.stateFile),
+      .lint(stateFilePath: Self.stateFile),
+    ] {
+      let prompt = operation.prompt(wikiRoot: Self.resolvedRoot)
+      // The read-only-by-design rule + the "never search for a mutation tool / never
+      // test the mount" guard + the exact wikictl write commands MUST be in the -p
+      // prompt itself (not only the appended system prompt).
+      #expect(prompt.contains("READ-ONLY BY DESIGN"))
+      #expect(prompt.contains("NEVER search for a \"mutation tool\""))
+      #expect(prompt.contains("wikictl page upsert --title T --body-file -"))
+      #expect(prompt.contains("wikictl index set --body-file -"))
+      #expect(prompt.contains("wikictl log append --kind ingest"))
+      #expect(prompt.contains("$WIKI_DB"))
+      #expect(prompt.contains("[[Page Title]]"))
     }
+  }
 
-    @Test func streamJSONRequiresVerbose() {
-        // The installed CLI (2.1.178) errors with "When using --print,
-        // --output-format=stream-json requires --verbose" if --verbose is absent —
-        // so the two flags must always travel together.
-        let args = buildIngest().arguments
-        #expect(args.contains("--output-format"))
-        #expect(args.contains("stream-json"))
-        #expect(args.contains("--verbose"))
+  // MARK: - Prompts: the staged paths + don't-rediscover (problem #2)
+
+  @Test func ingestPromptsNameTheStagedSourceAndStateAndForbidRediscovery() {
+    for operation in [Self.tinyIngest(), Self.plannedIngest()] {
+      let prompt = operation.prompt(wikiRoot: Self.resolvedRoot)
+      // Names the staged WIKI_STATE.md and the staged source path.
+      #expect(prompt.contains(Self.stateFile) || prompt.contains("/tmp/scratch-xyz/WIKI_STATE.md"))
+      guard case .ingest(_, let staged, _, _) = operation else { Issue.record("not ingest"); return }
+      #expect(prompt.contains(staged))
+      // Forbids the orientation turns.
+      #expect(prompt.contains("DO NOT REDISCOVER"))
+      #expect(prompt.contains("do NOT run `wikictl page list`"))
     }
+  }
 
-    @Test func usesSkipPermissionsNotAFineGrainedAllowlist() {
-        let cmd = buildIngest()
-        // Frictionless mode: exactly one permission flag, the bypass — no allowlist.
-        #expect(cmd.arguments.contains("--dangerously-skip-permissions"))
-        #expect(!cmd.arguments.contains("--allowedTools"))
-        #expect(!cmd.arguments.contains("--allowed-tools"))
-        // Nothing left referencing the old scoped Bash allowlist.
-        #expect(!cmd.arguments.contains { $0.contains("Bash(wikictl") })
+  @Test func queryAndLintPromptsNameStateAndForbidRediscovery() {
+    for operation: WikiOperation in [
+      .query(question: "q", stateFilePath: Self.stateFile),
+      .lint(stateFilePath: Self.stateFile),
+    ] {
+      let prompt = operation.prompt(wikiRoot: Self.resolvedRoot)
+      #expect(prompt.contains(Self.stateFile))
+      #expect(prompt.contains("DO NOT REDISCOVER"))
+      // No source for query/lint, so it must not claim a staged source.
+      #expect(!prompt.contains("source is staged"))
     }
+  }
 
-    @Test func environmentExportsWikiRootAndWikiDB() {
-        let cmd = buildIngest()
-        #expect(cmd.environment["WIKI_ROOT"] == "/Users/me/Library/CloudStorage/WikiFS-Research")
-        #expect(cmd.environment["WIKI_DB"] == "01WIKIULID")
+  // MARK: - Prompts: the worker-count guardrail (planned ingest only)
+
+  @Test func plannedIngestPromptStatesThe2to19WorkerGuardrail() {
+    let prompt = Self.plannedIngest().prompt(wikiRoot: Self.resolvedRoot)
+    #expect(prompt.contains("MORE THAN 1 and FEWER THAN 20"))
+    #expect(prompt.contains("between 2 and 19"))
+    // And it must tell the planner to size the fan-out to the material.
+    #expect(prompt.contains("do NOT spawn 15 workers for 3 pages"))
+    // The planner synthesizes index.md + the log after the workers.
+    #expect(prompt.contains("wikictl index set"))
+  }
+
+  @Test func tinyIngestPromptHasNoWorkerGuardrail() {
+    // The single Sonnet pass has no fan-out.
+    let prompt = Self.tinyIngest().prompt(wikiRoot: Self.resolvedRoot)
+    #expect(!prompt.contains("between 2 and 19"))
+    #expect(!prompt.contains("ingest-worker"))
+  }
+
+  // MARK: - Prompts: DRY against the schema (no layout duplication)
+
+  @Test func promptsDoNotDuplicateTheSchemaLayoutMap() {
+    for operation: WikiOperation in [
+      Self.tinyIngest(),
+      Self.plannedIngest(),
+      .query(question: "q", stateFilePath: Self.stateFile),
+      .lint(stateFilePath: Self.stateFile),
+    ] {
+      let prompt = operation.prompt(wikiRoot: Self.resolvedRoot)
+      // The resolved root is still injected and labelled WIKI_ROOT.
+      #expect(prompt.contains(Self.resolvedRoot))
+      #expect(prompt.contains("WIKI_ROOT"))
+      // The schema's layout map lives ONLY in --append-system-prompt (CLAUDE.md) —
+      // the operational write rule is duplicated here BY DESIGN, but the layout map
+      // and conventions are NOT.
+      #expect(!prompt.contains("pages/by-title/"))
+      #expect(!prompt.contains("files/by-name/"))
+      #expect(!prompt.contains("TREE.md"))
+      #expect(!prompt.contains("Concept pages explain one idea"))
     }
+  }
 
-    @Test func prependsWikictlDirectoryToChildPATH() {
-        let cmd = buildIngest(wikictlDir: "/Apps/WikiFS.app/Contents/Helpers", basePATH: "/usr/bin:/bin")
-        // The helper dir must come FIRST so `wikictl` resolves, but the base PATH
-        // is preserved so find/cat/grep still resolve too.
-        #expect(cmd.environment["PATH"] == "/Apps/WikiFS.app/Contents/Helpers:/usr/bin:/bin")
+  @Test func operationKindTitlesAreStable() {
+    #expect(Self.tinyIngest().kind == .ingest)
+    #expect(WikiOperation.query(question: "q", stateFilePath: "s").kind == .query)
+    #expect(WikiOperation.lint(stateFilePath: "s").kind == .lint)
+    #expect(WikiOperation.Kind.ingest.title == "Ingest")
+    #expect(WikiOperation.Kind.query.title == "Query")
+    #expect(WikiOperation.Kind.lint.title == "Lint")
+  }
+
+  // MARK: - PathPreflight
+
+  @Test func preflightFindsExecutableOnPath() {
+    let result = PathPreflight.resolve(
+      executable: "claude",
+      onPath: "/usr/bin:/opt/homebrew/bin:/bin",
+      fileExists: { $0 == "/opt/homebrew/bin/claude" })
+    #expect(result == .found(path: "/opt/homebrew/bin/claude"))
+  }
+
+  @Test func preflightReportsMissingWhenNotOnPath() {
+    let result = PathPreflight.resolve(
+      executable: "claude", onPath: "/usr/bin:/bin", fileExists: { _ in false })
+    guard case .missing(let reason) = result else {
+      Issue.record("expected .missing")
+      return
     }
+    #expect(reason.contains("claude"))
+    #expect(reason.contains("PATH"))
+  }
 
-    @Test func cwdIsTheWritableScratchDirNotTheMount() {
-        let cmd = buildIngest()
-        #expect(cmd.currentDirectoryPath == "/tmp/scratch-xyz")
-        // The mount is read-only; the cwd must never be it.
-        #expect(cmd.currentDirectoryPath != "/Users/me/Library/CloudStorage/WikiFS-Research")
+  @Test func preflightHonorsPathOrderFirstHitWins() {
+    let result = PathPreflight.resolve(
+      executable: "claude",
+      onPath: "/a:/b:/c",
+      fileExists: { $0 == "/b/claude" || $0 == "/c/claude" })
+    #expect(result == .found(path: "/b/claude"))
+  }
+
+  @Test func preflightTestsAbsolutePathDirectlyWithoutPath() {
+    let found = PathPreflight.resolve(
+      executable: "/opt/claude", onPath: "", fileExists: { $0 == "/opt/claude" })
+    #expect(found == .found(path: "/opt/claude"))
+
+    let missing = PathPreflight.resolve(
+      executable: "/opt/claude", onPath: "", fileExists: { _ in false })
+    guard case .missing = missing else {
+      Issue.record("expected .missing for absent absolute path")
+      return
     }
+  }
 
-    @Test func inheritsBaseEnvironment() {
-        let cmd = buildIngest()
-        #expect(cmd.environment["HOME"] == "/Users/me")
+  @Test func preflightEmptyExecutableIsMissing() {
+    let result = PathPreflight.resolve(executable: "", onPath: "/bin", fileExists: { _ in true })
+    guard case .missing = result else {
+      Issue.record("expected .missing for empty executable")
+      return
     }
-
-    @Test func eachOperationKindBuildsAValidCommand() {
-        for operation: WikiOperation in [
-            .ingest(sourcePath: "files/by-id/01X.txt"),
-            .query(question: "How does X compare to Y?"),
-            .lint,
-        ] {
-            let cmd = OperationCommand.build(
-                operation: operation,
-                wikiRoot: "/mount",
-                wikiID: "01W",
-                systemPrompt: "schema",
-                scratchDirectory: "/scratch",
-                wikictlDirectory: "/helpers",
-                claudeExecutable: "claude",
-                baseEnvironment: [:]
-            )
-            #expect(cmd.arguments[0] == "-p")
-            #expect(cmd.arguments[1] == operation.prompt(wikiRoot: "/mount"))
-            #expect(cmd.arguments.contains("--dangerously-skip-permissions"))
-            #expect(cmd.environment["WIKI_DB"] == "01W")
-        }
-    }
-
-    // MARK: - WikiOperation prompts
-
-    private static let resolvedRoot = "/Users/me/Library/CloudStorage/WikiFS-Research"
-
-    @Test func ingestPromptResolvesTheSourcePathAndDefersToTheSchemaWorkflow() {
-        let prompt = WikiOperation.ingest(sourcePath: "files/by-id/01ABC.pdf")
-            .prompt(wikiRoot: Self.resolvedRoot)
-        // The source is given as a RESOLVED absolute path — not `$WIKI_ROOT/…` for
-        // the agent to expand (the live gate showed env-var expansion is what the
-        // permission system choked on, and the agent hunting for the path).
-        #expect(prompt.contains("\(Self.resolvedRoot)/files/by-id/01ABC.pdf"))
-        #expect(!prompt.contains("$WIKI_ROOT/files/by-id/01ABC.pdf"))
-        // The prompt names the Ingest workflow but DEFERS its steps to the schema
-        // (CLAUDE.md, delivered via --append-system-prompt) — it no longer inlines
-        // the per-step wikictl cheatsheet.
-        #expect(prompt.contains("Ingest workflow"))
-        #expect(prompt.lowercased().contains("from your instructions"))
-    }
-
-    @Test func queryPromptCarriesTheQuestionAndDefersToTheSchemaWorkflow() {
-        let prompt = WikiOperation.query(question: "What is the auth flow?")
-            .prompt(wikiRoot: Self.resolvedRoot)
-        #expect(prompt.contains("What is the auth flow?"))
-        #expect(prompt.contains("Query workflow"))
-        #expect(prompt.lowercased().contains("cit"))   // "citing the pages…"
-    }
-
-    @Test func lintPromptNamesTheWorkflowAndDefersToTheSchema() {
-        let prompt = WikiOperation.lint.prompt(wikiRoot: Self.resolvedRoot)
-        #expect(prompt.contains("Lint workflow"))
-        #expect(prompt.lowercased().contains("from your instructions"))
-    }
-
-    @Test func everyPromptIsSlimCarryingTheResolvedRootButNotTheSchemaDuplication() {
-        for operation: WikiOperation in [
-            .ingest(sourcePath: "f"),
-            .query(question: "q"),
-            .lint,
-        ] {
-            let prompt = operation.prompt(wikiRoot: Self.resolvedRoot)
-            // The RESOLVED absolute root is still injected (the one per-run fact the
-            // schema can't contain), and is labelled WIKI_ROOT.
-            #expect(prompt.contains(Self.resolvedRoot))
-            #expect(prompt.contains("WIKI_ROOT"))
-            // Each prompt defers to the schema's workflow rather than restating it.
-            #expect(prompt.lowercased().contains("from your instructions"))
-            // The Phase-C inline duplication is GONE — these now live ONLY in the
-            // system prompt (CLAUDE.md), delivered via --append-system-prompt:
-            //   the layout map,
-            #expect(!prompt.contains("pages/by-title/"))
-            #expect(!prompt.contains("files/by-name/"))
-            #expect(!prompt.contains("TREE.md"))
-            //   the wikictl cheatsheet,
-            #expect(!prompt.contains("wikictl page upsert"))
-            #expect(!prompt.contains("wikictl index set"))
-            #expect(!prompt.contains("wikictl page list"))
-            //   and the read-after-write / do-not-pass-wiki reminders.
-            #expect(!prompt.contains("wikictl page get"))
-            #expect(!prompt.contains("do NOT pass --wiki"))
-        }
-    }
-
-    @Test func operationKindTitlesAreStable() {
-        #expect(WikiOperation.ingest(sourcePath: "f").kind == .ingest)
-        #expect(WikiOperation.query(question: "q").kind == .query)
-        #expect(WikiOperation.lint.kind == .lint)
-        #expect(WikiOperation.Kind.ingest.title == "Ingest")
-        #expect(WikiOperation.Kind.query.title == "Query")
-        #expect(WikiOperation.Kind.lint.title == "Lint")
-    }
-
-    // MARK: - PathPreflight
-
-    @Test func preflightFindsExecutableOnPath() {
-        let result = PathPreflight.resolve(
-            executable: "claude",
-            onPath: "/usr/bin:/opt/homebrew/bin:/bin",
-            fileExists: { $0 == "/opt/homebrew/bin/claude" }
-        )
-        #expect(result == .found(path: "/opt/homebrew/bin/claude"))
-    }
-
-    @Test func preflightReportsMissingWhenNotOnPath() {
-        let result = PathPreflight.resolve(
-            executable: "claude",
-            onPath: "/usr/bin:/bin",
-            fileExists: { _ in false }
-        )
-        guard case .missing(let reason) = result else {
-            Issue.record("expected .missing")
-            return
-        }
-        #expect(reason.contains("claude"))
-        #expect(reason.contains("PATH"))
-    }
-
-    @Test func preflightHonorsPathOrderFirstHitWins() {
-        let result = PathPreflight.resolve(
-            executable: "claude",
-            onPath: "/a:/b:/c",
-            fileExists: { $0 == "/b/claude" || $0 == "/c/claude" }
-        )
-        #expect(result == .found(path: "/b/claude"))
-    }
-
-    @Test func preflightTestsAbsolutePathDirectlyWithoutPath() {
-        let found = PathPreflight.resolve(
-            executable: "/opt/claude",
-            onPath: "",
-            fileExists: { $0 == "/opt/claude" }
-        )
-        #expect(found == .found(path: "/opt/claude"))
-
-        let missing = PathPreflight.resolve(
-            executable: "/opt/claude",
-            onPath: "",
-            fileExists: { _ in false }
-        )
-        guard case .missing = missing else {
-            Issue.record("expected .missing for absent absolute path")
-            return
-        }
-    }
-
-    @Test func preflightEmptyExecutableIsMissing() {
-        let result = PathPreflight.resolve(executable: "", onPath: "/bin", fileExists: { _ in true })
-        guard case .missing = result else {
-            Issue.record("expected .missing for empty executable")
-            return
-        }
-    }
+  }
 }

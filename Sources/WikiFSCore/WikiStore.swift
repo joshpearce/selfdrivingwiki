@@ -56,6 +56,12 @@ public protocol WikiStore {
     /// Ingested-file summaries (no content blob), most-recent-first.
     func listIngestedFiles() throws -> [IngestedFileSummary]
 
+    /// The verbatim content bytes for one ingested file, fetched on demand. On the
+    /// protocol so `WikiStoreModel` can STAGE the source into the agent's scratch
+    /// dir (reading from SQLite, not the laggy mount) without downcasting. Throws
+    /// `.notFound` if absent.
+    func ingestedFileContent(id: PageID) throws -> Data
+
     /// Remove an ingested file by id.
     func deleteIngestedFile(id: PageID) throws
 
@@ -81,6 +87,12 @@ public protocol WikiStore {
     /// entry (so the caller can echo its id).
     @discardableResult
     func appendLog(kind: LogEntry.Kind, title: String, note: String?) throws -> LogEntry
+
+    /// The most recent `limit` log entries in chronological order (oldest-of-the-tail
+    /// first), for the live state snapshot the operation prompts inject. On the
+    /// protocol (not only the concrete read helper) so `WikiStoreModel` can gather
+    /// the snapshot without downcasting. An empty/absent log yields `[]`.
+    func recentLogEntries(limit: Int) throws -> [LogEntry]
 
     /// Read the curated singleton index document (projected at the root as
     /// `index.md`). Returns the seeded default if absent.

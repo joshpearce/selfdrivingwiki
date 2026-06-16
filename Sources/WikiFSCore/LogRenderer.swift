@@ -29,15 +29,25 @@ public enum LogRenderer {
     /// Render the whole log as the `log.md` body. An empty log renders an empty
     /// document, so the file always exists.
     public static func render(_ entries: [LogEntry]) -> String {
-        entries.map(line(for:)).joined(separator: "\n")
+        entries.map(projectionLine(for:)).joined(separator: "\n")
     }
 
-    /// One entry's markdown: the grep-able `## [date] kind | title` heading, plus
-    /// the note on a following line when present.
-    private static func line(for entry: LogEntry) -> String {
+    /// One entry's markdown for the `log.md` projection: the grep-able
+    /// `## [date] kind | title` heading, plus the note on a following line when
+    /// present, with a trailing newline (so `render`'s `\n`-join leaves the blank
+    /// line between entries that the projection has always had).
+    private static func projectionLine(for entry: LogEntry) -> String {
+        line(for: entry) + "\n"
+    }
+
+    /// One entry's grep-able `## [date] kind | title` heading (plus the note on a
+    /// following line when present), WITHOUT a trailing newline. Reused by the
+    /// operation prompts' live state snapshot so its log-tail lines are byte-for-byte
+    /// what `log.md` shows — one source of log formatting, no drift.
+    public static func line(for entry: LogEntry) -> String {
         let date = dateFormatter.string(from: entry.timestamp)
         let heading = "## [\(date)] \(entry.kind.rawValue) | \(entry.title)"
-        guard let note = entry.note, !note.isEmpty else { return heading + "\n" }
-        return heading + "\n" + note + "\n"
+        guard let note = entry.note, !note.isEmpty else { return heading }
+        return heading + "\n" + note
     }
 }
