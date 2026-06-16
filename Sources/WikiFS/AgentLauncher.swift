@@ -3,33 +3,48 @@ import Observation
 import WikiFSCore
 
 /// Runs the three `claude -p` operations — Ingest / Query / Lint — against the
-/// currently-selected wiki, streaming combined stdout/stderr back into the app
+/// currently-selected wiki, streaming a live activity feed back into the app
 /// (`plans/llm-wiki.md` Phase C). Generalizes the v0 agent launcher: instead of a
 /// free-form shell command, it spawns a scoped `claude -p` invocation built by the
-/// pure `OperationCommand.build(...)` seam.
+/// pure `OperationCommand.build(...)` seam, now with `--output-format stream-json`
+/// so the run is visible as it happens instead of silent until the final result.
 ///
 /// Allowed because the app is **un-sandboxed** (`WikiFS/WikiFS.entitlements` — no
 /// `com.apple.security.app-sandbox`); a sandboxed app could not `Process`-spawn.
 ///
-/// `@MainActor @Observable`: the view binds `output`, `isRunning`, `exitStatus`,
-/// and `preflightError`. Output is appended on the main actor from the pipe
-/// `readabilityHandler`s — we NEVER block on `waitUntilExit`; completion arrives
-/// via `terminationHandler`, which is also where the per-wiki edit lock releases.
+/// `@MainActor @Observable`: the view binds `events`, `isRunning`, `exitStatus`,
+/// `preflightError`, and `logFileURL`. State is mutated on the main actor from the
+/// pipe `readabilityHandler`s — we NEVER block on `waitUntilExit`; completion
+/// arrives via `terminationHandler`, which is also where the per-wiki edit lock
+/// releases.
 @MainActor
 @Observable
 final class AgentLauncher {
-    /// Combined stdout+stderr captured so far for the current/last run.
-    private(set) var output = ""
+    /// The live, ordered activity feed for the current/last run: typed events parsed
+    /// from the stream-json NDJSON. The UI renders these as tool-call rows, prose,
+    /// and a final result. Appended on the main actor as lines arrive.
+    private(set) var events: [AgentEvent] = []
+    /// The raw combined transcript (raw stream-json stdout + stderr) kept alongside
+    /// the typed `events`, so the UI / a debugger can see exactly what the CLI
+    /// emitted. This is the in-memory mirror of the on-disk `run.jsonl`.
+    private(set) var rawTranscript = ""
+    /// stderr captured separately (claude's diagnostics): a failed start, a flag
+    /// error, an auth prompt. Surfaced prominently in the UI rather than swallowed.
+    private(set) var stderr = ""
     /// True while a spawned `claude -p` process is running.
     private(set) var isRunning = false
     /// Exit status of the last finished process, or nil if none finished / one is
     /// running.
     private(set) var exitStatus: Int32?
-    /// Set when the PATH preflight fails (claude not resolvable); shown in the UI
-    /// instead of spawning. Cleared on the next successful run.
+    /// Set when the PATH preflight fails (claude not resolvable) or the spawn
+    /// itself throws; shown in the UI instead of spawning. Cleared on the next
+    /// successful run.
     private(set) var preflightError: String?
     /// The kind of the operation currently running (drives the UI title / spinner).
     private(set) var runningKind: WikiOperation.Kind?
+    /// The per-run `run.jsonl` backend log on disk (raw stream-json), so the UI can
+    /// offer a "Reveal log" affordance. Its sibling `run.stderr.log` holds stderr.
+    private(set) var logFileURL: URL?
 
     /// Builds the login-shell PATH-resolved `claude` path. Injected so tests can
     /// stub it; the app uses the real login-shell preflight.
@@ -38,6 +53,13 @@ final class AgentLauncher {
     }
 
     private var process: Process?
+    /// Carries-over bytes from a stdout read that ended mid-line, so the parser only
+    /// ever sees complete NDJSON lines.
+    private var stdoutLineBuffer = ""
+    /// Append-only handle to the per-run `run.jsonl` (raw stream-json).
+    private var logHandle: FileHandle?
+    /// Append-only handle to the per-run `run.stderr.log`.
+    private var stderrLogHandle: FileHandle?
 
     /// Run `operation` against one wiki. No-op if a process is already running.
     ///
@@ -68,8 +90,7 @@ final class AgentLauncher {
             claudeExecutable = path
         case .missing(let reason):
             preflightError = reason
-            output = ""
-            exitStatus = nil
+            resetRunState()
             return
         }
         preflightError = nil
@@ -89,10 +110,10 @@ final class AgentLauncher {
             claudeExecutable: claudeExecutable
         )
 
-        output = ""
-        exitStatus = nil
+        resetRunState()
         isRunning = true
         runningKind = operation.kind
+        openLogFiles(in: scratch)
         onLock()
 
         let process = Process()
@@ -106,27 +127,27 @@ final class AgentLauncher {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
-        // Stream both pipes onto the main actor as bytes arrive. Non-blocking: the
-        // handlers fire on a background queue, then hop to the main actor.
-        let appendHandler: @Sendable (FileHandle) -> Void = { handle in
+        // stdout is line-buffered NDJSON: accumulate bytes, split on newlines, and
+        // feed each COMPLETE line to the parser. Non-blocking — the handler fires on
+        // a background queue, then hops to the main actor.
+        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor [weak self] in self?.output.append(text) }
+            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+            Task { @MainActor [weak self] in self?.ingestStdout(chunk) }
         }
-        stdoutPipe.fileHandleForReading.readabilityHandler = appendHandler
-        stderrPipe.fileHandleForReading.readabilityHandler = appendHandler
+        // stderr is claude's diagnostics — surfaced separately and prominently.
+        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+            Task { @MainActor [weak self] in self?.ingestStderr(chunk) }
+        }
 
         process.terminationHandler = { [weak self] proc in
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             let status = proc.terminationStatus
-            // Clean up the per-run scratch dir; best-effort.
-            try? FileManager.default.removeItem(at: scratch)
             Task { @MainActor [weak self] in
-                self?.isRunning = false
-                self?.exitStatus = status
-                self?.runningKind = nil
-                self?.process = nil
+                self?.finish(status: status)
                 onUnlock()
             }
         }
@@ -135,10 +156,11 @@ final class AgentLauncher {
             try process.run()
             self.process = process
         } catch {
-            output.append("Failed to launch: \(error.localizedDescription)\n")
+            preflightError = "Failed to launch claude: \(error.localizedDescription)"
+            closeLogFiles()
+            try? FileManager.default.removeItem(at: scratch)
             isRunning = false
             runningKind = nil
-            try? FileManager.default.removeItem(at: scratch)
             onUnlock()
         }
     }
@@ -149,9 +171,94 @@ final class AgentLauncher {
         process?.terminate()
     }
 
+    // MARK: - Stream ingestion (main actor)
+
+    /// Append a raw stdout chunk: mirror it to the transcript + `run.jsonl`, then
+    /// split into complete lines and feed each to the parser.
+    private func ingestStdout(_ chunk: String) {
+        rawTranscript.append(chunk)
+        writeLog(chunk, to: logHandle)
+
+        stdoutLineBuffer.append(chunk)
+        // Split off only the COMPLETE lines; keep any trailing partial in the buffer
+        // until its newline arrives so the parser never sees a half line.
+        while let newlineIndex = stdoutLineBuffer.firstIndex(of: "\n") {
+            let line = String(stdoutLineBuffer[..<newlineIndex])
+            stdoutLineBuffer.removeSubrange(...newlineIndex)
+            if let event = AgentEventParser.parse(line: line) {
+                events.append(event)
+            }
+        }
+    }
+
+    /// Append a raw stderr chunk: surface it in `stderr`, mirror to the transcript +
+    /// `run.stderr.log`.
+    private func ingestStderr(_ chunk: String) {
+        stderr.append(chunk)
+        rawTranscript.append(chunk)
+        writeLog(chunk, to: stderrLogHandle)
+    }
+
+    /// Drain any trailing partial line, record the exit status, and tear down.
+    private func finish(status: Int32) {
+        if !stdoutLineBuffer.isEmpty {
+            if let event = AgentEventParser.parse(line: stdoutLineBuffer) {
+                events.append(event)
+            }
+            stdoutLineBuffer = ""
+        }
+        closeLogFiles()
+        isRunning = false
+        exitStatus = status
+        runningKind = nil
+        process = nil
+    }
+
+    /// Clear per-run state at the start of (or on abort before) a run.
+    private func resetRunState() {
+        events = []
+        rawTranscript = ""
+        stderr = ""
+        stdoutLineBuffer = ""
+        exitStatus = nil
+        isRunning = false
+        runningKind = nil
+        logFileURL = nil
+    }
+
+    // MARK: - Backend log files
+
+    /// Create `run.jsonl` (raw stream-json) and `run.stderr.log` under the run's
+    /// scratch dir and open append handles. Best-effort: if a handle can't open, the
+    /// in-memory transcript still works.
+    private func openLogFiles(in scratch: URL) {
+        let jsonl = scratch.appendingPathComponent("run.jsonl", isDirectory: false)
+        let stderrLog = scratch.appendingPathComponent("run.stderr.log", isDirectory: false)
+        let manager = FileManager.default
+        manager.createFile(atPath: jsonl.path, contents: nil)
+        manager.createFile(atPath: stderrLog.path, contents: nil)
+        logHandle = try? FileHandle(forWritingTo: jsonl)
+        stderrLogHandle = try? FileHandle(forWritingTo: stderrLog)
+        logFileURL = jsonl
+    }
+
+    private func writeLog(_ text: String, to handle: FileHandle?) {
+        guard let handle, let data = text.data(using: .utf8) else { return }
+        try? handle.write(contentsOf: data)
+    }
+
+    private func closeLogFiles() {
+        try? logHandle?.close()
+        try? stderrLogHandle?.close()
+        logHandle = nil
+        stderrLogHandle = nil
+    }
+
     /// Create a fresh per-run writable scratch dir under the app's Caches (decision
-    /// #4 — Claude Code needs a writable cwd; the mount is read-only). Returns nil
-    /// only if the directory can't be created.
+    /// #4 — Claude Code needs a writable cwd; the mount is read-only). The dir also
+    /// holds the per-run `run.jsonl` / `run.stderr.log` backend logs, so — unlike
+    /// the previous version — we do NOT delete it on termination; it persists for
+    /// post-hoc debugging via "Reveal log". Returns nil only if it can't be created.
     private func makeScratchDirectory() -> URL? {
         let base = FileManager.default
             .urls(for: .cachesDirectory, in: .userDomainMask).first

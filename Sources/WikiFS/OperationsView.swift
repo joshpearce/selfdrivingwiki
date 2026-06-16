@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import WikiFSCore
 
@@ -26,7 +27,7 @@ struct OperationsView: View {
             operationPicker
             inputSection
             controls
-            outputConsole
+            AgentActivityView(launcher: launcher)
             footer
         }
         .padding(OperationMetrics.padding)
@@ -168,34 +169,27 @@ struct OperationsView: View {
         }
     }
 
-    // MARK: - Output
+    // MARK: - Footer
 
-    private var outputConsole: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                Text(consoleText)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(consoleIsPlaceholder ? .secondary : .primary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-                    .id(Self.bottomAnchor)
-            }
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
-            .onChange(of: launcher.output) {
-                withAnimation(.linear(duration: 0.1)) {
-                    proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
-                }
-            }
+    private var footer: some View {
+        HStack(spacing: 12) {
+            statusLabel
+            Spacer()
+            revealLogButton
+            Button("Done") { dismiss() }
+                .keyboardShortcut(.cancelAction)
         }
     }
 
-    private var footer: some View {
-        HStack {
-            statusLabel
-            Spacer()
-            Button("Done") { dismiss() }
-                .keyboardShortcut(.cancelAction)
+    /// "Reveal log" surfaces the per-run `run.jsonl` backend log (raw stream-json)
+    /// in Finder for after-the-fact debugging. Shown once a run has produced a log.
+    @ViewBuilder
+    private var revealLogButton: some View {
+        if let logURL = launcher.logFileURL {
+            Button("Reveal Log", systemImage: "doc.text.magnifyingglass") {
+                NSWorkspace.shared.activateFileViewerSelecting([logURL])
+            }
+            .help("Show this run's raw stream-json log (run.jsonl) in Finder")
         }
     }
 
@@ -217,25 +211,11 @@ struct OperationsView: View {
 
     // MARK: - Derived
 
-    private static let bottomAnchor = "agent-output-bottom"
-
     private var activeWikiName: String {
         guard let id = manager.activeWikiID,
               let descriptor = manager.wikis.first(where: { $0.id == id })
         else { return "this wiki" }
         return descriptor.displayName
-    }
-
-    /// The console shows the live agent output, or — when nothing has run — the
-    /// preflight error (claude missing) or a neutral placeholder.
-    private var consoleText: String {
-        if !launcher.output.isEmpty { return launcher.output }
-        if let error = launcher.preflightError { return error }
-        return "No output yet. Choose an operation and press Run."
-    }
-
-    private var consoleIsPlaceholder: Bool {
-        launcher.output.isEmpty && launcher.preflightError == nil
     }
 
     /// Run is enabled only when the active wiki's mount is resolved and the
