@@ -24,10 +24,14 @@ struct WikiLinkStoreTests {
 
     @Test func resolvesDuplicateTitleToLowestULID() throws {
         let store = try tempStore()
-        let first = try store.createPage(title: "Dup")   // older → lower ULID
-        let second = try store.createPage(title: "Dup")
-        #expect(first.id.rawValue < second.id.rawValue)
-        #expect(try store.resolveTitleToID("Dup") == first.id)
+        let a = try store.createPage(title: "Dup")
+        let b = try store.createPage(title: "Dup")
+        // Two ULIDs minted in the same millisecond order by their random bits, not
+        // by creation order — so don't assume the first-created id is the lower one.
+        // Derive the expected winner from the actual ids; the contract under test is
+        // that resolveTitleToID returns the lowest-ULID duplicate.
+        let expectedLowest = min(a.id.rawValue, b.id.rawValue)
+        #expect(try store.resolveTitleToID("Dup")?.rawValue == expectedLowest)
     }
 
     // MARK: - replaceLinks
@@ -105,11 +109,18 @@ struct WikiLinkStoreTests {
         ])
 
         let links = try store.listAllLinks()
-        // Ordered by (from, to): a→b, a→c, then c→a.
-        #expect(links.map { $0.from } == [a.id.rawValue, a.id.rawValue, c.id.rawValue])
-        #expect(links[0].to == b.id.rawValue)
-        #expect(links[1].to == c.id.rawValue)
-        #expect(links[2].to == a.id.rawValue)
+        // Contract: ordered by (from_page_id, to_page_id) ascending. ULIDs minted in
+        // the same millisecond order by their random bits, so derive the expected
+        // order from the actual ids rather than assuming creation order == lexical
+        // order. The three links are a→b, a→c, c→a.
+        let expected = [
+            (a.id.rawValue, b.id.rawValue),
+            (a.id.rawValue, c.id.rawValue),
+            (c.id.rawValue, a.id.rawValue),
+        ]
+        .sorted { $0.0 != $1.0 ? $0.0 < $1.0 : $0.1 < $1.1 }
+        .map { "\($0.0)->\($0.1)" }
+        #expect(links.map { "\($0.from)->\($0.to)" } == expected)
     }
 
     // MARK: - deletePage FK safety (the Phase-4 regression)
