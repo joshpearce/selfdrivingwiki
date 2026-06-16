@@ -2,6 +2,35 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-16 — Reader-first page detail UI
+
+Started correcting the app's main interface: page selection now defaults to a
+rendered reader instead of an always-visible markdown editor + preview split. The
+product principle is that WikiFS is agent-maintained first; users should rarely
+need manual source editing.
+
+**Changed**
+- `PageDetailView` now owns an explicit read/edit mode and a toolbar action:
+  **Edit Page** / **Done Editing** (`Command-E`).
+- `PageReaderView` is the default page surface: title plus rendered markdown in a
+  readable column. It suppresses a duplicate leading `# Title` when the body starts
+  with the same heading.
+- `PageEditorView` is the rare manual mode: title field + markdown `TextEditor`,
+  using the existing draft buffers and debounced autosave path.
+- `MarkdownPreview` now constrains rendered blocks to the same readable width.
+- Added `plans/page-reader-ui.md` and linked it from `PLAN.md`.
+
+**Skill pass.** Before code: `swiftui-pro`, `macos-design`, and
+`typography-designer` pointed toward progressive disclosure, reader-first content,
+semantic Dynamic Type styles, and a restrained macOS article column rather than a
+permanent edit/preview split. Post-code review found the view split aligned with
+SwiftUI guidance: `PageDetailView` stays small, leaf views are separate files,
+semantic fonts are used, and the editor reuses the existing model autosave seam.
+
+**Verified.** `make check` passes, `make test` passes (**320/320**), and the
+user-provided appshot shows the selected page in reader mode with the manual edit
+button tucked into the toolbar.
+
 ## 2026-06-16 — Ingest division of labor: Opus curates/writes, Sonnet only digests — DONE ✅ (user-verified, merged to main)
 
 CORRECTION to the model-tiering build below.

@@ -34,7 +34,7 @@ struct MarkdownPreview: View {
                     }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: PageEditorMetrics.readableContentWidth, alignment: .leading)
             .padding(PageEditorMetrics.contentInset)
         }
         // Intercept clicks on the private wiki:// scheme and drive the SAME
