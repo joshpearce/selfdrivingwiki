@@ -21,9 +21,28 @@ let package = Package(
             dependencies: ["WikiFSCore"],
             path: "Sources/WikiFS"
         ),
+        // wikictl's logic (arg parsing, command dispatch, wiki resolution, the
+        // Darwin post) lives in a LIBRARY target so it's unit-testable — the same
+        // split WikiFSCore uses (logic out of the executable). The executable
+        // below is a thin process shell over it.
+        .target(
+            name: "WikiCtlCore",
+            dependencies: ["WikiFSCore"],
+            path: "Sources/WikiCtlCore"
+        ),
+        // wikictl — the agent's write path (plans/llm-wiki.md Phase A). A
+        // scriptable CLI that writes straight to a wiki's <ulid>.sqlite in the
+        // App Group container and posts a per-wiki Darwin notification so the app
+        // refreshes. Reads still go via the read-only File Provider mount; this
+        // is the WRITE half of "read via the mount, write via wikictl".
+        .executableTarget(
+            name: "wikictl",
+            dependencies: ["WikiFSCore", "WikiCtlCore"],
+            path: "Sources/wikictl"
+        ),
         .testTarget(
             name: "WikiFSTests",
-            dependencies: ["WikiFSCore"],
+            dependencies: ["WikiFSCore", "WikiCtlCore"],
             path: "Tests/WikiFSTests"
         ),
         // The File Provider extension binary. build.sh repackages this into a

@@ -22,6 +22,7 @@ CONFIG="${1:-debug}"
 
 APP_NAME="WikiFS"
 EXT_NAME="WikiFSFileProvider"
+CTL_NAME="wikictl"
 BUNDLE_ID="org.sockpuppet.WikiFS"
 EXT_BUNDLE_ID="org.sockpuppet.WikiFS.FileProvider"
 APP_GROUP="group.org.sockpuppet.wiki"
@@ -42,6 +43,10 @@ PLUGINS_DIR="${CONTENTS}/PlugIns"
 APPEX="${PLUGINS_DIR}/${EXT_NAME}.appex"
 APPEX_CONTENTS="${APPEX}/Contents"
 APPEX_MACOS="${APPEX_CONTENTS}/MacOS"
+# wikictl is embedded under Contents/Helpers so the app can spawn it (Phase C)
+# at a stable bundle-relative path; it is ALSO copied to build/wikictl for the
+# Phase A gate to invoke directly.
+HELPERS_DIR="${CONTENTS}/Helpers"
 
 VERSION="$(git describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null | sed 's/^v//' || true)"
 if [ -z "${VERSION}" ] && [ -f VERSION ]; then VERSION="$(sed -n '1p' VERSION | tr -d '[:space:]')"; fi
@@ -52,7 +57,8 @@ swift build -c "${CONFIG}"
 BIN_DIR="$(swift build -c "${CONFIG}" --show-bin-path)"
 APP_BIN="${BIN_DIR}/${APP_NAME}"
 EXT_BIN="${BIN_DIR}/${EXT_NAME}"
-for b in "${APP_BIN}" "${EXT_BIN}"; do
+CTL_BIN="${BIN_DIR}/${CTL_NAME}"
+for b in "${APP_BIN}" "${EXT_BIN}" "${CTL_BIN}"; do
   [ -x "$b" ] || { echo "✗ built binary missing: $b" >&2; exit 1; }
 done
 
@@ -61,9 +67,12 @@ done
 # ---------------------------------------------------------------------------
 echo "→ assembling ${APP_BUNDLE}"
 rm -rf "${APP_BUNDLE}"
-mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${APPEX_MACOS}"
+mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${APPEX_MACOS}" "${HELPERS_DIR}"
 cp "${APP_BIN}" "${MACOS_DIR}/${APP_NAME}"
 cp "${EXT_BIN}" "${APPEX_MACOS}/${EXT_NAME}"
+cp "${CTL_BIN}" "${HELPERS_DIR}/${CTL_NAME}"
+# Also drop a copy at build/wikictl for the Phase A gate to invoke directly.
+cp "${CTL_BIN}" "${BUILD_DIR}/${CTL_NAME}"
 [ -f "${APP_ICON}" ] && cp "${APP_ICON}" "${RESOURCES_DIR}/AppIcon.icns"
 
 cat > "${CONTENTS}/Info.plist" <<PLIST
@@ -134,7 +143,12 @@ if [ "${REAL_SIGNING}" = "1" ]; then
   cp "${APP_PROFILE}" "${CONTENTS}/embedded.provisionprofile"
   cp "${EXT_PROFILE}" "${APPEX_CONTENTS}/embedded.provisionprofile"
 
-  # Inside-out: sign the nested .appex first, then the outer app.
+  # Inside-out: sign nested Mach-O (the wikictl helper + the .appex) first, then
+  # the outer app. wikictl needs no entitlements — it's an un-sandboxed helper
+  # writing user-owned App Group files, launched by the un-sandboxed app.
+  echo "→ codesign wikictl helper (${IDENTITY})"
+  codesign --force --timestamp=none --sign "${IDENTITY}" \
+    "${HELPERS_DIR}/${CTL_NAME}"
   echo "→ codesign appex (${IDENTITY})"
   codesign --force --timestamp=none --sign "${IDENTITY}" \
     --entitlements "${EXT_ENTITLEMENTS}" \
@@ -146,6 +160,7 @@ if [ "${REAL_SIGNING}" = "1" ]; then
   echo "✓ built + signed ${APP_BUNDLE} (real identity, File Provider enabled)"
 else
   echo "→ ad-hoc codesign (File Provider extension will NOT load)"
+  codesign --force --sign - "${HELPERS_DIR}/${CTL_NAME}"
   codesign --force --sign - "${APPEX}"
   codesign --force --sign - "${APP_BUNDLE}"
   echo "✓ built ${APP_BUNDLE} (${CONFIG}, v${VERSION}, ad-hoc)"

@@ -62,6 +62,7 @@ all: build
 help:
 	@echo "Build:"
 	@echo "  make / build      Build $(CONFIG) into ./$(APP)  (default)"
+	@echo "                    (also builds ./build/wikictl + embeds it in the app bundle)"
 	@echo "  check             Compile only (swift build) — no bundle/sign; CI/agent gate"
 	@echo "  test              Run the SwiftPM test suite"
 	@echo "  release           Build release into ./$(APP)"
