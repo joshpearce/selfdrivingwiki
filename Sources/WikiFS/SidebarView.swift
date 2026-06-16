@@ -13,6 +13,8 @@ struct SidebarView: View {
     let fileProvider: FileProviderSpike
     @State private var renameTarget: WikiPageSummary?
     @State private var renameText: String = ""
+    /// Drives the "Add from URL…" sheet (fetch a URL → ingested file).
+    @State private var showingAddFromURL = false
 
     var body: some View {
         List(selection: $store.selection) {
@@ -49,14 +51,27 @@ struct SidebarView: View {
             // Files section appears only once at least one file is ingested. The
             // rows are management-only (no `.tag`), so they never feed the page
             // selection binding above — clicking one is a no-op on the detail pane.
+            // The header carries an inline "Add from URL…" button so the affordance
+            // sits right next to the content it produces.
             if !store.ingestedFiles.isEmpty {
-                Section("Files") {
+                Section {
                     ForEach(store.ingestedFiles) { file in
                         IngestedFileRow(
                             file: file,
                             onOpen: { Task { await fileProvider.openIngestedFile(id: file.id) } },
                             onRemove: { store.deleteIngestedFile(file.id) }
                         )
+                    }
+                } header: {
+                    HStack {
+                        Text("Files")
+                        Spacer()
+                        Button("Add from URL…", systemImage: "link.badge.plus") {
+                            showingAddFromURL = true
+                        }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                        .help("Fetch a web page or PDF by URL and ingest it")
                     }
                 }
             }
@@ -70,8 +85,17 @@ struct SidebarView: View {
         )
         .toolbar {
             ToolbarItem {
+                Button("Add from URL…", systemImage: "link.badge.plus") {
+                    showingAddFromURL = true
+                }
+                .help("Fetch a web page or PDF by URL and ingest it into this wiki")
+            }
+            ToolbarItem {
                 Button("New Page", systemImage: "plus") { store.newPage() }
             }
+        }
+        .sheet(isPresented: $showingAddFromURL) {
+            AddFromURLSheet(store: store)
         }
         .alert("Rename Page", isPresented: renamePresented) {
             TextField("Title", text: $renameText)

@@ -76,7 +76,7 @@ struct OperationsView: View {
                 .font(.subheadline)
                 .fontWeight(.medium)
             if store.ingestedFiles.isEmpty {
-                Text("No ingested files yet. Drag a file onto the window to ingest it first.")
+                Text("No ingested files yet. Drag a file onto the window, or use ‘Add from URL…’ in the sidebar, to ingest one first.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
