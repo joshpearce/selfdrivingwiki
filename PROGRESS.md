@@ -2,6 +2,28 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-16 — Agent runs show quiet-live status and can be stopped inline
+
+- Diagnosed a Query run that appeared hung: the spawned `claude -p` process was
+  still alive, but `run.jsonl` had not changed since the last tool result, so the
+  transcript only showed a spinner with no heartbeat.
+- `AgentLauncher` now records run start time, last stdout/stderr activity, and
+  the child process ID for the current run.
+- The operation transcript and inline transcript sidebar now show a live status
+  line such as "Running · last output 12s ago · elapsed 1m 4s · pid 12345"; after
+  60 seconds without output it explicitly says the process is still running but
+  quiet.
+- Added a Stop button to the inline transcript header, matching the modal sheet's
+  existing stop control, so a wedged inline query can be terminated without
+  leaving the page.
+- Fixed a follow-on beachball when collapsing the transcript sidebar. The sidebar
+  had been kept alive at width 0, leaving selectable transcript text and live
+  timeline/status views in a zero-width layout loop. Collapsing now removes the
+  transcript subtree entirely; visible sidebars use a stable fixed width.
+
+**Verified.** `make check` passes, `swift test` passes (**337/337**), and
+`make install` installs the fixed app into `/Applications`.
+
 ## 2026-06-16 — Reader renders full Markdown blocks with Textual
 
 - Replaced the reader's inline-only Markdown preview with

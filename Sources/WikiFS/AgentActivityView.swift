@@ -20,6 +20,11 @@ struct AgentActivityView: View {
             if let error = launcher.preflightError {
                 preflightBanner(error)
             }
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                AgentRunStatusView(launcher: launcher, now: context.date)
+                    .padding(.horizontal, ActivityMetrics.padding)
+                    .padding(.top, ActivityMetrics.padding)
+            }
             activityList
             if !launcher.stderr.isEmpty {
                 stderrBanner

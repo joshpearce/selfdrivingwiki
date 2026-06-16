@@ -45,6 +45,15 @@ final class AgentLauncher {
     /// The per-run `run.jsonl` backend log on disk (raw stream-json), so the UI can
     /// offer a "Reveal log" affordance. Its sibling `run.stderr.log` holds stderr.
     private(set) var logFileURL: URL?
+    /// Wall-clock start time for the current/last run. Used by the UI to show a
+    /// heartbeat instead of a context-free spinner.
+    private(set) var runStartedAt: Date?
+    /// Last time stdout/stderr produced bytes, or the run state changed. A live
+    /// process with an old `lastActivityAt` is not necessarily dead, but the UI can
+    /// name that it is quiet.
+    private(set) var lastActivityAt: Date?
+    /// The spawned process ID while running, useful context when a run looks quiet.
+    private(set) var currentProcessID: Int32?
 
     /// Builds the login-shell PATH-resolved `claude` path. Injected so tests can
     /// stub it; the app uses the real login-shell preflight.
@@ -132,8 +141,11 @@ final class AgentLauncher {
         )
 
         resetRunState()
+        let now = Date()
         isRunning = true
         runningKind = operation.kind
+        runStartedAt = now
+        lastActivityAt = now
         openLogFiles(in: scratch)
         onLock()
 
@@ -176,12 +188,15 @@ final class AgentLauncher {
         do {
             try process.run()
             self.process = process
+            currentProcessID = process.processIdentifier
         } catch {
             preflightError = "Failed to launch claude: \(error.localizedDescription)"
             closeLogFiles()
             try? FileManager.default.removeItem(at: scratch)
             isRunning = false
             runningKind = nil
+            currentProcessID = nil
+            lastActivityAt = Date()
             onUnlock()
         }
     }
@@ -197,6 +212,7 @@ final class AgentLauncher {
     /// Append a raw stdout chunk: mirror it to the transcript + `run.jsonl`, then
     /// split into complete lines and feed each to the parser.
     private func ingestStdout(_ chunk: String) {
+        lastActivityAt = Date()
         rawTranscript.append(chunk)
         writeLog(chunk, to: logHandle)
 
@@ -215,6 +231,7 @@ final class AgentLauncher {
     /// Append a raw stderr chunk: surface it in `stderr`, mirror to the transcript +
     /// `run.stderr.log`.
     private func ingestStderr(_ chunk: String) {
+        lastActivityAt = Date()
         stderr.append(chunk)
         rawTranscript.append(chunk)
         writeLog(chunk, to: stderrLogHandle)
@@ -233,6 +250,8 @@ final class AgentLauncher {
         exitStatus = status
         runningKind = nil
         process = nil
+        currentProcessID = nil
+        lastActivityAt = Date()
     }
 
     /// Clear per-run state at the start of (or on abort before) a run.
@@ -245,6 +264,9 @@ final class AgentLauncher {
         isRunning = false
         runningKind = nil
         logFileURL = nil
+        runStartedAt = nil
+        lastActivityAt = nil
+        currentProcessID = nil
     }
 
     // MARK: - Backend log files
