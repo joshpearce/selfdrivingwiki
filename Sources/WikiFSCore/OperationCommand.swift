@@ -8,8 +8,8 @@ import Foundation
 /// scratch dir, and the directory holding `wikictl`. No process is spawned here —
 /// the app's `AgentLauncher` runs `executableURL` with `arguments`, `environment`,
 /// and `currentDirectory`. This split is what lets the Phase-C gate unit-test the
-/// EXACT flag surface (`--append-system-prompt`, `--allowedTools`, the env, the
-/// scratch cwd, and `wikictl`-on-PATH) without a real agent run.
+/// EXACT flag surface (`--append-system-prompt`, `--dangerously-skip-permissions`,
+/// the env, the scratch cwd, and `wikictl`-on-PATH) without a real agent run.
 public struct OperationCommand: Equatable, Sendable {
     /// The `claude` executable to run. Resolved from the login-shell PATH at spawn
     /// time (the app's PATH preflight guarantees it exists); we keep it as a bare
@@ -23,17 +23,6 @@ public struct OperationCommand: Equatable, Sendable {
     /// writable cwd for session/todo scratch — decision #4). NEVER the read-only
     /// mount.
     public let currentDirectoryPath: String
-
-    /// The `--allowedTools` value (decision: least privilege). `wikictl` is the
-    /// only write path; the rest are read-only shell + read tools. The CLI accepts
-    /// a single space-separated string for this flag (verified against
-    /// `claude --help` 2.x: "Comma or space-separated list of tool names").
-    ///
-    /// `Bash(wikictl:*)` scopes Bash to wikictl invocations; `Bash(find:*)` /
-    /// `(cat:*)` / `(grep:*)` / `(printf:*)` cover read-only browsing and the
-    /// stdin-piped `--body-file -` writes; `Read`/`Grep`/`Glob` are the read tools.
-    public static let allowedTools =
-        "Bash(wikictl:*) Bash(find:*) Bash(cat:*) Bash(grep:*) Bash(printf:*) Read Grep Glob"
 
     /// Build the invocation for `operation` against one wiki.
     ///
@@ -72,7 +61,12 @@ public struct OperationCommand: Equatable, Sendable {
         environment["PATH"] = wikictlDirectory + ":" + existingPath
 
         let arguments = [
-            "-p", operation.prompt,
+            // The prompt carries the RESOLVED absolute wikiRoot (not `$WIKI_ROOT`
+            // for the agent to expand) so it has a concrete map of the wiki and the
+            // exact source path up front — the live gate showed the agent burning
+            // turns probing for structure and getting every `$WIKI_ROOT`-expanded
+            // command rejected by the permission allowlist.
+            "-p", operation.prompt(wikiRoot: wikiRoot),
             // Stream the run as NDJSON so the UI can render activity in real time
             // instead of staring at a silent panel until the final result. The
             // installed CLI (2.1.178) REQUIRES `--verbose` alongside
@@ -84,7 +78,18 @@ public struct OperationCommand: Equatable, Sendable {
             "--verbose",
             "--include-partial-messages",
             "--append-system-prompt", systemPrompt,
-            "--allowedTools", allowedTools,
+            // Frictionless mode (`plans/llm-wiki.md`): the fine-grained
+            // `--allowedTools 'Bash(wikictl:*) Bash(cat:*) …'` allowlist is
+            // fundamentally incompatible with the `$WIKI_ROOT`/`$WIKI_DB` env-var
+            // paths and compound commands the whole design depends on — the CLI
+            // can't statically verify a command containing a shell expansion, so it
+            // demands approval, and in `-p` mode there is no approval prompt: the
+            // run is dead on arrival (the live gate produced ZERO output for exactly
+            // this reason). The app is local, un-sandboxed, and user-initiated, and
+            // the agent only has `wikictl` + read-only shell intent, so we bypass
+            // permission checks entirely. Verified accepted by the installed CLI
+            // (2.1.178 — `permissionMode":"bypassPermissions"`).
+            "--dangerously-skip-permissions",
         ]
 
         return OperationCommand(

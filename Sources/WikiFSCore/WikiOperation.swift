@@ -57,44 +57,71 @@ public enum WikiOperation: Equatable, Sendable {
 
 extension WikiOperation {
     /// The operation's OWN prompt — the `-p` argument handed to `claude`. Written
-    /// to be self-sufficient against today's stub `system_prompt`: it tells the
-    /// agent exactly which `wikictl` calls to make and reminds it of the
-    /// read-after-write rule. The agent runs against `$WIKI_DB` (already exported)
-    /// and reads sources under `$WIKI_ROOT`.
-    public var prompt: String {
+    /// to be self-sufficient against today's stub `system_prompt`: it leads with a
+    /// concrete MAP of the wiki (resolved absolute root, layout, `wikictl`
+    /// cheatsheet) so the agent acts immediately instead of probing for structure,
+    /// then tells it exactly which `wikictl` calls to make.
+    ///
+    /// - Parameter wikiRoot: the wiki's LIVE mount path, RESOLVED at click time and
+    ///   passed in (NOT `$WIKI_ROOT` for the agent to expand). Injecting the
+    ///   concrete path is load-bearing: the live Phase-C gate showed the agent
+    ///   burning turns discovering the layout and (under the old allowlist) getting
+    ///   every `$WIKI_ROOT`-expanded command rejected.
+    public func prompt(wikiRoot: String) -> String {
         switch self {
         case .ingest(let sourcePath):
-            return Self.ingestPrompt(sourcePath: sourcePath)
+            return Self.ingestPrompt(wikiRoot: wikiRoot, sourcePath: sourcePath)
         case .query(let question):
-            return Self.queryPrompt(question: question)
+            return Self.queryPrompt(wikiRoot: wikiRoot, question: question)
         case .lint:
-            return Self.lintPrompt
+            return Self.lintPrompt(wikiRoot: wikiRoot)
         }
     }
 
-    private static let toolingPreamble = """
-    You maintain a wiki stored in SQLite. Read the wiki through the read-only \
-    filesystem mount at $WIKI_ROOT (browse with find/cat/grep/Read). WRITE only \
-    through the `wikictl` command — never edit files under $WIKI_ROOT, the mount \
-    is read-only. `wikictl` writes the wiki selected by the WIKI_DB environment \
-    variable (already set), so do NOT pass --wiki. After any write, read it back \
-    with `wikictl page get` (NOT by cat-ing the mount, which lags a few seconds).
-
-    wikictl commands you will use:
-      wikictl page list                         list id / title / path per page
-      wikictl page get --title T | --id I       print a page body (instant, authoritative)
-      printf '%s' "<body>" | wikictl page upsert --title T --body-file -   create/update a page
-      wikictl log append --kind ingest|query|lint --title "…" [--note "…"]  record an action
-      printf '%s' "<body>" | wikictl index set --body-file -               rewrite index.md
-    Use [[Page Title]] wiki-links in page bodies to cross-reference other pages.
-    """
-
-    private static func ingestPrompt(sourcePath: String) -> String {
+    /// The concrete, load-bearing layout map prepended to every operation prompt.
+    /// Carries the RESOLVED absolute `wikiRoot` (so the agent never has to expand
+    /// `$WIKI_ROOT`), the fixed projection layout, and the `wikictl` cheatsheet —
+    /// the same map `TREE.md` serves, inlined so the agent has it without a read.
+    private static func toolingPreamble(wikiRoot: String) -> String {
         """
-        \(toolingPreamble)
+        You maintain a wiki stored in SQLite, projected read-only at this absolute \
+        path (the WIKI_ROOT — browse it with find/cat/grep/Read):
+          \(wikiRoot)
+        WRITE only through the `wikictl` command — never edit files under the mount, \
+        it is read-only. `wikictl` is on your PATH and already targets THIS wiki via \
+        the WIKI_DB environment variable, so do NOT pass --wiki. After any write, \
+        read it back with `wikictl page get` (NOT by cat-ing the mount, which lags a \
+        few seconds). The full layout is also in \(wikiRoot)/TREE.md.
 
-        TASK — Ingest a source into the wiki.
-        The source to ingest is at: $WIKI_ROOT/\(sourcePath)
+        Layout under \(wikiRoot):
+          index.md            curated catalog (rewrite wholesale via `wikictl index set`)
+          log.md              append-only chronological log
+          TREE.md             this layout/orientation map
+          CLAUDE.md / AGENTS.md   the agent system prompt (identical)
+          manifest.json       generated wiki manifest
+          pages/by-title/     one file per page, by title
+          pages/by-id/        the same pages, by ULID
+          files/by-name/      raw immutable ingested sources, by filename
+          files/by-id/        the same raw sources, by ULID
+          indexes/*.jsonl     machine indexes (pages.jsonl, links.jsonl, files.jsonl)
+
+        wikictl cheatsheet:
+          wikictl page list                         list id / title / path per page
+          wikictl page get --title T | --id I       print a page body (instant, authoritative)
+          printf '%s' "<body>" | wikictl page upsert --title T --body-file -   create/update a page
+          printf '%s' "<body>" | wikictl index set --body-file -               rewrite index.md
+          wikictl log append --kind ingest|query|lint --title "…" [--note "…"]  record an action
+        Use [[Page Title]] wiki-links in page bodies to cross-reference other pages.
+        """
+    }
+
+    private static func ingestPrompt(wikiRoot: String, sourcePath: String) -> String {
+        """
+        \(toolingPreamble(wikiRoot: wikiRoot))
+
+        TASK — Ingest a source into the wiki. Act immediately; do not explore first.
+        The source to ingest is at this absolute path:
+          \(wikiRoot)/\(sourcePath)
         Read it (use the Read tool for PDFs/images; cat for text). Then:
           1. Write at least one summary page capturing the source's key content,
              via `wikictl page upsert`. Cite the source by its files/ path.
@@ -102,7 +129,7 @@ extension WikiOperation {
              cross-linking with [[wiki-links]].
           3. Rewrite the curated index at index.md via `wikictl index set` so it
              lists the pages you just wrote (read the current index first with
-             `cat "$WIKI_ROOT/index.md"`).
+             `wikictl page list`).
           4. Append a log entry recording this ingest:
              `wikictl log append --kind ingest --title "<source name>" --note "<one line>"`.
         Work autonomously to completion — do not ask for confirmation. The live
@@ -110,37 +137,39 @@ extension WikiOperation {
         """
     }
 
-    private static func queryPrompt(question: String) -> String {
+    private static func queryPrompt(wikiRoot: String, question: String) -> String {
         """
-        \(toolingPreamble)
+        \(toolingPreamble(wikiRoot: wikiRoot))
 
         TASK — Answer a question from the wiki.
         Question: \(question)
-        Search the wiki under $WIKI_ROOT (find/grep/cat the pages, index.md, and
-        log.md) and answer concisely. CITE the page titles or files/ paths your
-        answer draws on. If the wiki lacks the information, say so plainly rather
-        than guessing. You MAY file the answer back as a page via
-        `wikictl page upsert` if it would be useful to keep, then append
-        `wikictl log append --kind query --title "<the question>"`.
+        Search the wiki (`wikictl page list`, then `wikictl page get`, plus
+        grep/cat over \(wikiRoot)/index.md and \(wikiRoot)/log.md) and answer
+        concisely. CITE the page titles or files/ paths your answer draws on. If the
+        wiki lacks the information, say so plainly rather than guessing. You MAY file
+        the answer back as a page via `wikictl page upsert` if it would be useful to
+        keep, then append `wikictl log append --kind query --title "<the question>"`.
         """
     }
 
-    private static let lintPrompt = """
-    \(toolingPreamble)
+    private static func lintPrompt(wikiRoot: String) -> String {
+        """
+        \(toolingPreamble(wikiRoot: wikiRoot))
 
-    TASK — Health-check the wiki and report.
-    Survey the wiki under $WIKI_ROOT (page list via `wikictl page list`, bodies
-    via cat/grep, the link graph in indexes/links.jsonl, index.md, log.md). Report
-    on:
-      • contradictions or claims that disagree across pages,
-      • stale claims that look outdated,
-      • orphan pages (no inbound [[links]]),
-      • missing cross-references between related pages,
-      • concepts mentioned repeatedly but lacking their own page.
-    Print a clear findings report. Then append
-    `wikictl log append --kind lint --title "Wiki lint" --note "<summary of findings>"`.
-    You MAY also file the report as a page via `wikictl page upsert` if useful.
-    Do not modify existing page content beyond adding cross-reference links you are
-    confident about.
-    """
+        TASK — Health-check the wiki and report.
+        Survey the wiki (page list via `wikictl page list`, bodies via
+        `wikictl page get`, the link graph in \(wikiRoot)/indexes/links.jsonl, plus
+        index.md and log.md). Report on:
+          • contradictions or claims that disagree across pages,
+          • stale claims that look outdated,
+          • orphan pages (no inbound [[links]]),
+          • missing cross-references between related pages,
+          • concepts mentioned repeatedly but lacking their own page.
+        Print a clear findings report. Then append
+        `wikictl log append --kind lint --title "Wiki lint" --note "<summary of findings>"`.
+        You MAY also file the report as a page via `wikictl page upsert` if useful.
+        Do not modify existing page content beyond adding cross-reference links you
+        are confident about.
+        """
+    }
 }

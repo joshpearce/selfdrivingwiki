@@ -31,20 +31,26 @@ struct OperationCommandTests {
         #expect(buildIngest().executable == "/opt/homebrew/bin/claude")
     }
 
-    @Test func argumentsCarryPromptStreamFlagsAppendSystemPromptAndAllowedTools() {
+    @Test func argumentsCarryPromptStreamFlagsAppendSystemPromptAndSkipPermissions() {
         let cmd = buildIngest()
         // -p <prompt> --output-format stream-json --verbose --include-partial-messages
-        //   --append-system-prompt <prompt> --allowedTools <tools>
+        //   --append-system-prompt <prompt> --dangerously-skip-permissions
         #expect(cmd.arguments[0] == "-p")
-        #expect(cmd.arguments[1] == WikiOperation.ingest(sourcePath: "files/by-id/01ABC.pdf").prompt)
+        #expect(cmd.arguments[1] == WikiOperation.ingest(sourcePath: "files/by-id/01ABC.pdf")
+            .prompt(wikiRoot: "/Users/me/Library/CloudStorage/WikiFS-Research"))
         #expect(cmd.arguments[2] == "--output-format")
         #expect(cmd.arguments[3] == "stream-json")
         #expect(cmd.arguments[4] == "--verbose")
         #expect(cmd.arguments[5] == "--include-partial-messages")
         #expect(cmd.arguments[6] == "--append-system-prompt")
         #expect(cmd.arguments[7] == "You are the maintainer.")
-        #expect(cmd.arguments[8] == "--allowedTools")
-        #expect(cmd.arguments[9] == OperationCommand.allowedTools)
+        // Frictionless mode: bypass permission checks entirely (the fine-grained
+        // allowlist is incompatible with the env-var paths and compound commands the
+        // design depends on, and `-p` mode has no approval prompt). Verified accepted
+        // by the installed CLI (2.1.178).
+        #expect(cmd.arguments[8] == "--dangerously-skip-permissions")
+        // The old fine-grained allowlist pair is gone.
+        #expect(!cmd.arguments.contains("--allowedTools"))
     }
 
     @Test func streamJSONRequiresVerbose() {
@@ -57,21 +63,14 @@ struct OperationCommandTests {
         #expect(args.contains("--verbose"))
     }
 
-    @Test func allowedToolsScopesWikictlAndReadOnlyShellAndReadTools() {
-        let tools = OperationCommand.allowedTools
-        // The agent MUST be able to invoke wikictl; everything else is read-only.
-        #expect(tools.contains("Bash(wikictl:*)"))
-        #expect(tools.contains("Bash(find:*)"))
-        #expect(tools.contains("Bash(cat:*)"))
-        #expect(tools.contains("Bash(grep:*)"))
-        #expect(tools.contains("Bash(printf:*)"))  // for the stdin-piped --body-file - writes
-        #expect(tools.contains("Read"))
-        #expect(tools.contains("Grep"))
-        #expect(tools.contains("Glob"))
-        // No broad Bash(*) / Write / Edit — least privilege.
-        #expect(!tools.contains("Bash(*)"))
-        #expect(!tools.contains("Edit"))
-        #expect(!tools.contains("Write"))
+    @Test func usesSkipPermissionsNotAFineGrainedAllowlist() {
+        let cmd = buildIngest()
+        // Frictionless mode: exactly one permission flag, the bypass — no allowlist.
+        #expect(cmd.arguments.contains("--dangerously-skip-permissions"))
+        #expect(!cmd.arguments.contains("--allowedTools"))
+        #expect(!cmd.arguments.contains("--allowed-tools"))
+        // Nothing left referencing the old scoped Bash allowlist.
+        #expect(!cmd.arguments.contains { $0.contains("Bash(wikictl") })
     }
 
     @Test func environmentExportsWikiRootAndWikiDB() {
@@ -116,16 +115,24 @@ struct OperationCommandTests {
                 baseEnvironment: [:]
             )
             #expect(cmd.arguments[0] == "-p")
-            #expect(cmd.arguments[1] == operation.prompt)
+            #expect(cmd.arguments[1] == operation.prompt(wikiRoot: "/mount"))
+            #expect(cmd.arguments.contains("--dangerously-skip-permissions"))
             #expect(cmd.environment["WIKI_DB"] == "01W")
         }
     }
 
     // MARK: - WikiOperation prompts
 
-    @Test func ingestPromptNamesTheSourceAndTheFourWriteSteps() {
-        let prompt = WikiOperation.ingest(sourcePath: "files/by-id/01ABC.pdf").prompt
-        #expect(prompt.contains("$WIKI_ROOT/files/by-id/01ABC.pdf"))
+    private static let resolvedRoot = "/Users/me/Library/CloudStorage/WikiFS-Research"
+
+    @Test func ingestPromptResolvesTheSourcePathAndNamesTheFourWriteSteps() {
+        let prompt = WikiOperation.ingest(sourcePath: "files/by-id/01ABC.pdf")
+            .prompt(wikiRoot: Self.resolvedRoot)
+        // The source is given as a RESOLVED absolute path — not `$WIKI_ROOT/…` for
+        // the agent to expand (the live gate showed env-var expansion is what the
+        // permission system choked on, and the agent hunting for the path).
+        #expect(prompt.contains("\(Self.resolvedRoot)/files/by-id/01ABC.pdf"))
+        #expect(!prompt.contains("$WIKI_ROOT/files/by-id/01ABC.pdf"))
         #expect(prompt.contains("wikictl page upsert"))
         #expect(prompt.contains("wikictl index set"))
         #expect(prompt.contains("wikictl log append --kind ingest"))
@@ -134,27 +141,42 @@ struct OperationCommandTests {
     }
 
     @Test func queryPromptCarriesTheQuestionAndAsksForCitations() {
-        let prompt = WikiOperation.query(question: "What is the auth flow?").prompt
+        let prompt = WikiOperation.query(question: "What is the auth flow?")
+            .prompt(wikiRoot: Self.resolvedRoot)
         #expect(prompt.contains("What is the auth flow?"))
         #expect(prompt.lowercased().contains("cite"))
     }
 
     @Test func lintPromptAsksForAHealthReportAndALogEntry() {
-        let prompt = WikiOperation.lint.prompt
+        let prompt = WikiOperation.lint.prompt(wikiRoot: Self.resolvedRoot)
         #expect(prompt.contains("orphan pages"))
         #expect(prompt.contains("wikictl log append --kind lint"))
     }
 
-    @Test func everyPromptTellsTheAgentNotToPassWikiAndToWriteViaWikictl() {
+    @Test func everyPromptLeadsWithTheLayoutMapResolvedRootAndCheatsheet() {
         for operation: WikiOperation in [
             .ingest(sourcePath: "f"),
             .query(question: "q"),
             .lint,
         ] {
-            let prompt = operation.prompt
-            #expect(prompt.contains("WIKI_DB"))       // selects the wiki
+            let prompt = operation.prompt(wikiRoot: Self.resolvedRoot)
+            // The RESOLVED absolute root is injected (not left as `$WIKI_ROOT`).
+            #expect(prompt.contains(Self.resolvedRoot))
+            // The concrete layout map up front — pages/files views, index/log/TREE.
+            #expect(prompt.contains("pages/by-title/"))
+            #expect(prompt.contains("pages/by-id/"))
+            #expect(prompt.contains("files/by-name/"))
+            #expect(prompt.contains("files/by-id/"))
+            #expect(prompt.contains("index.md"))
+            #expect(prompt.contains("log.md"))
+            #expect(prompt.contains("TREE.md"))
+            // The wikictl cheatsheet, including the exact stdin-piped upsert form.
+            #expect(prompt.contains("printf '%s' \"<body>\" | wikictl page upsert --title T --body-file -"))
+            #expect(prompt.contains("wikictl page list"))
+            // Wiki selection + read-only mount discipline.
+            #expect(prompt.contains("WIKI_DB"))        // selects the wiki
             #expect(prompt.contains("do NOT pass --wiki"))
-            #expect(prompt.contains("read-only"))     // never edit the mount
+            #expect(prompt.contains("read-only"))      // never edit the mount
         }
     }
 
