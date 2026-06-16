@@ -125,7 +125,7 @@ struct OperationCommandTests {
 
     private static let resolvedRoot = "/Users/me/Library/CloudStorage/WikiFS-Research"
 
-    @Test func ingestPromptResolvesTheSourcePathAndNamesTheFourWriteSteps() {
+    @Test func ingestPromptResolvesTheSourcePathAndDefersToTheSchemaWorkflow() {
         let prompt = WikiOperation.ingest(sourcePath: "files/by-id/01ABC.pdf")
             .prompt(wikiRoot: Self.resolvedRoot)
         // The source is given as a RESOLVED absolute path — not `$WIKI_ROOT/…` for
@@ -133,50 +133,53 @@ struct OperationCommandTests {
         // permission system choked on, and the agent hunting for the path).
         #expect(prompt.contains("\(Self.resolvedRoot)/files/by-id/01ABC.pdf"))
         #expect(!prompt.contains("$WIKI_ROOT/files/by-id/01ABC.pdf"))
-        #expect(prompt.contains("wikictl page upsert"))
-        #expect(prompt.contains("wikictl index set"))
-        #expect(prompt.contains("wikictl log append --kind ingest"))
-        // Read-after-write rule is present.
-        #expect(prompt.contains("wikictl page get"))
+        // The prompt names the Ingest workflow but DEFERS its steps to the schema
+        // (CLAUDE.md, delivered via --append-system-prompt) — it no longer inlines
+        // the per-step wikictl cheatsheet.
+        #expect(prompt.contains("Ingest workflow"))
+        #expect(prompt.lowercased().contains("from your instructions"))
     }
 
-    @Test func queryPromptCarriesTheQuestionAndAsksForCitations() {
+    @Test func queryPromptCarriesTheQuestionAndDefersToTheSchemaWorkflow() {
         let prompt = WikiOperation.query(question: "What is the auth flow?")
             .prompt(wikiRoot: Self.resolvedRoot)
         #expect(prompt.contains("What is the auth flow?"))
-        #expect(prompt.lowercased().contains("cite"))
+        #expect(prompt.contains("Query workflow"))
+        #expect(prompt.lowercased().contains("cit"))   // "citing the pages…"
     }
 
-    @Test func lintPromptAsksForAHealthReportAndALogEntry() {
+    @Test func lintPromptNamesTheWorkflowAndDefersToTheSchema() {
         let prompt = WikiOperation.lint.prompt(wikiRoot: Self.resolvedRoot)
-        #expect(prompt.contains("orphan pages"))
-        #expect(prompt.contains("wikictl log append --kind lint"))
+        #expect(prompt.contains("Lint workflow"))
+        #expect(prompt.lowercased().contains("from your instructions"))
     }
 
-    @Test func everyPromptLeadsWithTheLayoutMapResolvedRootAndCheatsheet() {
+    @Test func everyPromptIsSlimCarryingTheResolvedRootButNotTheSchemaDuplication() {
         for operation: WikiOperation in [
             .ingest(sourcePath: "f"),
             .query(question: "q"),
             .lint,
         ] {
             let prompt = operation.prompt(wikiRoot: Self.resolvedRoot)
-            // The RESOLVED absolute root is injected (not left as `$WIKI_ROOT`).
+            // The RESOLVED absolute root is still injected (the one per-run fact the
+            // schema can't contain), and is labelled WIKI_ROOT.
             #expect(prompt.contains(Self.resolvedRoot))
-            // The concrete layout map up front — pages/files views, index/log/TREE.
-            #expect(prompt.contains("pages/by-title/"))
-            #expect(prompt.contains("pages/by-id/"))
-            #expect(prompt.contains("files/by-name/"))
-            #expect(prompt.contains("files/by-id/"))
-            #expect(prompt.contains("index.md"))
-            #expect(prompt.contains("log.md"))
-            #expect(prompt.contains("TREE.md"))
-            // The wikictl cheatsheet, including the exact stdin-piped upsert form.
-            #expect(prompt.contains("printf '%s' \"<body>\" | wikictl page upsert --title T --body-file -"))
-            #expect(prompt.contains("wikictl page list"))
-            // Wiki selection + read-only mount discipline.
-            #expect(prompt.contains("WIKI_DB"))        // selects the wiki
-            #expect(prompt.contains("do NOT pass --wiki"))
-            #expect(prompt.contains("read-only"))      // never edit the mount
+            #expect(prompt.contains("WIKI_ROOT"))
+            // Each prompt defers to the schema's workflow rather than restating it.
+            #expect(prompt.lowercased().contains("from your instructions"))
+            // The Phase-C inline duplication is GONE — these now live ONLY in the
+            // system prompt (CLAUDE.md), delivered via --append-system-prompt:
+            //   the layout map,
+            #expect(!prompt.contains("pages/by-title/"))
+            #expect(!prompt.contains("files/by-name/"))
+            #expect(!prompt.contains("TREE.md"))
+            //   the wikictl cheatsheet,
+            #expect(!prompt.contains("wikictl page upsert"))
+            #expect(!prompt.contains("wikictl index set"))
+            #expect(!prompt.contains("wikictl page list"))
+            //   and the read-after-write / do-not-pass-wiki reminders.
+            #expect(!prompt.contains("wikictl page get"))
+            #expect(!prompt.contains("do NOT pass --wiki"))
         }
     }
 

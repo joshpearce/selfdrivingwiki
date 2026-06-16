@@ -11,12 +11,15 @@ import Foundation
 /// app's `AgentLauncher`. Keeping the prompt/command construction pure is what
 /// makes the Phase-C deterministic seams unit-testable without a real agent run.
 ///
-/// ⚠️ **Self-sufficient prompts.** The per-wiki `system_prompt` singleton is still
-/// the Phase-D stub, so each operation's own prompt must spell out how to act with
-/// `wikictl` (write via `wikictl page upsert`, record via `wikictl log append`,
-/// rewrite via `wikictl index set`, read-back via `wikictl page get` because the
-/// mount lags ~5s). This makes the structural Phase-C gate pass before Phase D
-/// lands the real schema.
+/// **DRY against the schema.** The maintainer schema (`SystemPrompt.defaultBody`,
+/// projected as `CLAUDE.md`/`AGENTS.md`) is delivered on every run via
+/// `--append-system-prompt`, and it documents the layout, the `wikictl` command
+/// reference, the read-after-write rule, and the Ingest/Query/Lint workflows. So
+/// each operation's `-p` prompt carries only the per-op task plus the dynamic,
+/// per-run facts the system prompt cannot contain: the resolved absolute
+/// `WIKI_ROOT`, and (for Ingest) the source file's absolute path / (for Query) the
+/// question. It does NOT restate the layout map or the `wikictl` cheatsheet — that
+/// would duplicate the schema and drift from it.
 public enum WikiOperation: Equatable, Sendable {
     /// Summarize one already-ingested source file into the wiki. `sourcePath` is
     /// the source's mount-relative path under `$WIKI_ROOT` (e.g.
@@ -56,11 +59,11 @@ public enum WikiOperation: Equatable, Sendable {
 }
 
 extension WikiOperation {
-    /// The operation's OWN prompt — the `-p` argument handed to `claude`. Written
-    /// to be self-sufficient against today's stub `system_prompt`: it leads with a
-    /// concrete MAP of the wiki (resolved absolute root, layout, `wikictl`
-    /// cheatsheet) so the agent acts immediately instead of probing for structure,
-    /// then tells it exactly which `wikictl` calls to make.
+    /// The operation's OWN prompt — the `-p` argument handed to `claude`. Slim by
+    /// design: the maintainer schema (layout, `wikictl` reference, read-after-write
+    /// rule, and the full Ingest/Query/Lint workflows) arrives every run via
+    /// `--append-system-prompt`, so this prompt carries only the per-op task and the
+    /// dynamic per-run facts the schema can't contain.
     ///
     /// - Parameter wikiRoot: the wiki's LIVE mount path, RESOLVED at click time and
     ///   passed in (NOT `$WIKI_ROOT` for the agent to expand). Injecting the
@@ -78,98 +81,35 @@ extension WikiOperation {
         }
     }
 
-    /// The concrete, load-bearing layout map prepended to every operation prompt.
-    /// Carries the RESOLVED absolute `wikiRoot` (so the agent never has to expand
-    /// `$WIKI_ROOT`), the fixed projection layout, and the `wikictl` cheatsheet —
-    /// the same map `TREE.md` serves, inlined so the agent has it without a read.
-    private static func toolingPreamble(wikiRoot: String) -> String {
-        """
-        You maintain a wiki stored in SQLite, projected read-only at this absolute \
-        path (the WIKI_ROOT — browse it with find/cat/grep/Read):
-          \(wikiRoot)
-        WRITE only through the `wikictl` command — never edit files under the mount, \
-        it is read-only. `wikictl` is on your PATH and already targets THIS wiki via \
-        the WIKI_DB environment variable, so do NOT pass --wiki. After any write, \
-        read it back with `wikictl page get` (NOT by cat-ing the mount, which lags a \
-        few seconds). The full layout is also in \(wikiRoot)/TREE.md.
-
-        Layout under \(wikiRoot):
-          index.md            curated catalog (rewrite wholesale via `wikictl index set`)
-          log.md              append-only chronological log
-          TREE.md             this layout/orientation map
-          CLAUDE.md / AGENTS.md   the agent system prompt (identical)
-          manifest.json       generated wiki manifest
-          pages/by-title/     one file per page, by title
-          pages/by-id/        the same pages, by ULID
-          files/by-name/      raw immutable ingested sources, by filename
-          files/by-id/        the same raw sources, by ULID
-          indexes/*.jsonl     machine indexes (pages.jsonl, links.jsonl, files.jsonl)
-
-        wikictl cheatsheet:
-          wikictl page list                         list id / title / path per page
-          wikictl page get --title T | --id I       print a page body (instant, authoritative)
-          printf '%s' "<body>" | wikictl page upsert --title T --body-file -   create/update a page
-          printf '%s' "<body>" | wikictl index set --body-file -               rewrite index.md
-          wikictl log append --kind ingest|query|lint --title "…" [--note "…"]  record an action
-        Use [[Page Title]] wiki-links in page bodies to cross-reference other pages.
-        """
-    }
-
     private static func ingestPrompt(wikiRoot: String, sourcePath: String) -> String {
         """
-        \(toolingPreamble(wikiRoot: wikiRoot))
+        Follow the Ingest workflow from your instructions to bring one source into \
+        this wiki. Act immediately; do not explore the layout first.
 
-        TASK — Ingest a source into the wiki. Act immediately; do not explore first.
-        The source to ingest is at this absolute path:
-          \(wikiRoot)/\(sourcePath)
-        Read it (use the Read tool for PDFs/images; cat for text). Then:
-          1. Write at least one summary page capturing the source's key content,
-             via `wikictl page upsert`. Cite the source by its files/ path.
-          2. Create or update any relevant entity/concept pages it mentions,
-             cross-linking with [[wiki-links]].
-          3. Rewrite the curated index at index.md via `wikictl index set` so it
-             lists the pages you just wrote (read the current index first with
-             `wikictl page list`).
-          4. Append a log entry recording this ingest:
-             `wikictl log append --kind ingest --title "<source name>" --note "<one line>"`.
-        Work autonomously to completion — do not ask for confirmation. The live
-        app shows your changes as they land.
+        WIKI_ROOT (resolved, read-only mount): \(wikiRoot)
+        Source to ingest (absolute path): \(wikiRoot)/\(sourcePath)
+
+        Work autonomously to completion — do not ask for confirmation. The live app \
+        shows your changes as they land.
         """
     }
 
     private static func queryPrompt(wikiRoot: String, question: String) -> String {
         """
-        \(toolingPreamble(wikiRoot: wikiRoot))
+        Follow the Query workflow from your instructions to answer a question from \
+        this wiki, citing the pages or files/ paths your answer draws on.
 
-        TASK — Answer a question from the wiki.
+        WIKI_ROOT (resolved, read-only mount): \(wikiRoot)
         Question: \(question)
-        Search the wiki (`wikictl page list`, then `wikictl page get`, plus
-        grep/cat over \(wikiRoot)/index.md and \(wikiRoot)/log.md) and answer
-        concisely. CITE the page titles or files/ paths your answer draws on. If the
-        wiki lacks the information, say so plainly rather than guessing. You MAY file
-        the answer back as a page via `wikictl page upsert` if it would be useful to
-        keep, then append `wikictl log append --kind query --title "<the question>"`.
         """
     }
 
     private static func lintPrompt(wikiRoot: String) -> String {
         """
-        \(toolingPreamble(wikiRoot: wikiRoot))
+        Follow the Lint workflow from your instructions to health-check this wiki \
+        and print a clear findings report.
 
-        TASK — Health-check the wiki and report.
-        Survey the wiki (page list via `wikictl page list`, bodies via
-        `wikictl page get`, the link graph in \(wikiRoot)/indexes/links.jsonl, plus
-        index.md and log.md). Report on:
-          • contradictions or claims that disagree across pages,
-          • stale claims that look outdated,
-          • orphan pages (no inbound [[links]]),
-          • missing cross-references between related pages,
-          • concepts mentioned repeatedly but lacking their own page.
-        Print a clear findings report. Then append
-        `wikictl log append --kind lint --title "Wiki lint" --note "<summary of findings>"`.
-        You MAY also file the report as a page via `wikictl page upsert` if useful.
-        Do not modify existing page content beyond adding cross-reference links you
-        are confident about.
+        WIKI_ROOT (resolved, read-only mount): \(wikiRoot)
         """
     }
 }

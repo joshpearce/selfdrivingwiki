@@ -2,6 +2,70 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-16 — LLM Wiki Phase D: the schema — DRAFT (independent gate pending)
+
+Branch `llmwiki/phase-d-schema` (stacked on `llmwiki/phase-c-claude-ops`).
+Implements `plans/llm-wiki.md` Phase D: replaces the stub `SystemPrompt.defaultBody`
+with the real wiki-maintainer schema, and slims the operation `-p` prompts now that
+the schema is delivered every run via `--append-system-prompt`. **Cheap, mostly
+prose — no new views, no migration changes.** DRAFT until the independent live gate.
+
+**What changed**
+- **`SystemPrompt.defaultBody` is now the real maintainer schema** (`WikiFSCore/
+  SystemPrompt.swift`) — addressed to the maintaining agent ("You maintain this
+  wiki…"), tight and skimmable. Documents: the **layout** (`pages/by-{title,id}`,
+  immutable `files/by-{name,id}`, `index.md`/`log.md`/`TREE.md`, `indexes/*.jsonl`,
+  `manifest.json`, `CLAUDE.md`≡`AGENTS.md`); **conventions** (page titling,
+  `[[wiki links]]`/`[[Target|alias]]`, summarize-don't-discard, entity vs concept
+  page shapes, citing sources by their `files/…` path); **tooling** — the full
+  `wikictl` command reference (`page list/get/upsert/delete`, `index set`,
+  `log append`), **write via `wikictl` NEVER the filesystem** (mount is read-only),
+  `wikictl` on PATH + targets the wiki via `WIKI_DB` (do NOT pass `--wiki`), and the
+  **read-after-write rule** (read back via `wikictl page get` because the mount lags
+  ~5s); **workflows** — the Ingest/Query/Lint playbooks in order; **sources** — raw
+  `files/` may be PDFs/images, use the `Read` tool (PDF text first, images
+  separately). This IS each wiki's per-wiki `CLAUDE.md`/`AGENTS.md`; the user
+  co-evolves it in-app.
+- **Slimmed the operation `-p` prompts** (`WikiOperation.swift`). The Phase-C
+  `toolingPreamble` (layout map + `wikictl` cheatsheet + read-after-write rule) is
+  REMOVED — that content now lives only in the system prompt, delivered every run via
+  `--append-system-prompt`. Each prompt is now the per-op task + the per-run facts
+  the schema can't contain: the resolved absolute `WIKI_ROOT` and (Ingest) the
+  source's absolute path / (Query) the question. E.g. Ingest is now "Follow the
+  Ingest workflow from your instructions… WIKI_ROOT: `<abs>` Source: `<abs>/…`". DRY
+  against the schema — no second copy of the layout/cheatsheet to drift.
+- **Migration UNCHANGED — verified, not disturbed.** The v2→3 seed and the
+  projection fallback both reference the same `defaultBody` constant, so changing the
+  constant seeds NEW wikis with the new schema while leaving EXISTING wikis untouched
+  (the seed runs only inside `if version < 3` at table-creation; there is no code
+  path that rewrites an existing `system_prompt` row to the default). A new test
+  (`existingSystemPromptRowIsNotOverwrittenOnReopen`) pins this. `CLAUDE.md`≡
+  `AGENTS.md`≡seeded body still holds structurally (both projection nodes serve
+  `systemPromptDocument().body`, which returns the seeded `defaultBody`).
+
+**Tests/build.** Updated `OperationCommandTests` to the slimmed prompt shape: each
+prompt now carries the resolved `WIKI_ROOT` and defers to "the … workflow from your
+instructions", and the inline layout map / `wikictl` cheatsheet / read-after-write /
+`--wiki` reminders are asserted GONE. New `SystemPromptTests` pin the schema content
+(names every `wikictl` command, the layout, conventions, workflows, the PDF/Read
+note) and the migration invariant (existing row not overwritten). **Also fixed the
+last same-millisecond ULID flake** (`PageUpsertTests.upsertByTitleResolvesDuplicate
+ToLowestULID` assumed creation order == ULID order; `ULID.generate()` is NOT
+monotonic within a ms, so it now derives the expected lowest id from the actual ids
+— matching the fix already applied to `WikiLinkNavigationTests`/`WikiLinkStoreTests`).
+`make test` → **211/211 green, 10/10 runs deterministic**; `make` produces a clean
+signed bundle (app + appex + `wikictl`, real identity).
+
+**Notes / what the independent verifier should watch (the Phase-D gate)**
+- The new default is **byte-identical** across a wiki's `CLAUDE.md` and `AGENTS.md`
+  and matches the seeded DB body (use a freshly-created wiki; one-shot
+  `WIKIFS_REENUMERATE=1` may be needed to surface the files on an already-materialized
+  domain).
+- A fresh `claude -p` launched against a NEW wiki reads the schema as its system
+  prompt and **can name the `wikictl` commands** (`claude` on PATH; macOS-26 TCC
+  prompt re-fires on a re-signed install).
+- Migration seeds new wikis with the new schema; **existing wikis are unaffected**.
+
 ## 2026-06-16 — Preview polish: clickable `[[wiki-links]]` — DONE ✅ (live-checked)
 
 Surfaced during the Phase C gate: the in-app Markdown preview rendered

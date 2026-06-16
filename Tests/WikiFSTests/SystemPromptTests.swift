@@ -29,6 +29,63 @@ struct SystemPromptTests {
         #expect(prompt.version == 1)
     }
 
+    // MARK: - The seeded schema documents the maintainer contract (Phase D)
+
+    /// The Phase-D gate requires a fresh `claude -p` to read the seeded schema as
+    /// its system prompt and be able to NAME the `wikictl` commands, the layout,
+    /// the read-after-write rule, and the workflows. Pin that content here so the
+    /// schema can't silently regress to a stub.
+    @Test func defaultBodyDocumentsTheWikictlCommandReference() {
+        let body = SystemPrompt.defaultBody
+        // Every `wikictl` subcommand the agent must know.
+        #expect(body.contains("wikictl page list"))
+        #expect(body.contains("wikictl page get"))
+        #expect(body.contains("wikictl page upsert"))
+        #expect(body.contains("wikictl page delete"))
+        #expect(body.contains("wikictl index set"))
+        #expect(body.contains("wikictl log append"))
+        // Write-via-wikictl-never-the-filesystem + read-only mount.
+        #expect(body.contains("READ-ONLY"))
+        // WIKI_DB selects the wiki, so do not pass --wiki.
+        #expect(body.contains("WIKI_DB"))
+        #expect(body.contains("do NOT pass"))
+        #expect(body.contains("--wiki"))
+        // The read-after-write escape hatch (the mount lags).
+        #expect(body.contains("Read back what you just wrote"))
+    }
+
+    @Test func defaultBodyDocumentsTheLayout() {
+        let body = SystemPrompt.defaultBody
+        #expect(body.contains("pages/by-title/"))
+        #expect(body.contains("pages/by-id/"))
+        #expect(body.contains("files/by-name/"))
+        #expect(body.contains("files/by-id/"))
+        #expect(body.contains("index.md"))
+        #expect(body.contains("log.md"))
+        #expect(body.contains("TREE.md"))
+        #expect(body.contains("indexes/"))
+        #expect(body.contains("manifest.json"))
+        #expect(body.contains("CLAUDE.md"))
+        #expect(body.contains("AGENTS.md"))
+    }
+
+    @Test func defaultBodyDocumentsConventionsAndWorkflows() {
+        let body = SystemPrompt.defaultBody
+        // Conventions.
+        #expect(body.contains("[[wiki links]]"))
+        #expect(body.lowercased().contains("summarize"))
+        #expect(body.lowercased().contains("entity"))
+        #expect(body.lowercased().contains("concept"))
+        #expect(body.lowercased().contains("cite"))
+        // The three workflows.
+        #expect(body.contains("Ingest"))
+        #expect(body.contains("Query"))
+        #expect(body.contains("Lint"))
+        // Sources may be PDFs/images, read with the Read tool.
+        #expect(body.contains("Read"))
+        #expect(body.contains("PDF"))
+    }
+
     // MARK: - Update persists + bumps version
 
     @Test func updatePersistsBodyAndBumpsVersion() throws {
@@ -55,6 +112,32 @@ struct SystemPromptTests {
         let prompt = try store.getSystemPrompt()
         #expect(prompt.body == "three")
         #expect(prompt.version == 4)   // 1 (seed) + 3 edits
+    }
+
+    /// Phase-D migration invariant: changing the `defaultBody` constant seeds NEW
+    /// wikis with the new schema but must NEVER rewrite an EXISTING wiki's row. A
+    /// pre-existing body (e.g. the prior schema, or a user's co-evolved version)
+    /// rides through reopen untouched — the seed runs only when the table is first
+    /// created, never on a subsequent open.
+    @Test func existingSystemPromptRowIsNotOverwrittenOnReopen() throws {
+        let url = tempDatabaseURL()
+        // First open seeds the row with the current defaultBody.
+        do {
+            let store = try SQLiteWikiStore(databaseURL: url)
+            #expect(try store.getSystemPrompt().body == SystemPrompt.defaultBody)
+        }
+        // Simulate a wiki carrying a DIFFERENT body than today's default (an older
+        // seed, or the user's edits).
+        let preExisting = "# My co-evolved schema\n\nDo not clobber me.\n"
+        do {
+            let store = try SQLiteWikiStore(databaseURL: url)
+            try store.updateSystemPrompt(body: preExisting)
+        }
+        // Reopening must NOT reset it back to defaultBody — the seed is create-only.
+        let reopened = try SQLiteWikiStore(databaseURL: url)
+        let prompt = try reopened.getSystemPrompt()
+        #expect(prompt.body == preExisting)
+        #expect(prompt.body != SystemPrompt.defaultBody)
     }
 
     // MARK: - Change token advances on a prompt-only edit
