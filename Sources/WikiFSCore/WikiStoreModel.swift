@@ -129,13 +129,14 @@ public final class WikiStoreModel {
     public func save() {
         guard let id = loadedPage else { return }
         do {
-            try store.updatePage(id: id, title: draftTitle, body: draftBody)
-            // Re-resolve this page's [[wiki-links]] against the current title
-            // graph (Phase 4). Parsing is pure; the store resolves targets and
-            // rewrites `page_links`. v0 limitation: a *rename* does NOT re-walk
-            // the whole graph, so links that targeted the old title go stale
-            // until the linking page is next saved (they self-heal then).
-            try store.replaceLinks(from: id, parsedLinks: WikiLinkParser.parse(draftBody))
+            // The shared upsert+reparse seam (Phase A): persist the body AND
+            // re-resolve this page's `[[wiki-links]]` in one operation. `wikictl`
+            // calls the SAME `PageUpsert.upsert`, so an in-app edit and a CLI
+            // edit leave byte-identical `page_links` rows (no drift). v0
+            // limitation: a *rename* does NOT re-walk the whole graph, so links
+            // that targeted the old title go stale until the linking page is next
+            // saved (they self-heal then).
+            try PageUpsert.upsert(in: store, id: id, title: draftTitle, body: draftBody)
             reloadSummaries()
             onPageDidChange?()
         } catch {
@@ -306,6 +307,16 @@ public final class WikiStoreModel {
     }
 
     // MARK: - Source-of-truth rebuild
+
+    /// Rebuild the sidebar lists from the store — used by the Phase A change
+    /// bridge after an EXTERNAL write (a `wikictl` call) lands in this wiki's DB,
+    /// so the on-screen sidebar reflects pages/files the CLI wrote. Always a full
+    /// rebuild from source, never an incremental patch (§3.1 / §3.2). The active
+    /// editing draft is untouched — only the list projections refresh.
+    public func reloadFromStore() {
+        reloadSummaries()
+        reloadIngestedFiles()
+    }
 
     private func reloadSummaries() {
         summaries = (try? store.listPages()) ?? []
