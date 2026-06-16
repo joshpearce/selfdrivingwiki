@@ -2,6 +2,118 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-16 — LLM Wiki Phase C: `claude -p` operations (Ingest / Query / Lint) — DRAFT (gate pending)
+
+Branch `llmwiki/phase-c-claude-ops` (stacked on `llmwiki/phase-b-index-log`).
+Implements `plans/llm-wiki.md` Phase C: generalizes the v0 agent launcher into
+three discrete `claude -p` operations scoped to the active wiki, the per-wiki
+edit lock, and the live-sidebar refresh during a run. The deterministic seams
+(prompt/command/env construction, PATH preflight, edit-lock state machine) are
+unit-tested; the real agent run is verified live by the independent gate.
+
+**Flag surface confirmed (claude-api skill + installed CLI `2.1.178`)**
+- `claude --help` confirms `-p`/`--print`, `--append-system-prompt <prompt>`,
+  `--allowedTools` ("Comma or space-separated list of tool names"), and
+  `--output-format text|json|stream-json`. We use plain text for v1.
+- Validated the EXACT combination parses on the real binary:
+  `claude -p "…" --append-system-prompt "…" --allowedTools "Bash(wikictl:*) Bash(find:*) …"`
+  (no unknown-flag error). The space-separated `Bash(<cmd>:*)` allowlist form is
+  what the installed CLI accepts.
+
+**Added (deterministic, unit-tested — `WikiFSCore`)**
+- **`WikiOperation`** — a PURE enum (`ingest(sourcePath:)` / `query(question:)` /
+  `lint`) that renders each operation's OWN self-sufficient `-p` prompt. Because
+  the per-wiki `system_prompt` is still the Phase-D stub, each prompt spells out
+  the `wikictl` workflow (write via `page upsert`, record via `log append`,
+  rewrite via `index set`, **read-back via `page get`** since the mount lags ~5s)
+  and reminds the agent the mount is read-only + `WIKI_DB` already selects the
+  wiki (so it must NOT pass `--wiki`). Ingest names all four write steps (≥1
+  summary page, entity/concept pages, rewrite `index.md`, append `log.md`); Query
+  asks for a cited answer; Lint asks for the health report + a `log append`.
+- **`OperationCommand`** — the PURE `claude -p` argv/env/cwd builder, the
+  load-bearing testable seam. `build(...)` assembles:
+  `claude -p <prompt> --append-system-prompt <wiki's system_prompt> --allowedTools
+  '<allowlist>'` with **env** `WIKI_ROOT=<live mount>` + `WIKI_DB=<wiki ULID>` +
+  `PATH=<Helpers dir>:<inherited PATH>` (so the agent's `wikictl` calls resolve),
+  **cwd** = a per-run writable scratch dir (NOT the read-only mount, decision #4).
+  `allowedTools` = `Bash(wikictl:*) Bash(find:*) Bash(cat:*) Bash(grep:*)
+  Bash(printf:*) Read Grep Glob` (least privilege: wikictl writes + read-only
+  shell + read tools; `printf` for the stdin-piped `--body-file -` writes).
+- **`PathPreflight`** — pure `resolve(executable:onPath:fileExists:)` first-hit
+  PATH search + `resolveOnLoginShell()` (a real `zsh -lc 'echo $PATH'` hop, since
+  the GUI app's process PATH lacks `/opt/homebrew/bin`). Surfaces a clear in-UI
+  error if `claude` isn't resolvable instead of a cryptic spawn failure.
+- **`EditLock`** — `@MainActor @Observable` per-wiki lock state machine (decision
+  #6): `lock(wikiID:)` / `unlock(wikiID:)`, keyed by ULID, **re-entrant via a
+  count** (two ops on one wiki don't unlock each other early), stray-unlock
+  clamped at zero. (The app drives the lock through `WikiStoreModel` directly —
+  `EditLock` is the tested standalone state machine for the per-wiki contract.)
+
+**Added / changed (app — `WikiFS`)**
+- **`AgentLauncher` generalized** from a free-form `zsh -lc <cmd>` to
+  `run(operation:wikiID:wikiRoot:systemPrompt:wikictlDirectory:onLock:onUnlock:)`:
+  runs the PATH preflight, builds the per-run scratch dir under Caches, assembles
+  the command via `OperationCommand.build`, spawns `claude`, streams stdout+stderr
+  through the existing pipe `readabilityHandler`s, and — in the
+  `terminationHandler` — releases the edit lock (`onUnlock`) + cleans up scratch,
+  so a killed/crashed agent still re-enables editing. Exposes `preflightError` +
+  `runningKind` for the UI. `resolveClaude` is injectable for tests.
+- **`HelpersLocation`** — resolves the `wikictl` dir to prepend to the agent's
+  PATH: the signed bundle's `Contents/Helpers` first, then `build/` and the
+  running-exe dir for dev (`swift run`). Confirmed live: the embedded+signed
+  `wikictl` resolves on PATH and honors `WIKI_DB`.
+- **Edit lock wired into the model.** `WikiStoreModel.beginAgentRun()` flushes
+  pending edits then sets `isAgentRunning` (editor → read-only, autosave PAUSED —
+  both `scheduleAutosave` and `systemPromptChanged` early-return while running, so
+  an in-app save can't clobber the agent's `wikictl` writes). `endAgentRun()`
+  clears the flag, `reloadFromStore()`s the sidebar, and reloads the open
+  document's draft from the (agent-rewritten) source. The live change-bridge
+  `reloadFromStore` is UNAFFECTED by the lock, so the sidebar still fills in as the
+  agent's writes land mid-run. `currentSystemPromptBody()` exposes the singleton
+  for `--append-system-prompt`.
+- **UI (macos-design + typography-designer + swiftui-pro).** `OperationsView`
+  replaces the old "Run Agent" sheet: a segmented Ingest/Query/Lint picker, an
+  Ingest source picker (over the wiki's ingested files → its `files/by-id/…`
+  mount path via the shared `FilenameEscaping`), a Query text box, a Lint button,
+  the streaming output panel (reused), and the PATH-preflight error surfaced in
+  the console. `AgentRunBanner` ("Agent is updating the wiki…") sits above both
+  editors — **always-mounted, height-animated** per SWIFTUI-RULES §1.1 (no
+  structural transition), Reduce-Motion-aware; both detail views `.disabled` while
+  `store.isAgentRunning`. Semantic Dynamic-Type fonts throughout. Toolbar button
+  renamed "Maintain Wiki" (`sparkles`). Obsolete `AgentLauncherView` removed.
+- Tests: 135 → **161** (+26). `OperationCommandTests` (18: argv order + exact
+  flags, allowlist scope, `WIKI_ROOT`/`WIKI_DB` env, Helpers-dir PATH prepend,
+  scratch-cwd-not-mount, base-env inheritance, every-kind builds; the three
+  prompts name their `wikictl` steps + read-after-write rule + `do NOT pass
+  --wiki`; PATH preflight found/missing/order/absolute/empty). `EditLockTests` (8:
+  per-wiki isolation, lock-on-start/unlock-on-terminate, re-entrant count,
+  stray-unlock clamp; model begin/end flag, autosave-paused-while-locked,
+  end-rebuilds-sidebar). `make test` → 161 (one PRE-EXISTING flake, below); `make`
+  clean signed bundle (app + appex + `wikictl`, real identity).
+
+**The EXACT command each op builds** (env + cwd shown):
+```
+cd <Caches>/WikiFS-agent/<uuid>  \   # writable scratch, NOT the read-only mount
+  env WIKI_ROOT=<live mount> WIKI_DB=<wiki ULID> \
+      PATH=<WikiFS.app/Contents/Helpers>:<inherited PATH> \
+  <resolved claude> -p "<operation prompt>" \
+    --append-system-prompt "<this wiki's system_prompt body>" \
+    --allowedTools 'Bash(wikictl:*) Bash(find:*) Bash(cat:*) Bash(grep:*) Bash(printf:*) Read Grep Glob'
+```
+
+**Notes / carry-forward**
+- **Pre-existing flaky test** `LogIndexTests.logEntriesOrderChronologicallyByULID`
+  (Phase B, commit `77c7590`) fails nondeterministically on same-millisecond ULID
+  ordering — INDEPENDENT of Phase C (reproduced on the Phase-B code). Same class
+  of flake as the noted `resolvesDuplicateTitleToLowestULID`. Flagged for a
+  separate fix; not introduced here.
+- **Gate is STRUCTURAL** (agent is non-deterministic): on a FRESHLY-CREATED wiki,
+  drop a real source → Ingest → ≥1 new summary page + ≥1 `log.md` entry +
+  `index.md` changed (all visible on the mount); a Query returns a cited answer; a
+  Lint produces a report; the editor is read-only during a run and re-enabled
+  after. `claude` must be on the login-shell PATH. macOS-26 TCC prompt re-fires on
+  a re-signed install (Phase 0 carry-forward).
+
 ## 2026-06-15 — LLM Wiki Phase B: `log.md` + `index.md` — DONE ✅ (gate passed)
 
 Branch `llmwiki/phase-b-index-log` (stacked on `llmwiki/phase-a-write-path`).

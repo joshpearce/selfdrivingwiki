@@ -10,6 +10,8 @@ struct PageDetailView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            AgentRunBanner(isVisible: store.isAgentRunning)
+
             TextField("Title", text: $store.draftTitle)
                 .font(.title2)
                 .fontWeight(.semibold)
@@ -36,6 +38,10 @@ struct PageDetailView: View {
                 .frame(minHeight: PageEditorMetrics.previewMinHeight)
                 .background(.quaternary.opacity(0.25))
         }
+        // The whole editor goes read-only while the agent runs (decision #6);
+        // autosave is also paused in the model so an in-app save can't clobber the
+        // agent's wikictl writes.
+        .disabled(store.isAgentRunning)
         .frame(minWidth: PageEditorMetrics.detailMinWidth)
     }
 }

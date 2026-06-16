@@ -12,6 +12,8 @@ struct SystemPromptDetailView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            AgentRunBanner(isVisible: store.isAgentRunning)
+
             VStack(alignment: .leading, spacing: 4) {
                 Text("System Prompt")
                     .font(.title2)
@@ -42,6 +44,8 @@ struct SystemPromptDetailView: View {
                 .frame(minHeight: PageEditorMetrics.previewMinHeight)
                 .background(.quaternary.opacity(0.25))
         }
+        // Read-only while the agent runs (decision #6); autosave paused in the model.
+        .disabled(store.isAgentRunning)
         .frame(minWidth: PageEditorMetrics.detailMinWidth)
     }
 }

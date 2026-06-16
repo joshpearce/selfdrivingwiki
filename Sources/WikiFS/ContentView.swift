@@ -59,10 +59,10 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button("Run Agent", systemImage: "play.circle") {
+                Button("Maintain Wiki", systemImage: "sparkles") {
                     showingAgentSheet = true
                 }
-                .help("Run a command with WIKI_ROOT set to the read-only mount")
+                .help("Run an agent: Ingest a source, Query the wiki, or Lint it")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button("Copy Unix Path", systemImage: "terminal") {
@@ -76,7 +76,12 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showingAgentSheet) {
-            AgentLauncherView(launcher: agentLauncher, fileProvider: fileProvider)
+            OperationsView(
+                launcher: agentLauncher,
+                store: store,
+                manager: manager,
+                fileProvider: fileProvider
+            )
         }
         // List(selection:) writes store.selection directly; observe it here so
         // the model flushes the outgoing page and loads the incoming one

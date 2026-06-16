@@ -1,0 +1,310 @@
+import SwiftUI
+import WikiFSCore
+
+/// The Ingest / Query / Lint sheet (`plans/llm-wiki.md` Phase C). Generalizes the
+/// v0 "Run Agent" sheet into the three discrete operations, each a one-shot
+/// `claude -p` scoped to the active wiki: an Ingest source picker, a Query input,
+/// a Lint button, the streaming output panel, and the PATH-preflight error.
+///
+/// Type scale matches the rest of the app's utility surfaces (`.headline` title,
+/// `.subheadline` secondary, monospaced code), per typography-designer +
+/// macos-design — a clean, native, simple presentation.
+struct OperationsView: View {
+    @Bindable var launcher: AgentLauncher
+    @Bindable var store: WikiStoreModel
+    @Bindable var manager: WikiManager
+    let fileProvider: FileProviderSpike
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var selectedKind: WikiOperation.Kind = .ingest
+    @State private var selectedSourceID: PageID?
+    @State private var queryText = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: OperationMetrics.sectionSpacing) {
+            header
+            operationPicker
+            inputSection
+            controls
+            outputConsole
+            footer
+        }
+        .padding(OperationMetrics.padding)
+        .frame(width: OperationMetrics.sheetWidth, height: OperationMetrics.sheetHeight)
+    }
+
+    // MARK: - Header
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Maintain Wiki")
+                .font(.headline)
+            Text("Run an agent against ‘\(activeWikiName)’. It reads the mount and writes via wikictl.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var operationPicker: some View {
+        Picker("Operation", selection: $selectedKind) {
+            ForEach(WikiOperation.Kind.allCases, id: \.self) { kind in
+                Text(kind.title).tag(kind)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .disabled(launcher.isRunning)
+    }
+
+    // MARK: - Per-operation input
+
+    @ViewBuilder
+    private var inputSection: some View {
+        switch selectedKind {
+        case .ingest: ingestInput
+        case .query: queryInput
+        case .lint: lintInput
+        }
+    }
+
+    private var ingestInput: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Source")
+                .font(.subheadline)
+                .fontWeight(.medium)
+            if store.ingestedFiles.isEmpty {
+                Text("No ingested files yet. Drag a file onto the window to ingest it first.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Picker("Source file", selection: $selectedSourceID) {
+                    Text("Choose a file…").tag(PageID?.none)
+                    ForEach(store.ingestedFiles) { file in
+                        Text(file.filename).tag(PageID?.some(file.id))
+                    }
+                }
+                .labelsHidden()
+                .disabled(launcher.isRunning)
+            }
+            Text("The agent reads the source, writes summary pages, updates index.md, and logs the ingest.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var queryInput: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Question")
+                .font(.subheadline)
+                .fontWeight(.medium)
+            TextEditor(text: $queryText)
+                .font(.callout)
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .frame(height: OperationMetrics.inputHeight)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(alignment: .topLeading) {
+                    if queryText.isEmpty {
+                        Text("Ask a question about the wiki…")
+                            .font(.callout)
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 13)
+                            .padding(.vertical, 16)
+                            .allowsHitTesting(false)
+                    }
+                }
+                .disabled(launcher.isRunning)
+        }
+    }
+
+    private var lintInput: some View {
+        Text("Lint health-checks the wiki for contradictions, stale claims, orphan pages, and missing cross-references, then reports findings below.")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - Controls
+
+    private var controls: some View {
+        HStack(spacing: 10) {
+            if launcher.isRunning {
+                Button("Stop", systemImage: "stop.fill") { launcher.stop() }
+                    .tint(.red)
+                ProgressView().controlSize(.small)
+                if let kind = launcher.runningKind {
+                    Text("Running \(kind.title)…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Button("Run \(selectedKind.title)", systemImage: "play.fill") { run() }
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(!canRun)
+            }
+            Spacer()
+            wikiRootLabel
+        }
+    }
+
+    @ViewBuilder
+    private var wikiRootLabel: some View {
+        if let root = fileProvider.path {
+            Label(root, systemImage: "folder")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .truncationMode(.middle)
+                .lineLimit(1)
+                .help("WIKI_ROOT — the live read-only File Provider mount")
+        } else {
+            Label("Resolving mount…", systemImage: "hourglass")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Output
+
+    private var outputConsole: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                Text(consoleText)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(consoleIsPlaceholder ? .secondary : .primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .id(Self.bottomAnchor)
+            }
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+            .onChange(of: launcher.output) {
+                withAnimation(.linear(duration: 0.1)) {
+                    proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    private var footer: some View {
+        HStack {
+            statusLabel
+            Spacer()
+            Button("Done") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+        }
+    }
+
+    @ViewBuilder
+    private var statusLabel: some View {
+        if let status = launcher.exitStatus {
+            Label(
+                status == 0 ? "Finished" : "Exited \(status)",
+                systemImage: status == 0 ? "checkmark.circle.fill" : "xmark.circle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(status == 0 ? .green : .red)
+        } else if launcher.isRunning {
+            Text("The editor is locked while the agent works.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Derived
+
+    private static let bottomAnchor = "agent-output-bottom"
+
+    private var activeWikiName: String {
+        guard let id = manager.activeWikiID,
+              let descriptor = manager.wikis.first(where: { $0.id == id })
+        else { return "this wiki" }
+        return descriptor.displayName
+    }
+
+    /// The console shows the live agent output, or — when nothing has run — the
+    /// preflight error (claude missing) or a neutral placeholder.
+    private var consoleText: String {
+        if !launcher.output.isEmpty { return launcher.output }
+        if let error = launcher.preflightError { return error }
+        return "No output yet. Choose an operation and press Run."
+    }
+
+    private var consoleIsPlaceholder: Bool {
+        launcher.output.isEmpty && launcher.preflightError == nil
+    }
+
+    /// Run is enabled only when the active wiki's mount is resolved and the
+    /// operation's required input is present.
+    private var canRun: Bool {
+        guard manager.activeWikiID != nil, fileProvider.path != nil else { return false }
+        switch selectedKind {
+        case .ingest: return selectedSourceID != nil
+        case .query: return !queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .lint: return true
+        }
+    }
+
+    // MARK: - Run
+
+    private func run() {
+        guard let wikiID = manager.activeWikiID else { return }
+        guard let operation = makeOperation() else { return }
+
+        Task {
+            // Refresh the mount + resolve WIKI_ROOT at click time (never hardcoded),
+            // so the agent sees current content before it reads.
+            await fileProvider.signalChange()
+            guard let root = fileProvider.path else { return }
+
+            let systemPrompt = store.currentSystemPromptBody()
+
+            launcher.run(
+                operation: operation,
+                wikiID: wikiID,
+                wikiRoot: root,
+                systemPrompt: systemPrompt,
+                wikictlDirectory: HelpersLocation.wikictlDirectory,
+                onLock: { store.beginAgentRun() },
+                onUnlock: { store.endAgentRun() }
+            )
+        }
+    }
+
+    /// Build the `WikiOperation` from the current selection + input.
+    private func makeOperation() -> WikiOperation? {
+        switch selectedKind {
+        case .ingest:
+            guard let id = selectedSourceID,
+                  let file = store.ingestedFiles.first(where: { $0.id == id })
+            else { return nil }
+            return .ingest(sourcePath: ingestSourcePath(for: file))
+        case .query:
+            let trimmed = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : .query(question: trimmed)
+        case .lint:
+            return .lint
+        }
+    }
+
+    /// The mount-relative path of an ingested file's `files/by-id` projection, so
+    /// the agent can Read it directly. Uses the SAME `FilenameEscaping` helper the
+    /// projection uses for the leaf filename, so it can't drift.
+    private func ingestSourcePath(for file: IngestedFileSummary) -> String {
+        let leaf = FilenameEscaping.byIDIngestedFilename(fileID: file.id.rawValue, ext: file.ext)
+        return "files/by-id/\(leaf)"
+    }
+}
+
+/// Layout constants for the operations sheet (§2.4 — no scattered magic numbers).
+private enum OperationMetrics {
+    static let sheetWidth: CGFloat = 660
+    static let sheetHeight: CGFloat = 560
+    static let padding: CGFloat = 20
+    static let sectionSpacing: CGFloat = 16
+    static let inputHeight: CGFloat = 72
+}
