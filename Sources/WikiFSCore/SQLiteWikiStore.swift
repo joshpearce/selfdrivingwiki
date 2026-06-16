@@ -728,13 +728,19 @@ public final class SQLiteWikiStore: WikiStore {
         return LogEntry(id: id, timestamp: now, kind: kind, title: title, note: note)
     }
 
-    /// All log rows ordered by `id` (ULID == chronological), oldest-first, for the
+    /// All log rows in chronological (insertion) order, oldest-first, for the
     /// `log.md` projection. Read-side helper (like `listAllPagesOrderedByID`) — not
     /// on the `WikiStore` protocol. Resilient to the table not existing yet is the
     /// caller's job (the projection wraps this in `try?`).
+    ///
+    /// Ordered by `ts` then `rowid` — NOT by the ULID `id`. The ULID's lexical sort
+    /// only matches creation order to millisecond granularity, so two appends in the
+    /// same millisecond would tie and order randomly by the ULID's random bits (a
+    /// flaky `log.md` ordering). `ts` is sub-millisecond and `rowid` is monotonic
+    /// per insert, so this is fully deterministic insertion order.
     public func listAllLogEntriesOrderedByID() throws -> [LogEntry] {
         let stmt = try statement("""
-        SELECT id, ts, kind, title, note FROM log ORDER BY id ASC;
+        SELECT id, ts, kind, title, note FROM log ORDER BY ts ASC, rowid ASC;
         """)
         defer { stmt.reset() }
         var out: [LogEntry] = []
