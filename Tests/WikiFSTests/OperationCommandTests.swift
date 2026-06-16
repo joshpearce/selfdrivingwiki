@@ -31,15 +31,30 @@ struct OperationCommandTests {
         #expect(buildIngest().executable == "/opt/homebrew/bin/claude")
     }
 
-    @Test func argumentsCarryPromptAppendSystemPromptAndAllowedTools() {
+    @Test func argumentsCarryPromptStreamFlagsAppendSystemPromptAndAllowedTools() {
         let cmd = buildIngest()
-        // -p <prompt> --append-system-prompt <prompt> --allowedTools <tools>
+        // -p <prompt> --output-format stream-json --verbose --include-partial-messages
+        //   --append-system-prompt <prompt> --allowedTools <tools>
         #expect(cmd.arguments[0] == "-p")
         #expect(cmd.arguments[1] == WikiOperation.ingest(sourcePath: "files/by-id/01ABC.pdf").prompt)
-        #expect(cmd.arguments[2] == "--append-system-prompt")
-        #expect(cmd.arguments[3] == "You are the maintainer.")
-        #expect(cmd.arguments[4] == "--allowedTools")
-        #expect(cmd.arguments[5] == OperationCommand.allowedTools)
+        #expect(cmd.arguments[2] == "--output-format")
+        #expect(cmd.arguments[3] == "stream-json")
+        #expect(cmd.arguments[4] == "--verbose")
+        #expect(cmd.arguments[5] == "--include-partial-messages")
+        #expect(cmd.arguments[6] == "--append-system-prompt")
+        #expect(cmd.arguments[7] == "You are the maintainer.")
+        #expect(cmd.arguments[8] == "--allowedTools")
+        #expect(cmd.arguments[9] == OperationCommand.allowedTools)
+    }
+
+    @Test func streamJSONRequiresVerbose() {
+        // The installed CLI (2.1.178) errors with "When using --print,
+        // --output-format=stream-json requires --verbose" if --verbose is absent —
+        // so the two flags must always travel together.
+        let args = buildIngest().arguments
+        #expect(args.contains("--output-format"))
+        #expect(args.contains("stream-json"))
+        #expect(args.contains("--verbose"))
     }
 
     @Test func allowedToolsScopesWikictlAndReadOnlyShellAndReadTools() {

@@ -73,6 +73,16 @@ public struct OperationCommand: Equatable, Sendable {
 
         let arguments = [
             "-p", operation.prompt,
+            // Stream the run as NDJSON so the UI can render activity in real time
+            // instead of staring at a silent panel until the final result. The
+            // installed CLI (2.1.178) REQUIRES `--verbose` alongside
+            // `--output-format stream-json` in `-p` mode, and
+            // `--include-partial-messages` adds token/text deltas for a livelier
+            // feel. All three were verified against `claude --help` and a real
+            // captured run; see `AgentEvent`/`AgentEventParser` for the schema.
+            "--output-format", "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--append-system-prompt", systemPrompt,
             "--allowedTools", allowedTools,
         ]
