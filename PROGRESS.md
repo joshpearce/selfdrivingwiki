@@ -14,11 +14,27 @@ unit-tested; the real agent run is verified live by the independent gate.
 **Flag surface confirmed (claude-api skill + installed CLI `2.1.178`)**
 - `claude --help` confirms `-p`/`--print`, `--append-system-prompt <prompt>`,
   `--allowedTools` ("Comma or space-separated list of tool names"), and
-  `--output-format text|json|stream-json`. We use plain text for v1.
-- Validated the EXACT combination parses on the real binary:
-  `claude -p "…" --append-system-prompt "…" --allowedTools "Bash(wikictl:*) Bash(find:*) …"`
-  (no unknown-flag error). The space-separated `Bash(<cmd>:*)` allowlist form is
-  what the installed CLI accepts.
+  `--output-format text|json|stream-json`.
+- **Streaming is now load-bearing, not polish.** A plain `claude -p` emits almost
+  nothing until the final result, so the operations panel sat blank for the whole
+  run — "you just sit there waiting for claude to do nothing", undebuggable. We now
+  always pass `--output-format stream-json --verbose --include-partial-messages`.
+  `--help` (and a real captured run) confirm `--verbose` is REQUIRED with
+  `stream-json` in print mode, and `--include-partial-messages` is accepted (it
+  adds token-level `stream_event` deltas).
+- **Real event shapes captured from the installed binary** (a live
+  `claude -p 'say hi' --output-format stream-json --verbose --include-partial-messages`
+  run, NDJSON, one per line): a `{"type":"system","subtype":"init",…,"model":…}`
+  event; `{"type":"assistant","message":{"content":[{type:"text"|"tool_use",…}]}}`;
+  `{"type":"user","message":{"content":[{type:"tool_result","is_error":…,"content":…}]}}`;
+  and the terminal `{"type":"result","is_error":…,"result":…}`. The bookkeeping
+  types we DON'T render — `system/status`, `rate_limit_event`, the
+  `--include-partial-messages` `stream_event` deltas, `system/post_turn_summary` —
+  were all observed and are intentionally skipped (the complete `assistant`/`user`
+  events carry the same content cleanly).
+- Validated the EXACT combination parses on the real binary (no unknown-flag
+  error). The space-separated `Bash(<cmd>:*)` allowlist form is what the installed
+  CLI accepts.
 
 **Added (deterministic, unit-tested — `WikiFSCore`)**
 - **`WikiOperation`** — a PURE enum (`ingest(sourcePath:)` / `query(question:)` /
@@ -32,13 +48,29 @@ unit-tested; the real agent run is verified live by the independent gate.
   asks for a cited answer; Lint asks for the health report + a `log append`.
 - **`OperationCommand`** — the PURE `claude -p` argv/env/cwd builder, the
   load-bearing testable seam. `build(...)` assembles:
-  `claude -p <prompt> --append-system-prompt <wiki's system_prompt> --allowedTools
-  '<allowlist>'` with **env** `WIKI_ROOT=<live mount>` + `WIKI_DB=<wiki ULID>` +
+  `claude -p <prompt> --output-format stream-json --verbose
+  --include-partial-messages --append-system-prompt <wiki's system_prompt>
+  --allowedTools '<allowlist>'` with **env** `WIKI_ROOT=<live mount>` +
+  `WIKI_DB=<wiki ULID>` +
   `PATH=<Helpers dir>:<inherited PATH>` (so the agent's `wikictl` calls resolve),
   **cwd** = a per-run writable scratch dir (NOT the read-only mount, decision #4).
   `allowedTools` = `Bash(wikictl:*) Bash(find:*) Bash(cat:*) Bash(grep:*)
   Bash(printf:*) Read Grep Glob` (least privilege: wikictl writes + read-only
   shell + read tools; `printf` for the stdin-piped `--body-file -` writes).
+- **`AgentEvent` + `AgentEventParser` + `ToolInputSummary`** (NEW, PURE,
+  unit-tested) — the typed projection of the stream-json NDJSON. `parse(line:)`
+  decodes ONE line → `.systemInit(model:)` / `.assistantText(String)` /
+  `.toolUse(name:inputSummary:)` / `.toolResult(isError:summary:)` /
+  `.result(isError:text:)`, and is deliberately TOLERANT: an empty line → `nil`;
+  any line that fails to decode (garbage, a mid-object partial flush) →
+  `.raw(line)` rather than throwing; unmodeled event types (`stream_event`
+  deltas, `system/status`, `rate_limit_event`, `post_turn_summary`) and
+  renderable-content-free `assistant` blocks (e.g. `thinking`-only) → `nil`. So a
+  bad/unfamiliar line never crashes or drops the run. `ToolInputSummary` renders a
+  concise one-liner per `tool_use` (Bash → its command, Read/Write/Edit → the
+  path, Glob/Grep → the pattern, else a sorted `key=value` join), elided at 120
+  chars — so the feed reads `Bash  wikictl page upsert --title "…"` not a JSON
+  blob. Built against the REAL captured shapes, not a guess.
 - **`PathPreflight`** — pure `resolve(executable:onPath:fileExists:)` first-hit
   PATH search + `resolveOnLoginShell()` (a real `zsh -lc 'echo $PATH'` hop, since
   the GUI app's process PATH lacks `/opt/homebrew/bin`). Surfaces a clear in-UI
@@ -50,14 +82,28 @@ unit-tested; the real agent run is verified live by the independent gate.
   `EditLock` is the tested standalone state machine for the per-wiki contract.)
 
 **Added / changed (app — `WikiFS`)**
-- **`AgentLauncher` generalized** from a free-form `zsh -lc <cmd>` to
+- **`AgentLauncher` generalized + made observable** from a free-form `zsh -lc
+  <cmd>` to
   `run(operation:wikiID:wikiRoot:systemPrompt:wikictlDirectory:onLock:onUnlock:)`:
   runs the PATH preflight, builds the per-run scratch dir under Caches, assembles
-  the command via `OperationCommand.build`, spawns `claude`, streams stdout+stderr
-  through the existing pipe `readabilityHandler`s, and — in the
-  `terminationHandler` — releases the edit lock (`onUnlock`) + cleans up scratch,
-  so a killed/crashed agent still re-enables editing. Exposes `preflightError` +
-  `runningKind` for the UI. `resolveClaude` is injectable for tests.
+  the command via `OperationCommand.build`, spawns `claude`. **The stdout
+  `readabilityHandler` now does double duty**: it tees every raw byte to the
+  per-run `run.jsonl` log AND feeds bytes through a line buffer (carrying over a
+  partial trailing line until its newline arrives, so the parser only ever sees
+  complete NDJSON) → `AgentEventParser` → a published
+  `private(set) var events: [AgentEvent]` the UI renders live, all on the main
+  actor. It also keeps a `rawTranscript` mirror and separate `stderr`. The
+  no-`waitUntilExit` model is preserved — completion arrives via
+  `terminationHandler`, which drains any trailing partial line, closes the log
+  handles, releases the edit lock (`onUnlock`), and records the exit status, so a
+  killed/crashed agent still re-enables editing. Exposes `preflightError`,
+  `runningKind`, `exitStatus`, and `logFileURL` for the UI. `resolveClaude` is
+  injectable for tests.
+- **Backend logs (the user-required "fully reconstructable after the fact").**
+  Each run's scratch dir holds `run.jsonl` (every raw stream-json byte, unparsed)
+  and a sibling `run.stderr.log` (claude's diagnostics). The scratch dir is now
+  PERSISTED (not deleted on termination) so a finished run can be replayed;
+  `logFileURL` surfaces `run.jsonl` so the UI can reveal it in Finder.
 - **`HelpersLocation`** — resolves the `wikictl` dir to prepend to the agent's
   PATH: the signed bundle's `Contents/Helpers` first, then `build/` and the
   running-exe dir for dev (`swift run`). Confirmed live: the embedded+signed
@@ -75,44 +121,78 @@ unit-tested; the real agent run is verified live by the independent gate.
   replaces the old "Run Agent" sheet: a segmented Ingest/Query/Lint picker, an
   Ingest source picker (over the wiki's ingested files → its `files/by-id/…`
   mount path via the shared `FilenameEscaping`), a Query text box, a Lint button,
-  the streaming output panel (reused), and the PATH-preflight error surfaced in
-  the console. `AgentRunBanner` ("Agent is updating the wiki…") sits above both
+  the live activity panel, and the PATH-preflight error.
+- **`AgentActivityView` (NEW) — the live transcript.** Replaces the old "raw blob"
+  console: an auto-scrolling `LazyVStack` over `launcher.events`, one row per typed
+  event — a `tool_use` row is an SF Symbol (terminal/doc/pencil/magnifyingglass per
+  tool) + monospaced name + concise input summary; assistant text is body prose;
+  the terminal result is distinct (green `checkmark.seal` / red
+  `exclamationmark.octagon` by `is_error`); a spinner + "Starting <kind>…"
+  placeholder shows while a run has started but emitted nothing yet, so the panel
+  is NEVER staring at nothing. Auto-scroll animates a scroll OFFSET to a
+  zero-height bottom anchor (`onChange(of: events.count)`) — never inserts/removes a
+  structural view (SWIFTUI-RULES §1.1); rows derive purely from their `AgentEvent`
+  (§3.1); semantic Dynamic-Type fonts (§5.1); no cached formatters in `body`. A
+  stderr "Diagnostics" sub-panel surfaces claude's stderr when non-empty, and the
+  footer's **"Reveal Log"** button opens `run.jsonl` in Finder. The raw transcript
+  stays available via `launcher.rawTranscript` for debugging.
+- `AgentRunBanner` ("Agent is updating the wiki…") sits above both
   editors — **always-mounted, height-animated** per SWIFTUI-RULES §1.1 (no
   structural transition), Reduce-Motion-aware; both detail views `.disabled` while
   `store.isAgentRunning`. Semantic Dynamic-Type fonts throughout. Toolbar button
   renamed "Maintain Wiki" (`sparkles`). Obsolete `AgentLauncherView` removed.
-- Tests: 135 → **161** (+26). `OperationCommandTests` (18: argv order + exact
-  flags, allowlist scope, `WIKI_ROOT`/`WIKI_DB` env, Helpers-dir PATH prepend,
-  scratch-cwd-not-mount, base-env inheritance, every-kind builds; the three
-  prompts name their `wikictl` steps + read-after-write rule + `do NOT pass
-  --wiki`; PATH preflight found/missing/order/absolute/empty). `EditLockTests` (8:
-  per-wiki isolation, lock-on-start/unlock-on-terminate, re-entrant count,
-  stray-unlock clamp; model begin/end flag, autosave-paused-while-locked,
-  end-rebuilds-sidebar). `make test` → 161 (one PRE-EXISTING flake, below); `make`
-  clean signed bundle (app + appex + `wikictl`, real identity).
+- Tests: 135 → **180** (+45). `OperationCommandTests` (updated: argv now asserts
+  `-p`, the `--output-format stream-json --verbose --include-partial-messages`
+  streaming flags, `--append-system-prompt`, `--allowedTools` in exact order, plus
+  a dedicated `streamJSONRequiresVerbose` check; allowlist scope,
+  `WIKI_ROOT`/`WIKI_DB` env, Helpers-dir PATH prepend, scratch-cwd-not-mount,
+  base-env inheritance, every-kind builds; the three prompts name their `wikictl`
+  steps + read-after-write rule + `do NOT pass --wiki`; PATH preflight
+  found/missing/order/absolute/empty). **`AgentEventParserTests` (NEW, ~19)** —
+  each event type from REAL captured sample lines (system/init w/ + w/o model,
+  assistant text, Bash/Read `tool_use` summaries, string + array `tool_result`,
+  success + error `result`); tolerance (garbage → `.raw`, truncated mid-object →
+  `.raw`, empty/whitespace → `nil`, unmodeled types → `nil`, renderable-free
+  assistant → `nil`); `ToolInputSummary` (unknown-tool sorted `key=value`,
+  long-command elision, empty input). `EditLockTests` (8, unchanged).
+  `make test` → **180 green, all deterministic** (the prior log-ordering flake was
+  fixed in `38aeb6f` — `ts+rowid` ordering); `make` clean signed bundle (app +
+  appex + `wikictl`, real identity).
+- **End-to-end live smoke (this session).** Drove the FULL pipeline against the
+  installed `claude 2.1.178`: built the real `OperationCommand` argv, spawned
+  `claude -p`, teed raw stdout to `run.jsonl`, line-buffered through the real
+  `AgentEventParser`. Result: parsed `systemInit(model: "claude-opus-4-8[1m]")` →
+  `assistantText("PONG")` → `result(isError:false, text:"PONG")`, and `run.jsonl`
+  populated (7,917 bytes). The activity stream AND the backend log both populate
+  on a real run. (Smoke harness was temporary; removed after the run.)
 
 **The EXACT command each op builds** (env + cwd shown):
 ```
-cd <Caches>/WikiFS-agent/<uuid>  \   # writable scratch, NOT the read-only mount
+cd <Caches>/WikiFS-agent/<uuid>  \   # writable scratch (also holds run.jsonl +
+                                     #   run.stderr.log); NOT the read-only mount
   env WIKI_ROOT=<live mount> WIKI_DB=<wiki ULID> \
       PATH=<WikiFS.app/Contents/Helpers>:<inherited PATH> \
   <resolved claude> -p "<operation prompt>" \
+    --output-format stream-json --verbose --include-partial-messages \
     --append-system-prompt "<this wiki's system_prompt body>" \
     --allowedTools 'Bash(wikictl:*) Bash(find:*) Bash(cat:*) Bash(grep:*) Bash(printf:*) Read Grep Glob'
 ```
 
 **Notes / carry-forward**
-- **Pre-existing flaky test** `LogIndexTests.logEntriesOrderChronologicallyByULID`
-  (Phase B, commit `77c7590`) fails nondeterministically on same-millisecond ULID
-  ordering — INDEPENDENT of Phase C (reproduced on the Phase-B code). Same class
-  of flake as the noted `resolvesDuplicateTitleToLowestULID`. Flagged for a
-  separate fix; not introduced here.
+- **The prior log-ordering flake is FIXED** (`38aeb6f` — `log.md` now orders by
+  `ts+rowid`, not the ULID `id`). The whole suite (180) is deterministic.
 - **Gate is STRUCTURAL** (agent is non-deterministic): on a FRESHLY-CREATED wiki,
   drop a real source → Ingest → ≥1 new summary page + ≥1 `log.md` entry +
   `index.md` changed (all visible on the mount); a Query returns a cited answer; a
   Lint produces a report; the editor is read-only during a run and re-enabled
   after. `claude` must be on the login-shell PATH. macOS-26 TCC prompt re-fires on
   a re-signed install (Phase 0 carry-forward).
+- **The verifier must ALSO confirm the streaming observability** (the whole point
+  of this enhancement): during a run the operations panel shows live tool-call
+  rows + assistant text streaming in (NOT a blank box until the end), and a
+  backend `run.jsonl` log is written under the run's scratch dir
+  (`<Caches>/WikiFS-agent/<uuid>/run.jsonl`, revealable via "Reveal Log"),
+  containing the raw stream-json for after-the-fact replay.
 
 ## 2026-06-15 — LLM Wiki Phase B: `log.md` + `index.md` — DONE ✅ (gate passed)
 
