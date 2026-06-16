@@ -2,14 +2,13 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
-## 2026-06-15 — LLM Wiki Phase 0: Many wikis (foundation) — CODE COMPLETE ⏳ (gate pending)
+## 2026-06-15 — LLM Wiki Phase 0: Many wikis (foundation) — DONE ✅ (gate passed)
 
-DRAFT entry — code + unit tests are done and all build/test gates are green, but
-the independent live-mount gate has NOT run yet. Branch
-`llmwiki/phase-0-many-wikis` (stacked on the post-v0 line). Implements
+Branch `llmwiki/phase-0-many-wikis` (stacked on the post-v0 line). Implements
 `plans/llm-wiki.md` Phase 0: one SQLite DB + one File Provider domain **per
 wiki**, a registry, an in-app switcher, and migration of the single v0 wiki as
-wiki #1.
+wiki #1. Independent live-mount gate (computer-use + Bash) PASSED after one
+fix round (the migration duplication loop below).
 
 **Added / changed**
 - **Registry (`WikiFSCore`).** New `WikiDescriptor` (id ULID, displayName,
@@ -63,25 +62,50 @@ wiki #1.
   when the registry is empty. Net invariant: a v0 user's first launch → exactly
   one wiki #1; every subsequent launch adds zero wikis and keeps it active; a
   non-empty registry + a stray legacy file never creates a new wiki.
-- Tests: 69 → **84** (+15). New `WikiRegistryTests` (round-trip, MRU,
+- Tests: 69 → **86** (+17). New `WikiRegistryTests` (round-trip, MRU,
   rename-keeps-identity, ULID-derived paths) + `WikiManagerTests` (fresh-seed,
   per-wiki DB isolation, distinct files on disk, delete removes DB, MRU
   launch-pick, rename doesn't move the file, v0 migration preserves content +
-  doesn't re-run). `make test` → **84/84**; `make check` clean; real `make`
-  app-bundle build + codesign (app + appex) clean.
+  doesn't re-run, **legacy file reappearing after first launch doesn't
+  duplicate**, **stray legacy file + non-empty registry creates no wiki**).
+  `make test` → **86/86**; `make check` clean; real `make` app-bundle build +
+  codesign (app + appex) clean.
 
-**For the independent verifier to watch**
-- **Per-domain `WIKIFS_REENUMERATE`:** a freshly-created wiki's domain is brand
-  new, so its tree should materialize without the hatch. But the **migrated v0
-  wiki** changes domain identity (old domain id was `"WikiFS"`; new is the ULID),
-  so the daemon may need a one-shot `WIKIFS_REENUMERATE=1` launch to drop the old
-  `WikiFS-WikiFS` mount and surface the ULID-identified one. Confirm on the live
-  mount.
+**Verified (independent live gate, real `make clean && make install`, real-signed, computer-use + Bash)**
+- **Create + isolation + independent DBs:** created a second wiki **"GateBeta"**
+  in-app via the sidebar switcher → it mounted at its own
+  `~/Library/CloudStorage/WikiFS-GateBeta` with its own `<ulid>.sqlite` (3
+  distinct ULID DB files in the container at peak). Added a sentinel page
+  `BetaSentinelZ9` in GateBeta → it appeared ONLY in GateBeta's DB (`count(*)=1`;
+  `0` in both other DBs) and ONLY in GateBeta's mount; the v0 wiki's unique
+  `Target` page never appeared in GateBeta's mount, and `BetaSentinelZ9` never
+  appeared in the v0 wiki's mount (`WikiFS-WikiFS`). Isolation proven both ways.
+- **Delete removes domain + DB:** deleted GateBeta via the switcher (destructive
+  confirm dialog) → its registry entry, `<ulid>.sqlite` + `-wal`/`-shm` sidecars,
+  Finder mount, AND File Provider domain (`fileproviderctl`) were all gone.
+- **v0 preserved + migration idempotent (the fix):** from a v0 starting point
+  (Application Support `WikiFS.sqlite` present, empty registry), the FIRST launch
+  migrated to **exactly one** wiki #1 "WikiFS" carrying the full v0 content —
+  original `Home` (`01KV6EAH…`) + `Target` (`01KV6KS0…`) + the ingested
+  `[MS-NRPC] (1).pdf` — served read-only on the mount. Repeated relaunches **with
+  the Application Support source still present** kept the registry at exactly one
+  wiki (same id) and one ULID DB — zero duplicates (the pre-fix code spawned a new
+  "WikiFS" every launch). Read-only still enforced (`echo >` rejected with
+  "operation not permitted"; SQLite untouched).
+
+**Notes / carry-forward**
+- **macOS-26 TCC gate re-fires on a re-signed install:** "WikiFS would like to
+  access data from other apps" appears (UserNotificationCenter) in `App.init()`
+  and holds the app hostage until "Allow" — migration/bootstrap don't run until
+  it's dismissed. Consent persists across launches within an install. Already
+  documented in `PROGRESS.md`/`ISSUES.md`; surfaced again here driving the gate.
 - **Mount labels:** each wiki mounts at `~/Library/CloudStorage/WikiFS-<display>`;
-  two wikis with the same display name would collide on the Finder label (not the
-  DB — identity is the ULID). Out of scope to dedupe for the gate.
-- Two-writer/many-domain lifecycle limits (the doc's open risk) are untested at
-  the daemon level here — the gate is the place to observe add/remove timing.
+  two wikis with the same display name collide on the Finder label (not the DB —
+  identity is the ULID). With the migration fixed there are no spurious
+  same-named duplicates; deliberate same-name wikis remain out of scope to dedupe.
+- **Stale domains** from prior manual file-archiving aren't reaped by the app
+  (it registers add-if-absent; `NSFileProviderManager.removeAllDomains` needs the
+  provider-app context, so an ad-hoc CLI can't reap them). Cosmetic only.
 
 A user-editable singleton "system prompt" document — the instructions the
 managing agent reads each run — projected **read-only at the wiki root under TWO

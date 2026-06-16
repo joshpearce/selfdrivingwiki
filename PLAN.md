@@ -41,8 +41,15 @@ with a plain-folder export, even though that would dodge the signing requirement
 
 ## Status
 
-See `PROGRESS.md` for the running log. Current: **🎉 v0 DONE ✅ — all four
-phases gate-passed (M0–M6).** A native macOS SwiftUI wiki, SQLite-backed,
+See `PROGRESS.md` for the running log. Current: **LLM Wiki Phase 0 (Many wikis)
+DONE ✅ — live gate passed.** One SQLite DB + one File Provider domain **per
+wiki**, a `wikis.json` registry, an in-app create/select/delete switcher, and the
+single v0 wiki migrated in as wiki #1 (idempotently). Branch
+`llmwiki/phase-0-many-wikis` (stacked on the post-v0 line, unmerged). Next:
+Phase A (the `wikictl` write path + change bridge). See `plans/llm-wiki.md` for
+the Phase 0 → A–D plan.
+
+**Prior baseline: 🎉 v0 DONE ✅ — all four phases gate-passed (M0–M6).** A native macOS SwiftUI wiki, SQLite-backed,
 projected read-only onto the filesystem via a File Provider extension, kept
 fresh on edit, and traversable by an agent launched with `WIKI_ROOT`. Delivered
 across four stacked, **unmerged** branches off a pristine `main`
