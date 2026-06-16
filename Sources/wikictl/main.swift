@@ -35,8 +35,7 @@ func run() -> Int32 {
         }
         let store = try SQLiteWikiStore(databaseURL: resolver.databaseURL(for: descriptor))
 
-        let action = try resolveAction(invocation.command)
-        let result = try PageCommand.run(action, in: store)
+        let result = try execute(invocation.command, in: store)
 
         if !result.output.isEmpty {
             print(result.output)
@@ -56,20 +55,26 @@ func run() -> Int32 {
     }
 }
 
-/// Turn a parsed `Command` into an executable `PageCommand.Action`, reading the
-/// `upsert` body from its source (`-` = stdin, otherwise a file path). The body
-/// read is the only I/O the parser deferred.
-func resolveAction(_ command: ArgumentParser.Command) throws -> PageCommand.Action {
+/// Execute a parsed `Command`, dispatching to `PageCommand` (the `page …` family)
+/// or `LogIndexCommand` (the Phase-B `log append` / `index set`). The deferred
+/// body read (`-` = stdin, else a file path) happens here — the only I/O the
+/// parser left for `main`.
+func execute(_ command: ArgumentParser.Command, in store: SQLiteWikiStore) throws -> PageCommand.Result {
     switch command {
     case .list(let json):
-        return .list(json: json)
+        return try PageCommand.run(.list(json: json), in: store)
     case .get(let selector):
-        return .get(selector)
+        return try PageCommand.run(.get(selector), in: store)
     case .delete(let id):
-        return .delete(id: id)
+        return try PageCommand.run(.delete(id: id), in: store)
     case .upsert(let id, let title, let bodyFile):
         let body = try readBody(from: bodyFile)
-        return .upsert(id: id, title: title, body: body)
+        return try PageCommand.run(.upsert(id: id, title: title, body: body), in: store)
+    case .logAppend(let kind, let title, let note):
+        return try LogIndexCommand.run(.logAppend(kind: kind, title: title, note: note), in: store)
+    case .indexSet(let bodyFile):
+        let body = try readBody(from: bodyFile)
+        return try LogIndexCommand.run(.indexSet(body: body), in: store)
     }
 }
 

@@ -6,11 +6,13 @@ import WikiFSCore
 /// a test feeds an `argv` array + an env lookup and asserts on the parsed result,
 /// with no filesystem touched.
 ///
-/// Grammar (`plans/llm-wiki.md` Phase A surface):
+/// Grammar (`plans/llm-wiki.md` Phase A + B surface):
 ///   wikictl [--wiki <id>] page list [--json]
 ///   wikictl [--wiki <id>] page get (--title X | --id Y)
 ///   wikictl [--wiki <id>] page upsert --title X [--id Y] --body-file <path|->
 ///   wikictl [--wiki <id>] page delete --id Y
+///   wikictl [--wiki <id>] log append --kind ingest|query|lint --title X [--note N]
+///   wikictl [--wiki <id>] index set --body-file <path|->
 ///
 /// `--wiki` may be omitted when the `WIKI_DB` env var supplies the selector.
 public enum ArgumentParser {
@@ -35,6 +37,12 @@ public enum ArgumentParser {
         /// builds the final `PageCommand.Action`.
         case upsert(id: PageID?, title: String, bodyFile: String)
         case delete(id: PageID)
+        /// Phase B: append one dated log row. Carries its values directly (no
+        /// deferred I/O) — the note is optional.
+        case logAppend(kind: LogEntry.Kind, title: String, note: String?)
+        /// Phase B: rewrite the singleton wiki-index body. Like `upsert`, the body
+        /// source is `-` for stdin or a file path; `main` reads it.
+        case indexSet(bodyFile: String)
     }
 
     public enum Failure: Error, Equatable, CustomStringConvertible {
@@ -58,6 +66,9 @@ public enum ArgumentParser {
       page upsert --title X [--id Y] --body-file <path|->
                                              create-or-update a page from a body
       page delete --id Y                     delete a page
+      log append --kind ingest|query|lint --title X [--note N]
+                                             append one dated row to log.md
+      index set --body-file <path|->         rewrite the curated index.md body
     """
 
     /// Parse `arguments` (WITHOUT the executable name) plus an env lookup into an
@@ -82,12 +93,17 @@ public enum ArgumentParser {
             throw Failure.usage("no wiki selected — pass --wiki <id> or set WIKI_DB")
         }
 
-        guard args.first == "page" else {
+        let command: Command
+        switch args.first {
+        case "page":
+            command = try parsePageCommand(Array(args.dropFirst()))
+        case "log":
+            command = try parseLogCommand(Array(args.dropFirst()))
+        case "index":
+            command = try parseIndexCommand(Array(args.dropFirst()))
+        default:
             throw Failure.usage("unknown command \((args.first ?? "").debugDescription)")
         }
-        args.removeFirst()
-
-        let command = try parsePageCommand(args)
         return Invocation(wikiSelector: selector, command: command)
     }
 
@@ -122,6 +138,37 @@ public enum ArgumentParser {
         default:
             throw Failure.usage("page: unknown subcommand \(sub.debugDescription)")
         }
+    }
+
+    private static func parseLogCommand(_ args: [String]) throws -> Command {
+        guard let sub = args.first else { throw Failure.usage("log: missing subcommand") }
+        guard sub == "append" else {
+            throw Failure.usage("log: unknown subcommand \(sub.debugDescription)")
+        }
+        let options = try Options(Array(args.dropFirst()))
+        guard let kindRaw = options.value("--kind") else {
+            throw Failure.usage("log append: --kind is required (ingest|query|lint)")
+        }
+        guard let kind = LogEntry.Kind(rawValue: kindRaw) else {
+            throw Failure.usage(
+                "log append: --kind must be one of ingest|query|lint, got \(kindRaw.debugDescription)")
+        }
+        guard let title = options.value("--title") else {
+            throw Failure.usage("log append: --title is required")
+        }
+        return .logAppend(kind: kind, title: title, note: options.value("--note"))
+    }
+
+    private static func parseIndexCommand(_ args: [String]) throws -> Command {
+        guard let sub = args.first else { throw Failure.usage("index: missing subcommand") }
+        guard sub == "set" else {
+            throw Failure.usage("index: unknown subcommand \(sub.debugDescription)")
+        }
+        let options = try Options(Array(args.dropFirst()))
+        guard let bodyFile = options.value("--body-file") else {
+            throw Failure.usage("index set: --body-file is required (path or -)")
+        }
+        return .indexSet(bodyFile: bodyFile)
     }
 
     /// A tiny `--key value` / `--flag` option bag. Tolerates options in any order;
