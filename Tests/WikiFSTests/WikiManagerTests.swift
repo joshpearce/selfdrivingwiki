@@ -175,4 +175,67 @@ struct WikiManagerTests {
         second.bootstrap()
         #expect(second.wikis.count == 1)
     }
+
+    /// The Phase-0 gate regression: a v0 user's Application Support copy can keep
+    /// re-depositing `WikiFS.sqlite` into the container after each launch. The
+    /// import must be strictly one-time — gated on an EMPTY registry — so a legacy
+    /// file reappearing alongside a non-empty registry adds ZERO wikis and keeps
+    /// the same wiki #1 active. This reproduces the duplication loop the gate
+    /// caught (1 wiki → 2, both "WikiFS").
+    @Test func legacyFileReappearingAfterFirstLaunchDoesNotDuplicate() throws {
+        let dir = tempDirectory()
+        let legacy = dir.appendingPathComponent(DatabaseLocation.legacyDatabaseFileName)
+
+        // First launch: a genuine v0 user with a legacy DB present.
+        _ = try SQLiteWikiStore(databaseURL: legacy)
+        let first = WikiManager(containerDirectory: dir)
+        first.bootstrap()
+        #expect(first.wikis.count == 1)
+        let migratedID = first.activeWikiID
+        #expect(migratedID != nil)
+
+        // Simulate the Application Support layer re-copying the legacy file back
+        // into the container before the next launch (the source of the loop).
+        #expect(!FileManager.default.fileExists(atPath: legacy.path))
+        _ = try SQLiteWikiStore(databaseURL: legacy)
+        #expect(FileManager.default.fileExists(atPath: legacy.path))
+
+        // Second launch: registry is non-empty, so the stray legacy file is
+        // ignored — zero new wikis, same wiki #1 still active.
+        let second = WikiManager(containerDirectory: dir)
+        second.bootstrap()
+        #expect(second.wikis.count == 1)
+        #expect(second.activeWikiID == migratedID)
+
+        // And a third, to prove it stays stable across any number of launches.
+        _ = try SQLiteWikiStore(databaseURL: legacy)
+        let third = WikiManager(containerDirectory: dir)
+        third.bootstrap()
+        #expect(third.wikis.count == 1)
+        #expect(third.activeWikiID == migratedID)
+    }
+
+    /// A non-empty registry that did NOT come from a legacy migration (a normal
+    /// multi-wiki install) plus a stray legacy `WikiFS.sqlite` in the container
+    /// must NOT create a new wiki — the empty-registry gate covers this too.
+    @Test func strayLegacyFileWithNonEmptyRegistryCreatesNoWiki() throws {
+        let dir = tempDirectory()
+
+        // A normal install: one seeded wiki, no legacy migration involved.
+        let manager = WikiManager(containerDirectory: dir)
+        manager.bootstrap()
+        #expect(manager.wikis.count == 1)
+        let existingID = manager.activeWikiID
+
+        // Drop a stray legacy file into the container, then relaunch.
+        let legacy = dir.appendingPathComponent(DatabaseLocation.legacyDatabaseFileName)
+        _ = try SQLiteWikiStore(databaseURL: legacy)
+
+        let relaunched = WikiManager(containerDirectory: dir)
+        relaunched.bootstrap()
+        #expect(relaunched.wikis.count == 1)
+        #expect(relaunched.activeWikiID == existingID)
+        // The stray legacy file was left untouched (not adopted, not renamed).
+        #expect(FileManager.default.fileExists(atPath: legacy.path))
+    }
 }

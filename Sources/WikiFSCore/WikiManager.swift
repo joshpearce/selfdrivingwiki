@@ -79,7 +79,14 @@ public final class WikiManager {
     /// re-running just reloads + reopens.
     public func bootstrap() {
         var registry = WikiRegistry.load(from: containerDirectory)
-        migrateLegacyWikiIfNeeded(into: &registry)
+        // The v0 legacy import is strictly first-run-only: it runs ONLY while the
+        // registry is still empty. Once any wiki exists, a stray legacy
+        // `WikiFS.sqlite` reappearing in the container (e.g. re-copied from
+        // Application Support) must NOT spawn a duplicate wiki — see
+        // `migrateLegacyWikiIfNeeded`.
+        if registry.isEmpty {
+            migrateLegacyWikiIfNeeded(into: &registry)
+        }
         if registry.isEmpty {
             // Brand-new install with no legacy DB: seed one wiki so the app always
             // has something to show.
@@ -227,8 +234,12 @@ public final class WikiManager {
     // MARK: - v0 migration
 
     /// Migrate the single pre-multi-wiki `WikiFS.sqlite` into the registry as
-    /// wiki #1, preserving all content. Runs only when (a) the registry has no
-    /// entry already pointing at it AND (b) the legacy file exists.
+    /// wiki #1, preserving all content. The caller (`bootstrap`) invokes this
+    /// ONLY while the registry is still empty — that empty-registry gate is the
+    /// one-time guard: once any wiki exists, a lingering / re-copied legacy file
+    /// can never produce a duplicate. As a belt-and-suspenders local check this
+    /// also no-ops unless (a) the legacy file exists AND (b) its ULID target is
+    /// absent.
     ///
     /// We RENAME the legacy `WikiFS.sqlite` (and its `-wal`/`-shm` sidecars) to
     /// `<ulid>.sqlite` so the per-wiki path scheme is uniform from then on — the

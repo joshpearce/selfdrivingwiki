@@ -52,7 +52,17 @@ wiki #1.
 - **v0 migration.** On first launch `WikiManager.bootstrap()` renames the legacy
   `WikiFS.sqlite` (+ `-wal`/`-shm`) to `<ulid>.sqlite` and registers it as wiki
   #1 named "WikiFS" — all pages/files/system_prompt ride along untouched (same
-  file). Idempotent (won't re-run / duplicate).
+  file). **Strictly one-time, idempotent across any number of launches:** the
+  whole legacy-import chain is gated on an EMPTY registry. The first gate run
+  found this was broken — two un-coordinated migration layers (`WikiManager`
+  renames the container file away; `DatabaseLocation.migrateFromApplicationSupportIfNeeded`
+  re-copies it from Application Support) formed a duplication loop, spawning a new
+  "WikiFS" wiki on every launch. Fixed by gating BOTH layers on the registry
+  being empty: `WikiFSApp.init` only runs the Application-Support copy when the
+  registry is empty, and `bootstrap()` only calls `migrateLegacyWikiIfNeeded`
+  when the registry is empty. Net invariant: a v0 user's first launch → exactly
+  one wiki #1; every subsequent launch adds zero wikis and keeps it active; a
+  non-empty registry + a stray legacy file never creates a new wiki.
 - Tests: 69 → **84** (+15). New `WikiRegistryTests` (round-trip, MRU,
   rename-keeps-identity, ULID-derived paths) + `WikiManagerTests` (fresh-seed,
   per-wiki DB isolation, distinct files on disk, delete removes DB, MRU

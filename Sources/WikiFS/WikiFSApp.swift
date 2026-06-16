@@ -18,13 +18,18 @@ struct WikiFSApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
-        // The single legacy v0 DB still lives at the literal App Group path; the
-        // one-time Application-Support → container migration must still run before
-        // the registry adopts it. Then the WikiManager migrates that legacy file
-        // into the registry as wiki #1 and opens the most-recently-used wiki.
-        DatabaseLocation.migrateFromApplicationSupportIfNeeded()
         let directory = (try? DatabaseLocation.appGroupContainerDirectory())
             ?? FileManager.default.temporaryDirectory
+        // The v0 legacy import is strictly FIRST-RUN-ONLY. We gate the whole chain
+        // on an empty registry: only a genuine first run (no wikis yet) may pull
+        // the Phase-1 Application-Support `WikiFS.sqlite` into the container for
+        // `WikiManager.bootstrap()` to adopt as wiki #1. Once ANY wiki exists,
+        // this is skipped — otherwise the WikiManager renames the container file
+        // away on each launch, this layer re-copies it from Application Support,
+        // and the two form an infinite duplication loop.
+        if WikiRegistry.load(from: directory).isEmpty {
+            DatabaseLocation.migrateFromApplicationSupportIfNeeded()
+        }
         _manager = State(initialValue: WikiManager(containerDirectory: directory))
     }
 
