@@ -2,6 +2,32 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-16 — Wiki rename plus SQLite backup/restore
+
+- Added wiki-level management actions to the switcher menu: rename the active
+  wiki, export it as a `.sqlite` backup, and import a `.sqlite` backup as a new
+  wiki with a new display name.
+- `WikiManager.exportWiki(id:to:)` flushes pending active edits, checkpoints the
+  WAL into the main DB, copies a single portable SQLite file, and refuses to
+  overwrite the source backing database.
+- `WikiManager.importWiki(from:displayName:)` copies the selected SQLite file to
+  a fresh ULID-backed DB, opens it once to validate/migrate the schema, adds it
+  to the registry, registers its File Provider domain, and selects it.
+- Rename remains identity-stable (`<ulid>.sqlite` unchanged) and now refreshes
+  the File Provider domain display name so Finder can pick up the new label.
+- Added native macOS open/save panels for choosing backup files, plus an import
+  naming sheet that uses the existing compact `.headline`/body hierarchy.
+
+**Skill pass.** Before code: `swiftui-pro` kept stateful backup/restore logic in
+the existing `@MainActor @Observable` manager and left the switcher as a thin UI
+surface; `macos-design` put the actions in the wiki/account menu and used system
+file panels; `typography-designer` kept semantic system type rather than adding a
+new scale. After code: import/export are covered by manager tests, the UI uses
+native controls and SF Symbols, and rename/delete/import remain progressive
+wiki-level actions rather than page chrome.
+
+**Verified.** Full `swift test` passes (**341/341**) and `make check` passes.
+
 ## 2026-06-16 — Agent runs show quiet-live status and can be stopped inline
 
 - Diagnosed a Query run that appeared hung: the spawned `claude -p` process was
