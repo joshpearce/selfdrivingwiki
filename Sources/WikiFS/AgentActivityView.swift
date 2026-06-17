@@ -1,39 +1,38 @@
-import AppKit
 import SwiftUI
 import WikiFSCore
 
-/// The live activity feed for a `claude -p` run (`plans/llm-wiki.md` Phase C). Turns
-/// the launcher's typed `events` into a readable, auto-scrolling list — each tool
-/// call a monospaced row (SF Symbol + name + concise input summary), assistant text
-/// as prose, and the final result distinctly styled (success vs error). Replaces the
-/// old "raw blob" console so a run no longer looks like it's doing nothing.
-///
-/// SWIFTUI-RULES: §1.1 — auto-scroll animates a scroll offset, never inserts/removes
-/// a structural view; rows are identified by stable index so appends don't reflow the
-/// world. §5.1 — semantic fonts throughout (`.callout` prose, monospaced `.caption`
-/// for tool/code, consistent type scale). macos-design — a clean native panel.
+/// The live activity feed for a `claude -p` run. This is the inspector/log
+/// surface: compact rows, tool calls, diagnostics, and optional internals.
 struct AgentActivityView: View {
     @Bindable var launcher: AgentLauncher
+    let showsResultEvents: Bool
+    let showsInternals: Bool
+
+    init(launcher: AgentLauncher, showsResultEvents: Bool = true, showsInternals: Bool = false) {
+        self.launcher = launcher
+        self.showsResultEvents = showsResultEvents
+        self.showsInternals = showsInternals
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let error = launcher.preflightError {
                 preflightBanner(error)
             }
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                AgentRunStatusView(launcher: launcher, now: context.date)
-                    .padding(.horizontal, ActivityMetrics.padding)
-                    .padding(.top, ActivityMetrics.padding)
+            if showsInternals {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    AgentRunStatusView(launcher: launcher, now: context.date)
+                        .padding(.horizontal, ActivityMetrics.padding)
+                        .padding(.top, ActivityMetrics.padding)
+                }
             }
             activityList
-            if !launcher.stderr.isEmpty {
+            if showsInternals && !launcher.stderr.isEmpty {
                 stderrBanner
             }
         }
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
     }
-
-    // MARK: - Activity list
 
     private var activityList: some View {
         ScrollViewReader { proxy in
@@ -42,13 +41,10 @@ struct AgentActivityView: View {
                     if showsPlaceholder {
                         placeholder
                     } else {
-                        ForEach(Array(launcher.events.enumerated()), id: \.offset) { _, event in
+                        ForEach(renderedEvents, id: \.offset) { _, event in
                             AgentEventRow(event: event)
                         }
                     }
-                    // Zero-height anchor we scroll to; appending events grows the list
-                    // above it, so scrolling here keeps the newest line in view without
-                    // any structural insert/remove of the anchor itself (§1.1).
                     Color.clear
                         .frame(height: 1)
                         .id(Self.bottomAnchor)
@@ -65,28 +61,36 @@ struct AgentActivityView: View {
     }
 
     private var showsPlaceholder: Bool {
-        launcher.events.isEmpty && launcher.preflightError == nil
+        renderedEvents.isEmpty && launcher.preflightError == nil
+    }
+
+    private var renderedEvents: [(offset: Int, element: AgentEvent)] {
+        launcher.events.enumerated().filter { _, event in
+            if !showsInternals && event.isInternalTranscriptEvent {
+                return false
+            }
+            if case .result = event {
+                return showsResultEvents
+            }
+            return true
+        }
     }
 
     @ViewBuilder
     private var placeholder: some View {
         if launcher.isRunning {
-            // Run started but no events yet — show the spinner so the panel is never
-            // "staring at nothing".
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text(launcher.runningKind.map { "Starting \($0.title)…" } ?? "Starting…")
+                Text(showsInternals ? (launcher.runningKind.map { "Starting \($0.title)…" } ?? "Starting…") : "Waiting for output…")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
         } else {
-            Text("No activity yet. Choose an operation and press Run.")
+            Text(showsInternals ? "No activity yet. Choose an operation and press Run." : "No output yet.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
     }
-
-    // MARK: - Banners
 
     private func preflightBanner(_ error: String) -> some View {
         Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -113,42 +117,28 @@ struct AgentActivityView: View {
         .background(.orange.opacity(0.10))
     }
 
-    // MARK: - Constants
-
     private static let bottomAnchor = "agent-activity-bottom"
 }
 
-/// One row of the activity feed, switched on the event kind. A small dedicated view
-/// so SwiftUI scopes redraws to the changed rows (§3.1 rebuild-from-source: each row
-/// derives purely from its `AgentEvent`).
 private struct AgentEventRow: View {
     let event: AgentEvent
 
     var body: some View {
         switch event {
+        case .userText(let text):
+            userRow(text: text)
         case .systemInit(let model):
             metaRow(symbol: "sparkles", text: "Started · \(model)")
-
         case .assistantText(let text):
-            Text(text)
-                .font(.callout)
-                .foregroundStyle(.primary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .fixedSize(horizontal: false, vertical: true)
-
+            AgentMarkdownText(markdown: text)
         case .toolUse(let name, let inputSummary):
             toolRow(name: name, summary: inputSummary)
-
         case .toolResult(let isError, let summary):
             toolResultRow(isError: isError, summary: summary)
-
         case .subagent(let subagentType, let description, let isCompletion):
             subagentRow(subagentType: subagentType, description: description, isCompletion: isCompletion)
-
         case .result(let isError, let text):
             resultRow(isError: isError, text: text)
-
         case .raw(let line):
             Text(line)
                 .font(.system(.caption, design: .monospaced))
@@ -157,6 +147,21 @@ private struct AgentEventRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private func userRow(text: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("You", systemImage: "person.crop.circle")
+                .font(.caption)
+                .fontWeight(.medium)
+                .foregroundStyle(.secondary)
+            Text(text)
+                .font(.callout)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
     }
 
     private func metaRow(symbol: String, text: String) -> some View {
@@ -186,11 +191,6 @@ private struct AgentEventRow: View {
         }
     }
 
-    /// A subagent fan-out row: the Opus curator delegating to (or hearing back from)
-    /// a Sonnet `source-reader` digester. Indented + tinted so the fan-out reads as a
-    /// distinct nested activity, making the Opus→Sonnet hand-off visible in the panel.
-    /// The Sonnet workers READ source volume and return digests; the rows are labelled
-    /// "reading" / "digested" to reflect that they do not write the wiki.
     private func subagentRow(subagentType: String, description: String, isCompletion: Bool) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: isCompletion ? "checkmark.circle" : "doc.text.magnifyingglass")
@@ -239,18 +239,12 @@ private struct AgentEventRow: View {
                 .fontWeight(.semibold)
                 .foregroundStyle(isError ? .red : .green)
             if !text.isEmpty {
-                Text(text)
-                    .font(.callout)
-                    .foregroundStyle(.primary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
+                AgentMarkdownText(markdown: text)
             }
         }
         .padding(.vertical, 4)
     }
 
-    /// An SF Symbol per tool kind so the feed scans visually.
     private func symbol(forTool name: String) -> String {
         switch name {
         case "Bash": return "terminal"
@@ -265,8 +259,18 @@ private struct AgentEventRow: View {
     }
 }
 
-/// Layout constants for the activity feed (§2.4 — no scattered magic numbers).
 private enum ActivityMetrics {
     static let padding: CGFloat = 10
     static let rowSpacing: CGFloat = 8
+}
+
+extension AgentEvent {
+    var isInternalTranscriptEvent: Bool {
+        switch self {
+        case .systemInit, .toolUse, .toolResult, .subagent, .raw:
+            true
+        case .userText, .assistantText, .result:
+            false
+        }
+    }
 }

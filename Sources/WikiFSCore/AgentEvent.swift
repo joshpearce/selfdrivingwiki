@@ -10,6 +10,9 @@ import Foundation
 /// the fields we render and is tolerant — any line it doesn't recognize (including
 /// a malformed/partial one) becomes `.raw`, so a bad line never crashes a run.
 public enum AgentEvent: Equatable, Sendable {
+    /// A user turn sent into an interactive agent session.
+    case userText(String)
+
     /// The `{"type":"system","subtype":"init"}` event — the run has started. Carries
     /// the resolved model so the UI can show what's working.
     case systemInit(model: String)

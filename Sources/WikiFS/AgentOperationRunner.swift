@@ -51,6 +51,31 @@ enum AgentOperationRunner {
             fileProvider: fileProvider)
     }
 
+    static func startQueryConversation(
+        firstMessage: String,
+        launcher: AgentLauncher,
+        store: WikiStoreModel,
+        manager: WikiManager,
+        fileProvider: FileProviderSpike
+    ) async {
+        let trimmed = firstMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let wikiID = manager.activeWikiID else { return }
+
+        await fileProvider.signalChange()
+        guard let root = fileProvider.path else { return }
+
+        launcher.startInteractiveQuery(
+            firstMessage: trimmed,
+            stateMarkdown: store.currentStateSnapshot().renderStateFile(),
+            wikiID: wikiID,
+            wikiRoot: root,
+            systemPrompt: store.currentSystemPromptBody(),
+            wikictlDirectory: HelpersLocation.wikictlDirectory,
+            onLock: { store.beginAgentRun() },
+            onUnlock: { store.endAgentRun() }
+        )
+    }
+
     static func runLint(
         launcher: AgentLauncher,
         store: WikiStoreModel,

@@ -33,7 +33,7 @@ struct ContentView: View {
                     onIngestFile: runIngest
                 )
 
-                if isTranscriptExpanded {
+                if isTranscriptExpanded && !isQuerySelected {
                     Divider()
                     AgentTranscriptSidebar(
                         launcher: agentLauncher,
@@ -116,19 +116,27 @@ struct ContentView: View {
         // (§3.5). The view, not the binding, is the right place for this.
         .onChange(of: store.selection) { _, newValue in
             store.handleSelectionChange(to: newValue)
+            if newValue == .query {
+                isTranscriptExpanded = false
+            }
         }
         .onChange(of: agentLauncher.isRunning) { _, isRunning in
-            if isRunning {
+            if isRunning && !isQuerySelected {
                 isTranscriptExpanded = true
             }
         }
     }
 
     private var canShowTranscript: Bool {
-        agentLauncher.isRunning
-            || !agentLauncher.events.isEmpty
-            || agentLauncher.preflightError != nil
-            || !agentLauncher.stderr.isEmpty
+        !isQuerySelected
+            && (agentLauncher.isRunning
+                || !agentLauncher.events.isEmpty
+                || agentLauncher.preflightError != nil
+                || !agentLauncher.stderr.isEmpty)
+    }
+
+    private var isQuerySelected: Bool {
+        store.selection == .query
     }
 
     private func toggleTranscript() {

@@ -119,4 +119,41 @@ public struct OperationCommand: Equatable, Sendable {
             currentDirectoryPath: scratchDirectory
         )
     }
+
+    /// Build a stdin-backed `claude -p` query conversation. Unlike one-shot
+    /// operations, no prompt is passed as the positional `-p` value; user turns are
+    /// sent later as stream-json over stdin while the session remains open.
+    public static func buildInteractiveQuery(
+        operation: WikiOperation,
+        wikiRoot: String,
+        wikiID: String,
+        systemPrompt: String,
+        scratchDirectory: String,
+        wikictlDirectory: String,
+        claudeExecutable: String = "claude",
+        baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> OperationCommand {
+        var environment = baseEnvironment
+        environment["WIKI_ROOT"] = wikiRoot
+        environment["WIKI_DB"] = wikiID
+        let existingPath = baseEnvironment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        environment["PATH"] = wikictlDirectory + ":" + existingPath
+
+        let arguments = [
+            "-p",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--model", operation.topLevelModelAlias,
+            "--append-system-prompt", systemPrompt + "\n\n" + operation.prompt(wikiRoot: wikiRoot),
+            "--dangerously-skip-permissions",
+        ]
+
+        return OperationCommand(
+            executable: claudeExecutable,
+            arguments: arguments,
+            environment: environment,
+            currentDirectoryPath: scratchDirectory
+        )
+    }
 }

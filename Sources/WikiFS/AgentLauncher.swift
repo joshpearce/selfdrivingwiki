@@ -69,6 +69,10 @@ final class AgentLauncher {
     private var logHandle: FileHandle?
     /// Append-only handle to the per-run `run.stderr.log`.
     private var stderrLogHandle: FileHandle?
+    /// Writable stdin for an interactive stream-json query session.
+    private var inputHandle: FileHandle?
+    /// True when the running process is waiting for user turns over stdin.
+    private(set) var isInteractiveSession = false
 
     /// Run an operation `request` against one wiki. No-op if a process is already
     /// running.
@@ -201,9 +205,141 @@ final class AgentLauncher {
         }
     }
 
+    /// Start a stdin-backed query conversation. The first user message is sent
+    /// immediately after the process launches; later turns use `sendInteractiveMessage`.
+    func startInteractiveQuery(
+        firstMessage: String,
+        stateMarkdown: String,
+        wikiID: String,
+        wikiRoot: String,
+        systemPrompt: String,
+        wikictlDirectory: String,
+        onLock: @escaping @MainActor () -> Void,
+        onUnlock: @escaping @MainActor @Sendable () -> Void
+    ) {
+        guard !isRunning else { return }
+
+        let claudeExecutable: String
+        switch resolveClaude() {
+        case .found(let path):
+            claudeExecutable = path
+        case .missing(let reason):
+            preflightError = reason
+            resetRunState()
+            return
+        }
+        preflightError = nil
+
+        guard let scratch = makeScratchDirectory() else {
+            preflightError = "Could not create a scratch working directory for the agent."
+            return
+        }
+
+        let stateFilePath: String
+        do {
+            stateFilePath = try AgentStaging.stageStateFile(stateMarkdown, in: scratch)
+        } catch {
+            preflightError = "Could not stage the agent's inputs: \(error.localizedDescription)"
+            try? FileManager.default.removeItem(at: scratch)
+            return
+        }
+
+        let operation = WikiOperation.queryConversation(stateFilePath: stateFilePath)
+        let command = OperationCommand.buildInteractiveQuery(
+            operation: operation,
+            wikiRoot: wikiRoot,
+            wikiID: wikiID,
+            systemPrompt: systemPrompt,
+            scratchDirectory: scratch.path,
+            wikictlDirectory: wikictlDirectory,
+            claudeExecutable: claudeExecutable
+        )
+
+        resetRunState()
+        let now = Date()
+        isRunning = true
+        isInteractiveSession = true
+        runningKind = operation.kind
+        runStartedAt = now
+        lastActivityAt = now
+        openLogFiles(in: scratch)
+        onLock()
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: command.executable)
+        process.arguments = command.arguments
+        process.environment = command.environment
+        process.currentDirectoryURL = scratch
+
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+            Task { @MainActor [weak self] in self?.ingestStdout(chunk) }
+        }
+        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+            Task { @MainActor [weak self] in self?.ingestStderr(chunk) }
+        }
+
+        process.terminationHandler = { [weak self] proc in
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            let status = proc.terminationStatus
+            Task { @MainActor [weak self] in
+                self?.finish(status: status)
+                onUnlock()
+            }
+        }
+
+        do {
+            try process.run()
+            self.process = process
+            inputHandle = stdinPipe.fileHandleForWriting
+            currentProcessID = process.processIdentifier
+            sendInteractiveMessage(firstMessage)
+        } catch {
+            preflightError = "Failed to launch claude: \(error.localizedDescription)"
+            closeLogFiles()
+            try? FileManager.default.removeItem(at: scratch)
+            isRunning = false
+            isInteractiveSession = false
+            runningKind = nil
+            currentProcessID = nil
+            lastActivityAt = Date()
+            onUnlock()
+        }
+    }
+
+    /// Send one user turn to the active interactive query session.
+    func sendInteractiveMessage(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isRunning, isInteractiveSession, !trimmed.isEmpty else { return }
+        guard let line = Self.streamJSONLine(forUserText: trimmed),
+              let data = (line + "\n").data(using: .utf8)
+        else { return }
+
+        events.append(.userText(trimmed))
+        lastActivityAt = Date()
+        do {
+            try inputHandle?.write(contentsOf: data)
+        } catch {
+            ingestStderr("Failed to send message to Claude: \(error.localizedDescription)\n")
+        }
+    }
+
     /// Terminate the running process, if any. The `terminationHandler` releases the
     /// edit lock and clears `isRunning`.
     func stop() {
+        try? inputHandle?.close()
+        inputHandle = nil
         process?.terminate()
     }
 
@@ -248,8 +384,10 @@ final class AgentLauncher {
         closeLogFiles()
         isRunning = false
         exitStatus = status
+        isInteractiveSession = false
         runningKind = nil
         process = nil
+        inputHandle = nil
         currentProcessID = nil
         lastActivityAt = Date()
     }
@@ -262,11 +400,32 @@ final class AgentLauncher {
         stdoutLineBuffer = ""
         exitStatus = nil
         isRunning = false
+        isInteractiveSession = false
         runningKind = nil
         logFileURL = nil
         runStartedAt = nil
         lastActivityAt = nil
         currentProcessID = nil
+        inputHandle = nil
+    }
+
+    private static func streamJSONLine(forUserText text: String) -> String? {
+        let payload: [String: Any] = [
+            "type": "user",
+            "message": [
+                "role": "user",
+                "content": [
+                    [
+                        "type": "text",
+                        "text": text,
+                    ],
+                ],
+            ],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let line = String(data: data, encoding: .utf8)
+        else { return nil }
+        return line
     }
 
     // MARK: - Backend log files
