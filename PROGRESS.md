@@ -2,6 +2,78 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-17 — Dedicated interactive Query page
+
+- Added a first-class Query destination in the sidebar, separate from individual
+  page readers, so asking questions is a wiki-level workspace.
+- Replaced the page-bottom one-shot query composer with `QueryConversationView`:
+  an output-first chat transcript, Start/Send composer, Stop, and Activity log
+  access.
+- Extended the Claude launcher with a stdin-backed stream-json session for Query
+  conversations. The first prompt starts the session; follow-ups are written to
+  stdin while the same process remains alive.
+- Added a specialized interactive Query prompt: answer in chat by default, follow
+  wiki pages/raw-source footnotes as needed, and write via `wikictl` only when the
+  user explicitly asks to persist an update. The prompt now also tells the agent
+  to do wiki/source inspection silently rather than narrating setup steps.
+- Suppressed the trailing transcript inspector while the Query page is selected,
+  because the page itself is already the transcript surface.
+- Transcript surfaces now default to output-only, with a default-off "Show
+  internals" checkbox that reveals tool calls, status, diagnostics, and raw agent
+  events for debugging.
+- Removed explicit Answer/Update mode controls from Query. The composer now sends
+  exactly what the user types; users can ask Claude to update the wiki in plain
+  language when they want persistence.
+- Removed the File Provider path chip from the Query header after the chat
+  surface stabilized; the mount is still used as a run precondition, but it no
+  longer competes with the conversation.
+- Tightened the Query typography pass: the empty state is centered and stronger,
+  the composer input uses body text, and the internals checkbox only appears once
+  there is a run/debug state.
+- Reworked Query around ChatGPT-style states: empty state is a centered greeting
+  with a floating pill composer; after the first turn, messages occupy the page
+  and the same composer docks at the bottom. User turns render as right-aligned
+  pills; Claude turns render as unboxed prose.
+- Centered the conversation in a shared chat column so user turns, Claude prose,
+  and the composer align with each other instead of spreading across the full
+  window. Collapsed Query debug controls into a small Activity menu; running
+  state now shows only a quiet spinner plus Stop.
+- Split the sidebar's top controls into Tools and System sections, leaving pages
+  and files as content lists rather than mixing them with app-level destinations.
+- Documented the design in `plans/query-conversation.md` and added command /
+  navigation regression coverage.
+
+**Skill pass.** Before code: `swiftui-pro` led to a singleton navigation
+destination and kept process/session state in the existing `@MainActor
+@Observable` launcher; `macos-design` kept Query as a quiet utility workspace
+with visible status and standard controls; `typography-designer` kept semantic
+system fonts (`.largeTitle`, `.callout`, `.caption`) rather than fixed sizes.
+After code: the new view is a focused leaf with distinct empty/conversation
+states, the prompt/command contract is pure and tested, page reading no longer
+carries unrelated query chrome, and the operations/sidebar transcript views
+share the same default-off internals control.
+
+**Verified.** `make check` passes and `swift test` passes (**351/351**).
+
+## 2026-06-16 — Agent transcript prose renders as Markdown
+
+- Added a reusable `AgentMarkdownText` leaf view that renders Claude-authored
+  transcript prose with Textual's `StructuredText(markdown:)`.
+- Updated the shared agent activity feed used by the transcript sidebar and the
+  Ingest/Query/Lint operation sheet so assistant prose and final results preserve
+  Markdown blocks such as headings, lists, links, and code fences.
+- Kept tool-use, tool-result, diagnostics, and raw-event rows in compact
+  monospaced/log styling so the operation log remains scannable.
+
+**Skill pass.** Before code: `swiftui-pro` pointed to a small extracted leaf view
+instead of expanding the activity row, `macos-design` kept the transcript as a
+quiet inspector/log surface, and `typography-designer` favored Textual/system
+Markdown typography over hard-coded sizes. After code: the change is localized to
+Claude prose/result rows and reuses the same Markdown renderer dependency already
+accepted for the page reader.
+
+**Verified.** `make check` passes and `swift test` passes (**348/348**).
+
 ## 2026-06-16 — Wiki rename plus SQLite backup/restore
 
 - Added wiki-level management actions to the switcher menu: rename the active

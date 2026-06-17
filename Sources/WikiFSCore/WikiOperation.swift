@@ -46,6 +46,10 @@ public enum WikiOperation: Equatable, Sendable {
   /// `stateFilePath` is the staged `WIKI_STATE.md` snapshot.
   case query(question: String, stateFilePath: String)
 
+  /// Keep a query conversation open. User turns arrive over stdin, and Claude may
+  /// answer only, or update the wiki with `wikictl` when the conversation asks for it.
+  case queryConversation(stateFilePath: String)
+
   /// Health-check the wiki and report findings. `stateFilePath` is the staged
   /// `WIKI_STATE.md` snapshot.
   case lint(stateFilePath: String)
@@ -54,7 +58,7 @@ public enum WikiOperation: Equatable, Sendable {
   public var kind: Kind {
     switch self {
     case .ingest: .ingest
-    case .query: .query
+    case .query, .queryConversation: .query
     case .lint: .lint
     }
   }
@@ -81,7 +85,7 @@ public enum WikiOperation: Equatable, Sendable {
   public var topLevelModelAlias: String {
     switch self {
     case .ingest(_, _, _, let plan): plan.topLevelModelAlias
-    case .query, .lint: "opus"
+    case .query, .queryConversation, .lint: "opus"
     }
   }
 
@@ -91,7 +95,7 @@ public enum WikiOperation: Equatable, Sendable {
   public var agentsJSON: String? {
     switch self {
     case .ingest(_, _, _, let plan): plan.agentsJSON()
-    case .query, .lint: nil
+    case .query, .queryConversation, .lint: nil
     }
   }
 }
@@ -124,6 +128,8 @@ extension WikiOperation {
     case .query(let question, let stateFilePath):
       return Self.queryPrompt(
         wikiRoot: wikiRoot, question: question, stateFilePath: stateFilePath)
+    case .queryConversation(let stateFilePath):
+      return Self.queryConversationPrompt(wikiRoot: wikiRoot, stateFilePath: stateFilePath)
     case .lint(let stateFilePath):
       return Self.lintPrompt(wikiRoot: wikiRoot, stateFilePath: stateFilePath)
     }
@@ -253,6 +259,43 @@ extension WikiOperation {
 
     WIKI_ROOT (resolved, read-only mount — reference only): \(wikiRoot)
     Question: \(question)
+    """
+  }
+
+  /// Interactive Query stays alive across user turns. It gives Claude permission
+  /// to either answer conversationally or make durable wiki updates on request.
+  private static func queryConversationPrompt(wikiRoot: String, stateFilePath: String) -> String {
+    """
+    \(IngestWriteRule.writes)
+
+    \(IngestWriteRule.dontRediscover(stateFilePath: stateFilePath))
+
+    ROLE — You are in an interactive Query conversation for this wiki. The user may \
+    ask questions, ask follow-ups, ask you to inspect sources, or ask you to update \
+    the wiki. Do not assume every answer should be written back. Answer in chat by \
+    default. Only change the wiki when the user explicitly asks you to save, update, \
+    add, rewrite, log, or otherwise persist something.
+
+    STYLE — Do the wiki/source inspection silently. Do NOT narrate process steps like \
+    "I'll check the wiki", "I'll consult the sources", "I'll read WIKI_STATE", or \
+    "I found this in the wiki" unless the user explicitly asks how you did it. Do \
+    not advertise capabilities or ask generic "what would you like me to do" setup \
+    questions. Reply directly and concisely to the user's actual message; cite pages \
+    or sources only when they materially support the answer.
+
+    When answering, use the Query workflow from your instructions. Pull fresh pages \
+    with `wikictl page get --title T` (or `--id I`) as needed. If a page contains \
+    Markdown footnotes (`[^id]: ...`) that cite a raw source, follow them through \
+    `$WIKI_ROOT/files/by-name/`, `$WIKI_ROOT/files/by-id/`, or \
+    `$WIKI_ROOT/indexes/files.jsonl`, then read the raw file from the mount with the \
+    Read tool or shell tools such as `cat`, `python`, `pdftotext`, or `strings`.
+
+    If the user asks you to update the wiki, write via `wikictl page upsert`, update \
+    `index.md` if the catalog should change, and append `wikictl log append --kind \
+    query` describing the change. Tell the user what you changed and which pages or \
+    source paths you relied on.
+
+    WIKI_ROOT (resolved, read-only mount — reference only): \(wikiRoot)
     """
   }
 

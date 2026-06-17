@@ -21,6 +21,13 @@ struct WikiDetailView: View {
             } actions: {
                 Button("New Page", systemImage: "plus") { store.newPage() }
             }
+        case .query:
+            QueryConversationView(
+                launcher: launcher,
+                store: store,
+                manager: manager,
+                fileProvider: fileProvider
+            )
         case .systemPrompt:
             SystemPromptDetailView(store: store)
         case .changeLog:

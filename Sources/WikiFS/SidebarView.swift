@@ -23,27 +23,37 @@ struct SidebarView: View {
             WikiSwitcher(manager: manager)
                 .listRowSeparator(.hidden)
 
-            // Pinned: the singleton system-prompt document, projected
-            // at the wiki root as CLAUDE.md / AGENTS.md. Selecting it edits the
-            // doc in the main pane, exactly like a page.
-            Label("System Prompt", systemImage: "sparkles")
-                .font(.body)
-                .lineLimit(1)
-                .tag(WikiSelection.systemPrompt)
-                .help("Agent instructions, projected read-only as CLAUDE.md and AGENTS.md")
+            Section("Tools") {
+                SidebarModeRow(
+                    title: "Query",
+                    subtitle: "Ask or update",
+                    systemImage: "bubble.left.and.text.bubble.right"
+                )
+                .tag(WikiSelection.query)
+                .help("Ask questions and decide whether Claude should update the wiki")
+            }
 
-            Label("Change Log", systemImage: "clock.arrow.circlepath")
-                .font(.body)
-                .lineLimit(1)
+            Section("System") {
+                SidebarModeRow(
+                    title: "Activity",
+                    subtitle: "Operation log",
+                    systemImage: "clock.arrow.circlepath"
+                )
                 .tag(WikiSelection.changeLog)
                 .help("Operation history, projected read-only as log.md")
 
+                SidebarModeRow(
+                    title: "Instructions",
+                    subtitle: "Agent prompt",
+                    systemImage: "sparkles"
+                )
+                .tag(WikiSelection.systemPrompt)
+                .help("Agent instructions, projected read-only as CLAUDE.md and AGENTS.md")
+            }
+
             Section("Pages") {
                 ForEach(store.summaries) { summary in
-                    Text(summary.title.isEmpty ? "Untitled" : summary.title)
-                        .font(.body)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+                    SidebarPageRow(summary: summary)
                         .tag(WikiSelection.page(summary.id))
                         .contextMenu {
                             Button("Rename") { beginRename(summary) }

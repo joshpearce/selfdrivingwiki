@@ -20,6 +20,7 @@ struct OperationsView: View {
     @State private var selectedKind: WikiOperation.Kind = .ingest
     @State private var selectedSourceID: PageID?
     @State private var queryText = ""
+    @State private var showsInternals = false
 
     init(
         launcher: AgentLauncher,
@@ -41,7 +42,7 @@ struct OperationsView: View {
             operationPicker
             inputSection
             controls
-            AgentActivityView(launcher: launcher)
+            AgentActivityView(launcher: launcher, showsInternals: showsInternals)
             footer
         }
         .padding(OperationMetrics.padding)
@@ -167,6 +168,10 @@ struct OperationsView: View {
                     .disabled(!canRun)
             }
             Spacer()
+            Toggle("Show internals", isOn: $showsInternals)
+                .toggleStyle(.checkbox)
+                .font(.caption)
+                .foregroundStyle(.secondary)
             wikiRootLabel
         }
     }

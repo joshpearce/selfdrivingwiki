@@ -142,6 +142,10 @@ public final class WikiStoreModel {
     private func loadDrafts(for newValue: WikiSelection?) {
         loadedSelection = newValue
         switch newValue {
+        case .query:
+            draftTitle = ""
+            draftBody = ""
+            loadedPage = nil
         case .page(let id):
             guard let page = try? store.getPage(id: id) else {
                 draftTitle = ""
@@ -582,7 +586,7 @@ public final class WikiStoreModel {
             pageIDs.contains(id)
         case .ingestedFile(let id):
             fileIDs.contains(id)
-        case .systemPrompt, .changeLog:
+        case .query, .systemPrompt, .changeLog:
             true
         }
     }

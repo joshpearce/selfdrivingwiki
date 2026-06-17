@@ -1,0 +1,81 @@
+# Query Conversation Page
+
+## Direction
+
+Query is now a dedicated wiki-level workspace instead of a page-bottom composer.
+The user can ask questions, ask follow-ups, inspect the transcript, and decide
+whether Claude should update the wiki. The default behavior is conversational:
+Claude answers in chat. It writes through `wikictl` only when the user explicitly
+asks to save, update, add, rewrite, log, or otherwise persist something.
+
+## App Shape
+
+- `WikiSelection.query` is a singleton sidebar destination beside System Prompt
+  and Change Log.
+- `QueryConversationView` owns the visible query workspace: output-first chat
+  transcript, Start/Send composer, Stop, and Activity log access. The File
+  Provider mount remains a run precondition, but its path is not shown as primary
+  chrome.
+- Page readers no longer embed query controls. Reading a page stays focused on
+  page content; questions happen in the Query workspace.
+- The global transcript inspector is suppressed while `WikiSelection.query` is
+  selected, because Query's primary content is already the transcript.
+- Query uses `QueryTranscriptView` for the default chat surface. It shows user
+  turns as right-aligned pills and Claude prose/results as unboxed readable text,
+  suppressing tool calls and duplicate terminal result events.
+- The shared `AgentActivityView` remains the inspector/log renderer for
+  operations and debugging. Transcript surfaces default to output-only; the
+  "Show internals" checkbox reveals tool calls, live status, raw events,
+  diagnostics, and stderr when debugging a run.
+- The sidebar separates app-level destinations into Tools (Query) and System
+  (Activity, Instructions), with Pages and Files left as content lists.
+
+## Agent Session
+
+Interactive Query uses Claude Code's print-mode streaming input:
+
+```text
+claude -p --input-format stream-json --output-format stream-json --verbose ...
+```
+
+`AgentLauncher.startInteractiveQuery(...)` stages `WIKI_STATE.md`, starts Claude
+with stdin/stdout/stderr pipes, and sends the first user turn as stream-json.
+Follow-up turns call `sendInteractiveMessage(_:)`, which appends the user message
+to the transcript and writes the same text as a JSON line to stdin. The process
+remains open until the user stops it or Claude exits.
+
+The command still exports `WIKI_ROOT`, `WIKI_DB`, and a PATH prefixed with the
+embedded `wikictl` directory. The appended prompt includes the normal maintainer
+schema plus an interactive Query overlay:
+
+- answer in chat by default;
+- inspect the wiki/source material silently, without narrating setup steps;
+- use `wikictl page get` and raw-source footnote chasing when needed;
+- only mutate the wiki on explicit user request;
+- when mutating, write via `wikictl`, update `index.md` if appropriate, and
+  append a `query` log entry.
+
+## UI Notes
+
+The page uses two explicit states. Empty Query is a centered greeting plus a
+floating pill composer. Once the first user turn exists, the transcript fills the
+page and the same composer docks at the bottom. This avoids permanent header
+chrome and keeps attention on either starting or reading the conversation.
+
+Conversation content is constrained to a centered chat column. User turns align
+right within that column, Claude prose aligns left, and the composer uses the
+same width. Debug controls live in a compact Activity menu, with Stop exposed
+only while the agent is running.
+
+The page uses the app's existing semantic macOS type scale: `.largeTitle` for the
+empty-state greeting, `.body` for composed text, `.callout` for message text, and
+`.caption` for debug/status controls. Controls use SF Symbols and standard
+SwiftUI buttons.
+
+The composer is intentionally plain: users type the question or instruction they
+want, including requests to update the wiki. There is no separate Answer/Update
+mode control.
+
+Debug affordances are progressive: "Show internals" and Activity log access
+appear once a run exists or is running, instead of occupying the empty Query
+state.

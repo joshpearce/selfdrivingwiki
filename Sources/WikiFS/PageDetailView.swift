@@ -18,11 +18,7 @@ struct PageDetailView: View {
             if isEditing {
                 PageEditorView(store: store)
             } else {
-                PageReaderView(
-                    store: store,
-                    isRunning: launcher.isRunning,
-                    onQuery: runQuery
-                )
+                PageReaderView(store: store)
             }
         }
         .frame(minWidth: PageEditorMetrics.detailMinWidth)
@@ -53,14 +49,4 @@ struct PageDetailView: View {
         isEditing.toggle()
     }
 
-    private func runQuery(_ question: String) {
-        Task {
-            await AgentOperationRunner.runQuery(
-                question: question,
-                launcher: launcher,
-                store: store,
-                manager: manager,
-                fileProvider: fileProvider)
-        }
-    }
 }

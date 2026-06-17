@@ -115,6 +115,7 @@ struct OperationCommandTests {
   @Test func queryAndLintStayOpusSingleAgent() {
     for operation: WikiOperation in [
       .query(question: "How does X work?", stateFilePath: Self.stateFile),
+      .queryConversation(stateFilePath: Self.stateFile),
       .lint(stateFilePath: Self.stateFile),
     ] {
       let cmd = build(operation: operation)
@@ -122,6 +123,57 @@ struct OperationCommandTests {
       #expect(cmd.arguments[modelIndex + 1] == "opus")
       #expect(!cmd.arguments.contains("--agents"))
     }
+  }
+
+  @Test func interactiveQueryUsesStreamingInputAndNoPositionalPrompt() {
+    let cmd = OperationCommand.buildInteractiveQuery(
+      operation: .queryConversation(stateFilePath: Self.stateFile),
+      wikiRoot: Self.resolvedRoot,
+      wikiID: "01WIKIULID",
+      systemPrompt: "You are the maintainer.",
+      scratchDirectory: "/tmp/scratch-xyz",
+      wikictlDirectory: "/Apps/Self Driving Wiki.app/Contents/Helpers",
+      claudeExecutable: "/opt/homebrew/bin/claude",
+      baseEnvironment: ["PATH": "/usr/bin:/bin"])
+
+    #expect(cmd.executable == "/opt/homebrew/bin/claude")
+    #expect(cmd.arguments[0] == "-p")
+    #expect(cmd.arguments.contains("--input-format"))
+    let inputIndex = cmd.arguments.firstIndex(of: "--input-format")!
+    #expect(cmd.arguments[inputIndex + 1] == "stream-json")
+    let outputIndex = cmd.arguments.firstIndex(of: "--output-format")!
+    #expect(cmd.arguments[outputIndex + 1] == "stream-json")
+    #expect(cmd.arguments.contains("--verbose"))
+    #expect(cmd.arguments.contains("--dangerously-skip-permissions"))
+    #expect(!cmd.arguments.contains { $0.hasPrefix("Question:") })
+    #expect(cmd.environment["WIKI_ROOT"] == Self.resolvedRoot)
+    #expect(cmd.environment["WIKI_DB"] == "01WIKIULID")
+    #expect(cmd.environment["PATH"] == "/Apps/Self Driving Wiki.app/Contents/Helpers:/usr/bin:/bin")
+  }
+
+  @Test func interactiveQueryPromptAnswersByDefaultAndWritesOnlyOnRequest() {
+    let cmd = OperationCommand.buildInteractiveQuery(
+      operation: .queryConversation(stateFilePath: Self.stateFile),
+      wikiRoot: Self.resolvedRoot,
+      wikiID: "01WIKIULID",
+      systemPrompt: "schema",
+      scratchDirectory: "/tmp/scratch-xyz",
+      wikictlDirectory: "/helpers",
+      claudeExecutable: "claude",
+      baseEnvironment: [:])
+    let promptIndex = cmd.arguments.firstIndex(of: "--append-system-prompt")!
+    let prompt = cmd.arguments[promptIndex + 1]
+
+    #expect(prompt.contains("interactive Query conversation"))
+    #expect(prompt.contains("Answer in chat by default"))
+    #expect(prompt.contains("Only change the wiki when the user explicitly asks"))
+    #expect(prompt.contains("Do the wiki/source inspection silently"))
+    #expect(prompt.contains("Do NOT narrate process steps"))
+    #expect(prompt.contains("Do not advertise capabilities"))
+    #expect(prompt.contains("wikictl page upsert"))
+    #expect(prompt.contains("wikictl log append --kind query"))
+    #expect(prompt.contains(Self.stateFile))
+    #expect(prompt.contains(Self.resolvedRoot))
   }
 
   // MARK: - Digester prompt digests, does NOT write (no write rule, no wikictl)
@@ -185,6 +237,7 @@ struct OperationCommandTests {
       Self.tinyIngest(),
       Self.curatedIngest(),
       .query(question: "How does X compare to Y?", stateFilePath: Self.stateFile),
+      .queryConversation(stateFilePath: Self.stateFile),
       .lint(stateFilePath: Self.stateFile),
     ] {
       let cmd = OperationCommand.build(
@@ -237,6 +290,7 @@ struct OperationCommandTests {
       Self.tinyIngest(),
       Self.curatedIngest(),
       .query(question: "q", stateFilePath: Self.stateFile),
+      .queryConversation(stateFilePath: Self.stateFile),
       .lint(stateFilePath: Self.stateFile),
     ] {
       let prompt = operation.prompt(wikiRoot: Self.resolvedRoot)
@@ -283,6 +337,7 @@ struct OperationCommandTests {
   @Test func queryAndLintPromptsDoNotCarryIngestFootnoteRule() {
     for operation: WikiOperation in [
       .query(question: "q", stateFilePath: Self.stateFile),
+      .queryConversation(stateFilePath: Self.stateFile),
       .lint(stateFilePath: Self.stateFile),
     ] {
       let prompt = operation.prompt(wikiRoot: Self.resolvedRoot)
@@ -294,6 +349,7 @@ struct OperationCommandTests {
   @Test func queryAndLintPromptsNameStateAndForbidRediscovery() {
     for operation: WikiOperation in [
       .query(question: "q", stateFilePath: Self.stateFile),
+      .queryConversation(stateFilePath: Self.stateFile),
       .lint(stateFilePath: Self.stateFile),
     ] {
       let prompt = operation.prompt(wikiRoot: Self.resolvedRoot)

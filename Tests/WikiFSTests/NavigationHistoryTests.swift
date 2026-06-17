@@ -70,6 +70,21 @@ struct NavigationHistoryTests {
         #expect(model.selection == .page(from.id))
     }
 
+    @Test func querySelectionParticipatesInHistory() throws {
+        let (model, store) = try tempModel()
+        let page = try store.createPage(title: "A")
+        model.reloadFromStore()
+
+        model.select(.page(page.id))
+        model.select(.query)
+
+        #expect(model.selection == .query)
+        model.navigateBack()
+        #expect(model.selection == .page(page.id))
+        model.navigateForward()
+        #expect(model.selection == .query)
+    }
+
     @Test func historyNavigationFlushesOutgoingDraft() throws {
         let (model, store) = try tempModel()
         let a = try store.createPage(title: "A")

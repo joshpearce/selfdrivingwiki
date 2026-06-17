@@ -6,12 +6,13 @@ import SwiftUI
 struct AgentTranscriptSidebar: View {
     @Bindable var launcher: AgentLauncher
     let onCollapse: () -> Void
+    @State private var showsInternals = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider().opacity(PageEditorMetrics.dividerOpacity)
-            AgentActivityView(launcher: launcher)
+            AgentActivityView(launcher: launcher, showsInternals: showsInternals)
                 .padding(AgentTranscriptMetrics.padding)
         }
         .frame(width: AgentTranscriptMetrics.width)
@@ -26,6 +27,10 @@ struct AgentTranscriptSidebar: View {
                 Label("Transcript", systemImage: "text.bubble")
                     .font(.headline)
                 Spacer()
+                Toggle("Show internals", isOn: $showsInternals)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 if launcher.isRunning {
                     ProgressView()
                         .controlSize(.small)
@@ -43,9 +48,6 @@ struct AgentTranscriptSidebar: View {
                 .labelStyle(.iconOnly)
                 .buttonStyle(.borderless)
                 .help("Hide transcript")
-            }
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                AgentRunStatusView(launcher: launcher, now: context.date)
             }
         }
         .padding(.horizontal, AgentTranscriptMetrics.padding)
