@@ -220,9 +220,15 @@ final class FileProviderSpike {
     /// by its `by-id` leaf identifier (built from the shared prefix so it can't
     /// drift), then hands it to `NSWorkspace`. URL asked at click time.
     func openIngestedFile(id: PageID) async {
-        guard let wikiID = activeWikiID else { return }
+        DebugLog.agent("openIngestedFile: id=\(id.rawValue) activeWiki=\(activeWikiID ?? "nil")")
+        guard let wikiID = activeWikiID else {
+            DebugLog.agent("openIngestedFile: ABORT — no active wiki")
+            status = "Can’t open file — no active wiki."
+            return
+        }
         let domain = domain(id: wikiID, displayName: wikiID)
         guard let manager = NSFileProviderManager(for: domain) else {
+            DebugLog.agent("openIngestedFile: ABORT — no NSFileProviderManager for domain \(wikiID)")
             status = "No manager for domain"
             return
         }
@@ -232,8 +238,14 @@ final class FileProviderSpike {
                 manager: manager,
                 itemIdentifier: identifier,
                 timeout: .seconds(5))
-            NSWorkspace.shared.open(url)
+            DebugLog.agent("openIngestedFile: resolved url=\(url.path)")
+            let opened = NSWorkspace.shared.open(url)
+            DebugLog.agent("openIngestedFile: NSWorkspace.open returned \(opened)")
+            if !opened {
+                status = "macOS couldn’t open \(url.lastPathComponent)."
+            }
         } catch {
+            DebugLog.agent("openIngestedFile: FAILED resolving URL — \(error.localizedDescription)")
             status = "open file failed: \(error.localizedDescription)"
         }
     }

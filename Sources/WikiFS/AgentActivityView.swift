@@ -85,10 +85,6 @@ struct AgentActivityView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-        } else if !launcher.extractionLog.isEmpty {
-            Text(launcher.extractionLog)
-                .font(.callout)
-                .foregroundStyle(.secondary)
         } else {
             Text(showsInternals ? "No activity yet. Choose an operation and press Run." : "No output yet.")
                 .font(.callout)

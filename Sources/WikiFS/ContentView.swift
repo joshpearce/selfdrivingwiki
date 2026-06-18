@@ -35,10 +35,7 @@ struct ContentView: View {
 
                 if isTranscriptExpanded && !isQuerySelected {
                     Divider()
-                    AgentTranscriptSidebar(
-                        launcher: agentLauncher,
-                        onCollapse: collapseTranscript
-                    )
+                    AgentTranscriptSidebar(launcher: agentLauncher)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
@@ -82,6 +79,11 @@ struct ContentView: View {
                     toggleTranscript()
                 }
                 .disabled(!canShowTranscript)
+                // Light up (tint + pulse) while the agent is busy — including the
+                // PDF-conversion phase, before the agent process itself starts — so
+                // the user can tell something is running and open the transcript.
+                .foregroundStyle(agentBusy ? Color.orange : Color.primary)
+                .symbolEffect(.pulse, isActive: agentBusy)
                 .help(isTranscriptExpanded ? "Hide agent transcript" : "Show agent transcript")
             }
             ToolbarItem(placement: .primaryAction) {
@@ -132,11 +134,26 @@ struct ContentView: View {
                 isTranscriptExpanded = true
             }
         }
+        // Auto-open the transcript the moment an ingest starts — even during the
+        // PDF-conversion phase, before the agent process spawns — so the
+        // conversion box is visible.
+        .onChange(of: agentLauncher.ingestingFileID) { _, newValue in
+            if newValue != nil && !isQuerySelected {
+                isTranscriptExpanded = true
+            }
+        }
+    }
+
+    /// The agent is doing work — running, or in the local PDF-conversion phase of
+    /// an ingest (which precedes the agent process). Drives the toolbar glow.
+    private var agentBusy: Bool {
+        agentLauncher.isRunning || agentLauncher.ingestingFileID != nil
     }
 
     private var canShowTranscript: Bool {
         !isQuerySelected
             && (agentLauncher.isRunning
+                || agentLauncher.ingestingFileID != nil
                 || !agentLauncher.events.isEmpty
                 || agentLauncher.preflightError != nil
                 || !agentLauncher.stderr.isEmpty)
@@ -148,10 +165,6 @@ struct ContentView: View {
 
     private func toggleTranscript() {
         isTranscriptExpanded.toggle()
-    }
-
-    private func collapseTranscript() {
-        isTranscriptExpanded = false
     }
 
     private func navigateBack() {

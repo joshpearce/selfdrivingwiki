@@ -1,9 +1,10 @@
 import SwiftUI
 import WikiFSCore
 
-/// A dedicated sheet for ingesting a single file into the wiki — shown when
-/// the user clicks "Ingest Into Wiki" on a file.  No operation picker, no
-/// Query/Lint — just the source filename, extraction status, and Run.
+/// A small confirmation sheet for ingesting a single file into the wiki — shown
+/// when the user clicks "Ingest Into Wiki" on a file. Running the ingest closes
+/// the sheet immediately; all progress (PDF conversion + agent activity) lives in
+/// the transcript sidebar.
 struct IngestSheetView: View {
     @Bindable var launcher: AgentLauncher
     @Bindable var store: WikiStoreModel
@@ -12,21 +13,21 @@ struct IngestSheetView: View {
     let sourceID: PageID
 
     @Environment(\.dismiss) private var dismiss
-    @State private var extractionReady = false
-    @State private var isRunning = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            // Header
             Text("Ingest into Wiki")
                 .font(.headline)
 
-            // Source
+            if alreadyIngested {
+                alreadyIngestedBanner
+            }
+
             VStack(alignment: .leading, spacing: 6) {
                 Text("Source")
                     .font(.subheadline)
                     .fontWeight(.medium)
-                if let file = store.ingestedFiles.first(where: { $0.id == sourceID }) {
+                if let file = sourceFile {
                     Text(file.filename)
                         .font(.callout)
                         .foregroundStyle(.primary)
@@ -39,57 +40,50 @@ struct IngestSheetView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-
-                // Extraction status
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(extractionReady ? Color.green : Color.red)
-                        .frame(width: 8, height: 8)
-                    Text(extractionReady
-                         ? "PDF extraction ready"
-                         : "PDF extraction needs ~2 GB download (slow first run)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             }
 
-            Divider()
-
-            // Activity view
-            AgentActivityView(launcher: launcher, showsInternals: false)
-
-            // Footer
-            HStack(spacing: 12) {
-                if launcher.isRunning || isRunning {
-                    ProgressView().controlSize(.small)
-                    if let kind = launcher.runningKind {
-                        Text("Running \(kind.title)…")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+            HStack {
                 Spacer()
-                Button("Done") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button("Run Ingest") { run() }
+                Button("Ingest") { runAndClose() }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
                     .disabled(!canRun)
+                Spacer()
             }
         }
         .padding(20)
-        .frame(width: 540, height: 400)
-        .task { extractionReady = await PdfExtractionService.checkReady() }
+        .frame(width: 440)
+        .onAppear { launcher.resetActivityIfIdle() }
+    }
+
+    private var sourceFile: IngestedFileSummary? {
+        store.ingestedFiles.first(where: { $0.id == sourceID })
+    }
+
+    private var alreadyIngested: Bool {
+        sourceFile.map(store.hasIngestedFile) ?? false
+    }
+
+    private var alreadyIngestedBanner: some View {
+        Label(
+            "This document has already been ingested. Running ingest again may create duplicate pages.",
+            systemImage: "exclamationmark.triangle.fill")
+            .font(.callout)
+            .foregroundStyle(.primary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .background(.yellow.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
     }
 
     private var canRun: Bool {
-        !isRunning && !launcher.isRunning && manager.activeWikiID != nil
+        !launcher.isRunning && launcher.ingestingFileID == nil && manager.activeWikiID != nil
     }
 
-    private func run() {
-        isRunning = true
-        Task {
-            defer { isRunning = false }
+    /// Kick off the ingest and close the sheet — progress shows in the sidebar.
+    private func runAndClose() {
+        DebugLog.ingest("IngestSheetView.run: user pressed Run Ingest (sourceID=\(sourceID.rawValue))")
+        let task = Task {
+            defer { launcher.ingestTask = nil }
             await AgentOperationRunner.runIngest(
                 fileID: sourceID,
                 launcher: launcher,
@@ -97,5 +91,9 @@ struct IngestSheetView: View {
                 manager: manager,
                 fileProvider: fileProvider)
         }
+        // Publish the task so the sidebar's Stop button can cancel the conversion
+        // phase (not just the agent process).
+        launcher.ingestTask = task
+        dismiss()
     }
 }

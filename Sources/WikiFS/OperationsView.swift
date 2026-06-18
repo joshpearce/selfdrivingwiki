@@ -19,14 +19,42 @@ struct OperationsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: OperationMetrics.sectionSpacing) {
             header
-            operationPicker
-            inputSection
-            controls
-            AgentActivityView(launcher: launcher, showsInternals: showsInternals)
+            if isIngestBusy {
+                // An ingest owns the shared agent + the wiki's single-writer lock,
+                // so Query/Lint can't run. Replace the controls + activity with a
+                // clear notice rather than showing the ingest's feed in here.
+                ingestBusyNotice
+            } else {
+                operationPicker
+                inputSection
+                controls
+                AgentActivityView(launcher: launcher, showsInternals: showsInternals)
+            }
             footer
         }
         .padding(OperationMetrics.padding)
         .frame(width: OperationMetrics.sheetWidth, height: OperationMetrics.sheetHeight)
+    }
+
+    /// True while an ingest is in flight (its conversion or agent run). Query and
+    /// Lint share one `AgentLauncher` and write the same wiki, so they must wait.
+    private var isIngestBusy: Bool {
+        launcher.ingestingFileID != nil
+    }
+
+    private var ingestBusyNotice: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+            Text("An ingest is running")
+                .font(.headline)
+            Text("Query and Lint use the same agent and write to the same wiki, so they’re paused until the ingest finishes. Watch its progress from the file’s detail view.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
     }
 
     // MARK: - Header
