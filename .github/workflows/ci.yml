@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  swift:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
+
+  python:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/pdf2md
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Lint
+        run: uv run ruff check pdf2md tests/
+      - name: Type check
+        run: uv run pyright pdf2md tests/
+      - name: Unit tests
+        run: uv run pytest tests/test_pdf2md.py -v
+      - name: Fast integration tests
+        run: uv run pytest tests/test_integration.py -v
+        timeout-minutes: 10
