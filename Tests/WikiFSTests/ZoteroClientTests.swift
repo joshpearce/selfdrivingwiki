@@ -163,6 +163,11 @@ struct ZoteroClientTests {
         #expect(throws: ZoteroClient.ZoteroError.httpStatus(500)) { try ZoteroClient.checkStatus(500) }
     }
 
+    @Test func checkStatus299Passes300Throws() {
+        #expect(throws: Never.self) { try ZoteroClient.checkStatus(299) }
+        #expect(throws: ZoteroClient.ZoteroError.httpStatus(300)) { try ZoteroClient.checkStatus(300) }
+    }
+
     @Test func unauthorizedPropagatesFromSearch() async throws {
         let fetcher = FakeFetcher()
         fetcher.statusCode = 403
@@ -193,5 +198,139 @@ struct ZoteroClientTests {
         await #expect(throws: ZoteroClient.ZoteroError.unauthorized) {
             try await makeClient(fetcher).verifyConnection()
         }
+    }
+
+    // MARK: - childAttachments end-to-end error propagation
+
+    @Test func childAttachmentsPropagatesUnauthorized() async throws {
+        let fetcher = FakeFetcher()
+        fetcher.statusCode = 403
+        await #expect(throws: ZoteroClient.ZoteroError.unauthorized) {
+            try await makeClient(fetcher).childAttachments(ofItemKey: "NXYPZL8Q")
+        }
+    }
+
+    @Test func childAttachmentsPropagatesNotFound() async throws {
+        let fetcher = FakeFetcher()
+        fetcher.statusCode = 404
+        await #expect(throws: ZoteroClient.ZoteroError.notFound) {
+            try await makeClient(fetcher).childAttachments(ofItemKey: "NXYPZL8Q")
+        }
+    }
+
+    // MARK: - Decoding edge cases
+
+    @Test func decodeItemsEmptyArray() throws {
+        let items = try ZoteroClient.decodeItems(Data("[]".utf8))
+        #expect(items.isEmpty)
+    }
+
+    @Test func decodeAttachmentsEmptyArray() throws {
+        let attachments = try ZoteroClient.decodeAttachments(Data("[]".utf8))
+        #expect(attachments.isEmpty)
+    }
+
+    @Test func decodeAttachmentsWithNilParentItem() throws {
+        let json = """
+            [{"key": "A1", "version": 1, "data": {"itemType": "attachment", "linkMode": "imported_file", "filename": "report.pdf"}}]
+            """
+        let attachments = try ZoteroClient.decodeAttachments(Data(json.utf8))
+        #expect(attachments.count == 1)
+        #expect(attachments[0].parentItem == nil)
+    }
+
+    @Test func decodeAttachmentsWithMissingLinkMode() throws {
+        let json = """
+            [{"key": "A1", "version": 1, "data": {"itemType": "attachment"}}]
+            """
+        let attachments = try ZoteroClient.decodeAttachments(Data(json.utf8))
+        #expect(attachments.count == 1)
+        #expect(attachments[0].linkMode == "")  // defaults to empty string
+    }
+
+    // MARK: - ZoteroItem.subtitle
+
+    @Test func itemSubtitleWithBothFields() {
+        let item = ZoteroItem(
+            key: "K1", version: 1, itemType: "journalArticle",
+            title: "Title", creatorSummary: "Ito, K.", date: "2016")
+        #expect(item.subtitle == "Ito, K. · 2016")
+    }
+
+    @Test func itemSubtitleWithOnlyCreator() {
+        let item = ZoteroItem(
+            key: "K1", version: 1, itemType: "journalArticle",
+            title: "Title", creatorSummary: "Smith, J.", date: nil)
+        #expect(item.subtitle == "Smith, J.")
+    }
+
+    @Test func itemSubtitleWithOnlyDate() {
+        let item = ZoteroItem(
+            key: "K1", version: 1, itemType: "journalArticle",
+            title: "Title", creatorSummary: nil, date: "2020")
+        #expect(item.subtitle == "2020")
+    }
+
+    @Test func itemSubtitleNilWhenBothNil() {
+        let item = ZoteroItem(
+            key: "K1", version: 1, itemType: "journalArticle",
+            title: "Title", creatorSummary: nil, date: nil)
+        #expect(item.subtitle == nil)
+    }
+
+    @Test func itemSubtitleNilWhenBothEmptyStrings() {
+        let item = ZoteroItem(
+            key: "K1", version: 1, itemType: "journalArticle",
+            title: "Title", creatorSummary: "", date: "")
+        #expect(item.subtitle == nil)
+    }
+
+    // MARK: - ZoteroAttachment.isIngestable
+
+    @Test func isIngestablePDF() {
+        #expect(ZoteroAttachment(
+            key: "K1", parentItem: nil, linkMode: "imported_file",
+            filename: "paper.pdf", contentType: "application/pdf", title: nil).isIngestable)
+    }
+
+    @Test func isIngestableMarkdown() {
+        #expect(ZoteroAttachment(
+            key: "K1", parentItem: nil, linkMode: "imported_file",
+            filename: "notes.md", contentType: "text/markdown", title: nil).isIngestable)
+    }
+
+    @Test func isIngestableCaseInsensitive() {
+        #expect(ZoteroAttachment(
+            key: "K1", parentItem: nil, linkMode: "imported_file",
+            filename: "Paper.PDF", contentType: "application/pdf", title: nil).isIngestable)
+        #expect(ZoteroAttachment(
+            key: "K2", parentItem: nil, linkMode: "imported_file",
+            filename: "Notes.MD", contentType: "text/markdown", title: nil).isIngestable)
+    }
+
+    @Test func isIngestableRejectsOtherExtensions() {
+        #expect(!ZoteroAttachment(
+            key: "K1", parentItem: nil, linkMode: "imported_file",
+            filename: "data.txt", contentType: "text/plain", title: nil).isIngestable)
+        #expect(!ZoteroAttachment(
+            key: "K2", parentItem: nil, linkMode: "imported_file",
+            filename: "image.png", contentType: "image/png", title: nil).isIngestable)
+        #expect(!ZoteroAttachment(
+            key: "K3", parentItem: nil, linkMode: "imported_file",
+            filename: "archive.zip", contentType: "application/zip", title: nil).isIngestable)
+    }
+
+    @Test func isIngestableRejectsNilFilename() {
+        #expect(!ZoteroAttachment(
+            key: "K1", parentItem: nil, linkMode: "imported_file",
+            filename: nil, contentType: "application/pdf", title: nil).isIngestable)
+    }
+
+    @Test func isIngestableChecksExtensionNotContentType() {
+        // A file with a .txt extension is not ingestable even if its
+        // contentType says application/pdf.
+        #expect(!ZoteroAttachment(
+            key: "K1", parentItem: nil, linkMode: "imported_file",
+            filename: "readme.txt", contentType: "application/pdf", title: nil).isIngestable)
     }
 }

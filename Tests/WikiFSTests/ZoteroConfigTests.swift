@@ -53,4 +53,31 @@ struct ZoteroConfigTests {
         let config = ZoteroConfig(libraryID: "1", zoteroDirOverride: "/Volumes/External/Zotero")
         #expect(config.zoteroDirectory().path == "/Volumes/External/Zotero")
     }
+
+    @Test func zoteroDirectoryFallsBackToDefaultWhenOverrideIsEmptyString() {
+        let config = ZoteroConfig(libraryID: "1", zoteroDirOverride: "")
+        #expect(config.zoteroDirectory() == ZoteroLocalStorage.defaultDirectory())
+    }
+
+    @Test func roundTripPreservesNilFields() throws {
+        let dir = tempDirectory()
+        let config = ZoteroConfig(libraryID: nil, zoteroDirOverride: nil)
+        try config.save(to: dir)
+
+        let loaded = ZoteroConfig.load(from: dir)
+        #expect(loaded.libraryID == nil)
+        #expect(loaded.zoteroDirOverride == nil)
+        #expect(!loaded.isConfigured)
+    }
+
+    @Test func saveThenReloadEmptyConfigIsRoundTripConsistent() throws {
+        let dir = tempDirectory()
+        // Save a configured config, then load it fresh and verify equality.
+        let config = ZoteroConfig(libraryID: "7089244", zoteroDirOverride: nil)
+        try config.save(to: dir)
+
+        let loaded = ZoteroConfig.load(from: dir)
+        #expect(loaded == config)
+        #expect(loaded.zoteroDirOverride == nil)
+    }
 }

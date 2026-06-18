@@ -173,8 +173,7 @@ struct AddFromZoteroSheet: View {
     }
 
     private func itemSubtitle(_ item: ZoteroItem) -> String? {
-        let parts = [item.creatorSummary, item.date].compactMap { $0 }.filter { !$0.isEmpty }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        item.subtitle
     }
 
     // MARK: - Attachment picker (drill-down)
@@ -302,7 +301,7 @@ struct AddFromZoteroSheet: View {
             do {
                 let attachments = try await client.childAttachments(ofItemKey: item.key)
                 attachmentRows = attachments
-                    .filter(Self.isIngestable)
+                    .filter(\.isIngestable)
                     .map { attachment in
                         AttachmentRow(
                             attachment: attachment,
@@ -350,11 +349,6 @@ struct AddFromZoteroSheet: View {
 
     private func errorMessage(_ error: Error) -> String {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-    }
-
-    private static func isIngestable(_ attachment: ZoteroAttachment) -> Bool {
-        guard let filename = attachment.filename?.lowercased() else { return false }
-        return filename.hasSuffix(".pdf") || filename.hasSuffix(".md")
     }
 
     /// Layout constants (§2.4 — no scattered magic numbers).

@@ -83,4 +83,38 @@ struct WikiStoreModelZoteroIngestTests {
         }
         #expect(model.ingestedFiles.isEmpty)
     }
+
+    @Test func ingestingTwoAttachmentsAddsBothToList() async throws {
+        let store = try tempStore()
+        let model = WikiStoreModel(store: store)
+        let zoteroDir = try tempZoteroDir()
+        try writeFixture(
+            zoteroDir: zoteroDir, key: "K1", filename: "paper.pdf", data: Data("pdf-content".utf8))
+        try writeFixture(
+            zoteroDir: zoteroDir, key: "K1", filename: "notes.md", data: Data("# Notes".utf8))
+
+        try await model.ingestFromZotero(
+            attachment(key: "K1", filename: "paper.pdf"), zoteroDir: zoteroDir)
+        try await model.ingestFromZotero(
+            attachment(key: "K1", filename: "notes.md"), zoteroDir: zoteroDir)
+
+        #expect(model.ingestedFiles.count == 2)
+        let filenames = Set(model.ingestedFiles.map(\.filename))
+        #expect(filenames == ["paper.pdf", "notes.md"])
+    }
+
+    // MARK: - ZoteroIngestError
+
+    @Test func zoteroIngestErrorDescriptionReturnsReason() {
+        let error = ZoteroIngestError.unavailable("Not synced to this Mac yet")
+        #expect(error.errorDescription == "Not synced to this Mac yet")
+    }
+
+    @Test func zoteroIngestErrorIsEquatable() {
+        let a = ZoteroIngestError.unavailable("msg")
+        let b = ZoteroIngestError.unavailable("msg")
+        let c = ZoteroIngestError.unavailable("different")
+        #expect(a == b)
+        #expect(a != c)
+    }
 }
