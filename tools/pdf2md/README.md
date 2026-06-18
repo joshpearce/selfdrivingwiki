@@ -29,14 +29,11 @@ missing — run `curl -LsSf https://astral.sh/uv/install.sh | sh`).
 ## Development
 
 ```bash
-# Unit tests (fast, no docling needed for most)
-uv run pytest tests/test_pdf2md.py -v
-
-# Integration tests (needs real PDF + docling + MLX)
-uv run pytest tests/test_integration.py -v
-
-# All tests
+# Default suite (unit + fast integration — safe, never hangs)
 uv run pytest tests/ -v
+
+# VLM pipeline tests (slow, needs real PDF + ~2 GB granite model)
+uv run pytest tests/test_vlm.py -v
 
 # Lint
 uv run ruff check pdf2md tests/
@@ -52,7 +49,9 @@ uv run pyright pdf2md tests/
 | `pdf2md` | PEP 723 inline script — the tool itself |
 | `pyproject.toml` | Dependencies + tool config (ruff, pyright, pytest) |
 | `tests/test_pdf2md.py` | Unit tests (regex, cleanup, CLI parsing) |
-| `tests/test_integration.py` | Integration tests (full PDF→MD pipeline) |
+| `tests/test_integration.py` | Fast integration tests (CLI I/O, JSON, errors — minimal PDF fixture) |
+| `tests/test_vlm.py` | Slow quality tests (standard + VLM pipeline with real PDF) |
+| `tests/conftest.py` | Shared fixtures (minimal_pdf, real_pdf_or_skip) |
 
 ## Architecture
 
