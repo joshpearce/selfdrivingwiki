@@ -4,9 +4,7 @@ Newest first. To get up to speed: read `PLAN.md` then this file.
 
 ## 2026-06-18 — PDF extraction pipeline: PdfExtractionService + pdf2md integration
 
-Branch `feature/pdf2md-docling-pipeline` (PR #11). Integrated the `pdf2md` local
-PDF-to-Markdown converter into the app so PDFs are converted to Markdown before
-the agent sees them, replacing Claude `Read`-tool PDF extraction.
+Add pdf2md to integrate docling/granite-docling VLM/spacy pipeline to convert PDF to markdown without going through Claude.  Refactor the ingestion UI to show PDF conversion and ingestion results.
 
 **Added — PdfExtractionService (WikiFS)**
 
@@ -60,11 +58,11 @@ kept the transcript sidebar as a quiet inspector with native split-drag controls
 `typography-designer` kept semantic system fonts (`.subheadline`, `.caption`,
 monospaced logs).
 
-**Verified.** `make check` clean; `swift test` passes (**all 22 PdfExtractionService
-tests green**); `uv run pytest tests/test_pdf2md.py -v` **(48/48 green)**;
-`uv run pytest tests/test_integration.py -v -k "not vlm"` (standard-pipeline +
-stdout/error tests green; VLM pipeline test skipped — requires ~2 GB model download +
-a real PDF fixture, and the full suite hung, likely GPU resource contention).
+**Verified.** `make check` clean; full `swift test` passes (**435/435**). Python
+tests pass but are not in CI (manual):
+`uv run pytest tests/test_pdf2md.py tests/test_integration.py -v` **(60/60 green)**;
+`uv run pytest tests/test_vlm.py -v` (VLM pipeline, run on demand — requires
+~2 GB model download + a real PDF fixture).
 
 **Carry-forward.** The `pdf2md` VLM pipeline (`--pipeline vlm`) is not tested in
 CI (requires model download). `--json -o` ignoring the `-o` flag is existing
