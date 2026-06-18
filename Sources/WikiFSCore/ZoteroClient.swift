@@ -247,6 +247,14 @@ public struct ZoteroItem: Identifiable, Hashable, Sendable {
     public let creatorSummary: String?
     public let date: String?
     public var id: String { key }
+
+    /// "Ito, K. · 2016" for display in search results — nil when both fields are
+    /// absent or empty. Extracted as a pure value-type property so the picker UI
+    /// stays thin and the formatting is trivially unit-testable.
+    public var subtitle: String? {
+        let parts = [creatorSummary, date].compactMap { $0 }.filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
 }
 
 /// A Zotero attachment (PDF, converted Markdown, web snapshot, …) attached to a
@@ -266,6 +274,15 @@ public struct ZoteroAttachment: Identifiable, Hashable, Sendable {
     /// client source (see `ZoteroLocalStorage`). `linked_file`/`linked_url` point
     /// elsewhere or nowhere on disk.
     public var hasLocalCopy: Bool { linkMode == "imported_file" || linkMode == "imported_url" }
+
+    /// Whether this attachment's filename ends in `.pdf` or `.md`
+    /// (case-insensitive) — the two attachment types Self Driving Wiki can
+    /// ingest. Extracted as a pure value-type property so the picker UI stays
+    /// thin and the decision is trivially unit-testable.
+    public var isIngestable: Bool {
+        guard let filename = filename?.lowercased() else { return false }
+        return filename.hasSuffix(".pdf") || filename.hasSuffix(".md")
+    }
 }
 
 /// The production `ZoteroClient.RequestFetcher` — a thin `URLSession` wrapper,
