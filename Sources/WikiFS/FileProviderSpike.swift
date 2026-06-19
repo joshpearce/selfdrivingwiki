@@ -118,8 +118,14 @@ final class FileProviderSpike {
     /// pure policy helper. A failed `domains()` call reads as "not present" so the
     /// retry loop keeps trying.
     private func isDomainRegistered(id: String) async -> Bool {
-        let domainIDs = (try? await NSFileProviderManager.domains())?
-            .map(\.identifier.rawValue) ?? []
+        // NSFileProviderDomain is not Sendable, so calling domains() from a
+        // @MainActor context is a strict-concurrency error under Swift 6.
+        // Run the call in a detached task and extract only the Sendable
+        // raw-value strings before returning to the main actor.
+        let domainIDs = await Task.detached {
+            (try? await NSFileProviderManager.domains())?
+                .map(\.identifier.rawValue) ?? []
+        }.value
         return DomainRegistrationPolicy.isRegistered(domainIDs: domainIDs, wikiID: id)
     }
 
