@@ -288,6 +288,10 @@ public final class SQLiteWikiStore: WikiStore {
     nonisolated(unsafe) private static var _vecLoadAttempted = false
 
     private static func ensureVecExtensionLoaded() {
+        // When there's no app bundle (test / CI), the dylib path search is
+        // pointless AND Bundle.main can crash in some configurations.
+        // Semantic search degrades to LIKE fallback automatically.
+        guard Bundle.main.bundlePath.hasSuffix(".app") else { return }
         vecInitQueue.sync {
             guard !_vecLoadAttempted else { return }
             _vecLoadAttempted = true
