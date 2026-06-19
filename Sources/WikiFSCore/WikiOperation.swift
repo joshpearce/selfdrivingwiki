@@ -23,21 +23,20 @@ import Foundation
 /// `WIKI_ROOT` and the absolute scratch paths of the staged source / wiki-state
 /// snapshot. It does NOT restate the layout map (DRY against the schema).
 public enum WikiOperation: Equatable, Sendable {
-  /// Summarize one already-ingested source file into the wiki.
+  /// Summarize one or more ingested source files into the wiki in a single agent run.
   ///
-  /// - `sourcePath`: the source's mount-relative path under `$WIKI_ROOT` (kept for
+  /// - `sourcePaths`: the sources' mount-relative paths under `$WIKI_ROOT` (kept for
   ///   reference / the rare mount fallback).
-  /// - `stagedSourcePath`: the ABSOLUTE scratch path the app staged the raw source
-  ///   bytes to (read from SQLite, not the laggy mount) — what the agent actually
-  ///   reads.
+  /// - `stagedSourcePaths`: the ABSOLUTE scratch paths the app staged the raw source
+  ///   bytes to as `source-1.<ext>`, `source-2.<ext>`, … (read from SQLite, not the
+  ///   laggy mount) — what the agent actually reads.
   /// - `stateFilePath`: the ABSOLUTE scratch path of the staged `WIKI_STATE.md`
   ///   snapshot (titles + index.md + log tail) — so the agent skips orientation.
   /// - `plan`: the model-tiering decision (single Opus pass vs Opus curator + Sonnet
-  ///   digesters), which selects between the single-pass and curate-and-fan-out
-  ///   prompt. Opus writes in BOTH modes.
+  ///   digesters), based on total source byte size. Opus writes in BOTH modes.
   case ingest(
-    sourcePath: String,
-    stagedSourcePath: String,
+    sourcePaths: [String],
+    stagedSourcePaths: [String],
     stateFilePath: String,
     plan: IngestPlan
   )
@@ -112,21 +111,23 @@ extension WikiOperation {
   ///     (NOT `$WIKI_ROOT` for the agent to expand).
   public func prompt(wikiRoot: String) -> String {
     switch self {
-    case .ingest(let sourcePath, let stagedSourcePath, let stateFilePath, let plan):
-      let sourceID = Self.sourceID(fromPath: sourcePath)
+    case .ingest(let sourcePaths, let stagedSourcePaths, let stateFilePath, let plan):
+      let sourceIDs = sourcePaths.map { Self.sourceID(fromPath: $0) }
       switch plan {
       case .singleOpus:
         return Self.ingestSinglePrompt(
           wikiRoot: wikiRoot,
-          stagedSourcePath: stagedSourcePath,
+          sourcePaths: sourcePaths,
+          stagedSourcePaths: stagedSourcePaths,
           stateFilePath: stateFilePath,
-          sourceID: sourceID)
+          sourceIDs: sourceIDs)
       case .opusCurator:
         return Self.ingestCuratorPrompt(
           wikiRoot: wikiRoot,
-          stagedSourcePath: stagedSourcePath,
+          sourcePaths: sourcePaths,
+          stagedSourcePaths: stagedSourcePaths,
           stateFilePath: stateFilePath,
-          sourceID: sourceID)
+          sourceIDs: sourceIDs)
       }
     case .query(let question, let stateFilePath):
       return Self.queryPrompt(
@@ -148,90 +149,110 @@ extension WikiOperation {
 
   // MARK: - Ingest prompts
 
-  /// Single-pass Ingest (tiny source): one Opus pass does the whole ingest itself via
-  /// `wikictl`. No fan-out — Opus reads the small staged source and writes the pages
-  /// + index + log. (Opus is the curator even for small sources.) Leads with the
-  /// write rule because Opus is the writer.
+  /// Single-pass Ingest (tiny total source): one Opus pass does the whole ingest
+  /// itself via `wikictl`. No fan-out — Opus reads the small staged source(s) and
+  /// writes the pages + index + log. (Opus is the curator even for small sources.)
+  /// Leads with the write rule because Opus is the writer.
   private static func ingestSinglePrompt(
     wikiRoot: String,
-    stagedSourcePath: String,
+    sourcePaths: [String],
+    stagedSourcePaths: [String],
     stateFilePath: String,
-    sourceID: String
+    sourceIDs: [String]
   ) -> String {
     """
     \(IngestWriteRule.writes)
 
-    \(IngestWriteRule.dontRediscover(stateFilePath: stateFilePath, sourceFilePath: stagedSourcePath))
+    \(IngestWriteRule.dontRediscover(stateFilePath: stateFilePath, sourceFilePaths: stagedSourcePaths))
 
     \(footnoteConclusionsRule)
 
-    TASK — Ingest this one source into the wiki, following the Ingest workflow from \
-    your instructions. Act immediately; do not explore the mount first. Read the \
-    staged source, DECIDE what belongs in the wiki, and write one or more \
-    summary/entity/concept pages via `wikictl page upsert` (cross-linking with \
-    [[wiki links]]), rewrite index.md via `wikictl index set`, and record it with \
-    `wikictl log append --kind ingest --source \(sourceID) --title "<source>"`. The \
-    `--source` id is REQUIRED on success — it marks this file Ingested in the app. \
+    \(sourcesSection(sourcePaths: sourcePaths, stagedSourcePaths: stagedSourcePaths))
+
+    TASK — Ingest \(sourcePaths.count) file\(sourcePaths.count == 1 ? "" : "s") into \
+    the wiki, following the Ingest workflow from your instructions. Act immediately; \
+    do not explore the mount first. Read each staged source, DECIDE what belongs in \
+    the wiki, CROSS-REFERENCE across all sources to find connections and avoid \
+    duplicates, and write one or more summary/entity/concept pages via \
+    `wikictl page upsert` (cross-linking with [[wiki links]]). Then rewrite index.md \
+    via `wikictl index set`, and for EACH ingested source record it with \
+    `wikictl log append --kind ingest --source <id> --title "<source>"`. \
+    The `--source` ids are: \(sourceIDs.joined(separator: ", ")). \
+    Each `--source` id is REQUIRED — it marks that file Ingested in the app. \
     Work autonomously to completion; the live app shows your changes as they land.
 
     WIKI_ROOT (resolved, read-only mount — reference only): \(wikiRoot)
-    SOURCE_ID (pass to `--source` on the final log append): \(sourceID)
     """
   }
 
   /// Large-source Ingest: an Opus CURATOR delegates raw source ingestion to Sonnet
   /// `source-reader` digesters, then DECIDES the page set and WRITES every page +
-  /// index.md + the log entry itself. The 2..19 digester guardrail and the
+  /// index.md + the log entries itself. The 2..19 digester guardrail and the
   /// "fork more for follow-up questions / pull pages to double-check" affordances are
   /// stated prompt-level. Leads with the write rule because Opus is the writer.
   private static func ingestCuratorPrompt(
     wikiRoot: String,
-    stagedSourcePath: String,
+    sourcePaths: [String],
+    stagedSourcePaths: [String],
     stateFilePath: String,
-    sourceID: String
+    sourceIDs: [String]
   ) -> String {
     """
     \(IngestWriteRule.writes)
 
-    \(IngestWriteRule.dontRediscover(stateFilePath: stateFilePath, sourceFilePath: stagedSourcePath))
+    \(IngestWriteRule.dontRediscover(stateFilePath: stateFilePath, sourceFilePaths: stagedSourcePaths))
 
     \(footnoteConclusionsRule)
 
-    TASK — Ingest this one source into the wiki, following the Ingest workflow from \
-    your instructions. You are the CURATOR: you decide what goes in the wiki and you \
-    write everything. The source is LARGE — use Sonnet `source-reader` workers, not \
-    Opus, to do the raw source ingestion: they read the bulk source chunks and return \
-    structured digests for you to synthesize. Act immediately; do not explore the \
-    mount first.
+    \(sourcesSection(sourcePaths: sourcePaths, stagedSourcePaths: stagedSourcePaths))
 
-    1. INSPECT the staged source's size and structure WITHOUT reading the whole bulk \
+    TASK — Ingest \(sourcePaths.count) file\(sourcePaths.count == 1 ? "" : "s") into \
+    the wiki, following the Ingest workflow from your instructions. You are the \
+    CURATOR: you decide what goes in the wiki and you write everything. \
+    \(sourcePaths.count == 1 ? "The source is LARGE" : "The sources are LARGE") — \
+    use Sonnet `source-reader` workers, not Opus, to do the raw source ingestion: \
+    they read the bulk source chunks and return structured digests for you to \
+    synthesize. Act immediately; do not explore the mount first.
+
+    1. INSPECT each staged source's size and structure WITHOUT reading the whole bulk \
        — e.g. `wc -l`/`head` for text, or count pages for a PDF — then split it into \
        chunks (byte/line ranges, sections, or page ranges).
     2. FAN OUT RAW INGESTION to Sonnet `source-reader` subagents via the Task tool — \
        use MORE THAN 1 and FEWER THAN 20 workers (between 2 and 19). Size the fan-out \
        to the material: do NOT spawn 15 workers for 3 pages; one worker can digest \
-       adjacent chunks. In each worker's task, give it the staged source path \
-       (\(stagedSourcePath)) and the exact chunk/section/page-range it must DIGEST. \
+       adjacent chunks. In each worker's task, give it the staged source path(s) \
+       (\(stagedSourcePaths.joined(separator: ", "))) and the exact chunk/section/page-range it must DIGEST. \
        Each worker READS its chunk and returns a structured digest; workers do NOT \
        write to the wiki.
-    3. SYNTHESIZE the digests, DECIDE the set of wiki pages this ingest should \
-       produce (summary pages plus the entity/concept pages it mentions), reusing \
-       existing titles where they fit. You MAY fork MORE `source-reader` workers to \
-       ask follow-up QUESTIONS of the source ("re-read section 4 and tell me X"), \
-       and you MAY pull specific existing wiki pages with `wikictl page get` to \
-       double-check facts before/while writing. Keep TOTAL Sonnet worker invocations \
-       under 20 across the whole run (initial digest fan-out plus any follow-ups).
+    3. SYNTHESIZE the digests, CROSS-REFERENCE across all sources to find connections \
+       and avoid duplicate pages, and DECIDE the set of wiki pages this ingest should \
+       produce (summary pages plus the entity/concept pages), reusing existing titles \
+       where they fit. You MAY fork MORE `source-reader` workers to ask follow-up \
+       QUESTIONS ("re-read section 4 and tell me X"), and you MAY pull specific \
+       existing wiki pages with `wikictl page get` to double-check facts. Keep TOTAL \
+       Sonnet worker invocations under 20 across the whole run.
     4. WRITE every page yourself via `wikictl page upsert` (cross-linking with \
        [[wiki links]]), then rewrite index.md wholesale via `wikictl index set` so it \
-       catalogs the new pages, and append the log entry with \
-       `wikictl log append --kind ingest --source \(sourceID) --title "<source>"`. The \
-       `--source` id is REQUIRED on success — it marks this file Ingested in the app.
+       catalogs the new pages, and for EACH ingested source record it with \
+       `wikictl log append --kind ingest --source <id> --title "<source>"`. The \
+       `--source` ids are: \(sourceIDs.joined(separator: ", ")). Each `--source` id \
+       is REQUIRED — it marks that file Ingested in the app.
 
     Work autonomously to completion; the live app shows changes as they land.
 
     WIKI_ROOT (resolved, read-only mount — reference only): \(wikiRoot)
-    SOURCE_ID (pass to `--source` on the final log append): \(sourceID)
     """
+  }
+
+  /// Renders the source list for the prompt: each source's scratch path + original
+  /// wiki path.
+  private static func sourcesSection(sourcePaths: [String], stagedSourcePaths: [String]) -> String {
+    var lines = ["SOURCES (\(sourcePaths.count) file\(sourcePaths.count == 1 ? "" : "s")):"]
+    for i in 0..<sourcePaths.count {
+      let stagedLeaf = (stagedSourcePaths[i] as NSString).lastPathComponent
+      lines.append("- \(stagedLeaf)    (from \(sourcePaths[i]))")
+    }
+    return lines.joined(separator: "\n")
   }
 
   /// Ingest-written pages should make provenance visible without making the agent

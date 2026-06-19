@@ -39,25 +39,28 @@ public enum IngestWriteRule {
     pages with [[Page Title]] wiki-links.
     """
 
-  /// The "don't rediscover" directive. Names the two locally-staged files (the live
-  /// wiki-state snapshot and the raw source) and forbids the orientation turns
+  /// The "don't rediscover" directive. Names the locally-staged files (the live
+  /// wiki-state snapshot and the raw source(s)) and forbids the orientation turns
   /// (`wikictl page list`, re-reading `index.md`/`log.md`) the agent burns
   /// rediscovering what the app already staged — problem #2.
   ///
   /// - Parameters:
   ///   - stateFilePath: absolute scratch path of the staged `WIKI_STATE.md`.
-  ///   - sourceFilePath: absolute scratch path of the staged source (nil for ops
-  ///     with no source, e.g. Query/Lint).
-  public static func dontRediscover(stateFilePath: String, sourceFilePath: String? = nil) -> String {
+  ///   - sourceFilePaths: absolute scratch paths of the staged source(s) (empty
+  ///     for ops with no source, e.g. Query/Lint).
+  public static func dontRediscover(stateFilePath: String, sourceFilePaths: [String] = []) -> String {
     var lines = [
       "DO NOT REDISCOVER. The wiki's current state — existing page titles (your "
         + "cross-link vocabulary), the current index.md body, and the recent log "
         + "tail — is already staged locally at \(stateFilePath). Read THAT; do NOT run "
         + "`wikictl page list` or read index.md/log.md to rediscover it."
     ]
-    if let sourceFilePath {
+    if !sourceFilePaths.isEmpty {
+      let list = sourceFilePaths.enumerated().map { (i, path) in
+        "source-\(i + 1) at \(path)"
+      }.joined(separator: ", ")
       lines.append(
-        "The source to ingest is staged locally at \(sourceFilePath) — read it THERE "
+        "The source(s) to ingest are staged locally — \(list) — read them THERE "
           + "(reliable local disk), not from the laggy read-only mount.")
     }
     return lines.joined(separator: "\n")

@@ -1,14 +1,21 @@
 import SwiftUI
 import WikiFSCore
 
-/// One row in the sidebar's "Files" section: an ingested file's name + size.
-/// Selecting the row opens a file detail pane with the agent-ingest affordance;
-/// the context menu keeps direct file actions close at hand.
+/// One row in the sidebar's "Files" section. Multi-select is handled natively
+/// by the List (Shift+Arrow, Shift+Click, Command+Click). Right-click offers
+/// Open, Remove, and "Ingest Selected" when this file is part of a selection.
 struct IngestedFileRow: View {
     let file: IngestedFileSummary
     let hasBeenIngested: Bool
+    /// True while the agent is actively ingesting this file.
+    var isIngesting: Bool = false
+    /// True when this file is part of the List's multi-selection.
+    var isSelected: Bool = false
     let onOpen: () -> Void
     let onRemove: () -> Void
+    /// Ingest all currently-selected files (shown in context menu when this
+    /// file is part of a multi-file selection).
+    var onIngestSelected: (() -> Void)? = nil
 
     var body: some View {
         Label {
@@ -21,16 +28,26 @@ struct IngestedFileRow: View {
                 Text(Self.sizeFormatter.string(fromByteCount: Int64(file.byteSize)))
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Image(systemName: hasBeenIngested ? "checkmark.circle.fill" : "circle.dashed")
-                    .font(.caption)
-                    .foregroundStyle(hasBeenIngested ? .green : .secondary)
-                    .help(hasBeenIngested ? "Ingested into the wiki" : "Ready to ingest into the wiki")
+                if isIngesting {
+                    ProgressView()
+                        .controlSize(.small)
+                        .help("Ingesting…")
+                } else {
+                    Image(systemName: hasBeenIngested ? "checkmark.circle.fill" : "circle.dashed")
+                        .font(.caption)
+                        .foregroundStyle(hasBeenIngested ? .green : .secondary)
+                        .help(hasBeenIngested ? "Ingested into the wiki" : "Ready to ingest into the wiki")
+                }
             }
         } icon: {
             Image(systemName: Self.symbol(forExtension: file.ext))
         }
         .contentShape(Rectangle())
         .contextMenu {
+            if isSelected, let onIngestSelected {
+                Button("Ingest Selected", systemImage: "text.badge.plus", action: onIngestSelected)
+                Divider()
+            }
             Button("Open", systemImage: "arrow.up.forward.app", action: onOpen)
             Button("Remove", role: .destructive, action: onRemove)
         }

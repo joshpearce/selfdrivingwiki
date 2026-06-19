@@ -41,7 +41,7 @@ final class AgentLauncher {
     /// The ingested-file id currently being operated on — from the moment its
     /// ingest starts (local conversion included) until the agent run ends. Drives
     /// the "Ingesting…" status in `IngestedFileDetailView`. Cleared in `finish()`.
-    var ingestingFileID: PageID?
+    var ingestingFileIDs: Set<PageID> = []
     /// The in-flight ingest operation Task (set by `IngestSheetView`). Cancelling
     /// it aborts a running `pdf2md` conversion (via its task-cancellation handler).
     /// Held here so `stop()` — driven from the transcript sidebar too — can cancel
@@ -480,7 +480,7 @@ final class AgentLauncher {
         process = nil
         inputHandle = nil
         currentProcessID = nil
-        ingestingFileID = nil
+        ingestingFileIDs = []
         lastActivityAt = Date()
     }
 

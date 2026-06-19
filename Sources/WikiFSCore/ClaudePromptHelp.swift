@@ -83,16 +83,16 @@ public enum ClaudePromptHelp {
 
   private static var tinyIngest: WikiOperation {
     .ingest(
-      sourcePath: "files/by-id/<file-id>",
-      stagedSourcePath: stagedSourcePlaceholder,
+      sourcePaths: ["files/by-id/<file-id>"],
+      stagedSourcePaths: [stagedSourcePlaceholder],
       stateFilePath: stateFilePlaceholder,
       plan: .singleOpus)
   }
 
   private static var curatedIngest: WikiOperation {
     .ingest(
-      sourcePath: "files/by-id/<file-id>",
-      stagedSourcePath: stagedSourcePlaceholder,
+      sourcePaths: ["files/by-id/<file-id>"],
+      stagedSourcePaths: [stagedSourcePlaceholder],
       stateFilePath: stateFilePlaceholder,
       plan: .opusCurator)
   }

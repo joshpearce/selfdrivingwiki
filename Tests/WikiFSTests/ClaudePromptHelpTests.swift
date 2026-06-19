@@ -34,13 +34,13 @@ struct ClaudePromptHelpTests {
   @Test func promptDocumentsComeFromProductionPromptBuilders() {
     let byID = Dictionary(uniqueKeysWithValues: ClaudePromptHelp.documents.map { ($0.id, $0.body) })
     let tiny = WikiOperation.ingest(
-      sourcePath: "files/by-id/<file-id>",
-      stagedSourcePath: ClaudePromptHelp.stagedSourcePlaceholder,
+      sourcePaths: ["files/by-id/<file-id>"],
+      stagedSourcePaths: [ClaudePromptHelp.stagedSourcePlaceholder],
       stateFilePath: ClaudePromptHelp.stateFilePlaceholder,
       plan: .singleOpus)
     let curated = WikiOperation.ingest(
-      sourcePath: "files/by-id/<file-id>",
-      stagedSourcePath: ClaudePromptHelp.stagedSourcePlaceholder,
+      sourcePaths: ["files/by-id/<file-id>"],
+      stagedSourcePaths: [ClaudePromptHelp.stagedSourcePlaceholder],
       stateFilePath: ClaudePromptHelp.stateFilePlaceholder,
       plan: .opusCurator)
 

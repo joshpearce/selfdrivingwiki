@@ -2,6 +2,96 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-19 — File filter + native multi-select + batch ingest in single agent run
+
+Added a filter picker and native multi-select to the Files section, and generalized
+the ingest pipeline so multiple selected files are staged and processed in a single
+agent run.
+
+- **Filter picker** (All / Ready / Ingested) in the Files header
+- **Native List multi-select** — Shift+Arrow, Shift+Click, Command+Click select
+  multiple files; selected files highlight and show "Ingest Selected" button
+- **Multi-source ingest** — selected files staged together as `source-1.md`,
+  `source-2.pdf`, … in ONE agent run so the agent cross-references holistically
+- **ProgressView spinner** on file rows while being ingested
+- **`ingestingFileID` → `ingestingFileIDs: Set<PageID>`** to track multiple files
+- **Right-click → "Ingest Selected"** on a selected file in the context menu
+
+**Changed — Core pipeline (WikiFSCore)**
+- `WikiOperation.ingest` generalized from one source to N: `sourcePath`→`sourcePaths`,
+  `stagedSourcePath`→`stagedSourcePaths`. Prompt builders list all sources and
+  instruct the agent to cross-reference and log each source ID.
+- `AgentStaging` gained `stageSources(_:in:)` (stages `source-1.<ext>`, …) and
+  `sourceFileName(ext:index:)`. `IngestWriteRule.dontRediscover` takes `[String]`.
+- `AgentOperationRunner.runMultiIngest(fileIDs:)` reads all files, converts PDFs,
+  builds `[StagedSource]`, stages together, launches one agent run.
+
+**Changed — App (WikiFS)**
+- `OperationRequest.ingest` takes `sources: [StagedSource]` (bytes, ext, displayPath).
+- `SidebarView`: `listSelection: Set<WikiSelection>` bridges native multi-select to
+  single-item detail navigation. "Ingest Selected" appears when file IDs are selected.
+- `IngestedFileRow`: simplified — no custom checkboxes; shows spinner when ingesting;
+  context menu has "Ingest Selected" on selected files.
+- Removed all custom checkbox / batch-mode toggle code.
+
+**Tests**
+- Updated `OperationCommandTests`, `ClaudePromptHelpTests` for new signatures.
+- `AgentStagingTests`: `sourceFileNameWithIndex`, `stagesMultipleSourcesIntoScratch`,
+  `stagesEmptySourcesListReturnsEmpty`.
+
+**Verified.** `make check` clean; `swift test` **479/479** green; `make` produces a
+clean signed bundle. PR #16.
+
+See `plans/markdown-folder-import.md`.
+
+## 2026-06-19 — Import Markdown Folder (Obsidian, LogSeq, general .md directories)
+
+Added a one-shot "Import Markdown Folder…" action that recursively walks a directory
+of Markdown files and lands them in `ingested_files` for the agent to curate via
+Ingest. Works with Obsidian vaults, LogSeq graphs, and any folder of `.md` files.
+Hidden files/directories are skipped; duplicate filenames get a disambiguating suffix.
+
+**Added — Core (WikiFSCore)**
+- `MarkdownFolderReader` — pure, testable recursive walk with injectable `FileOperations`
+  protocol (production: `FileManagerFileOperations`). Filters `.md` / `.markdown`,
+  skips hidden entries, deduplicates filenames, collects per-file read errors.
+  `WalkResult`, `MarkdownFile`, `WalkError` (conforms to `LocalizedError`).
+
+**Added — Model (WikiStoreModel)**
+- `importFromMarkdownFolder(directory:) async -> (imported: Int, errors: [String])`
+  — walks off the main actor via `Task.detached`, stores each file via the shared
+  `store.ingestFile(filename:data:)` seam, returns import count + error messages.
+
+**Added — UI (WikiFS)**
+- `ImportMarkdownSheet` — follows `AddFromURLSheet`'s phase-enum pattern: idle →
+  scanning → ready(count) → importing → done(imported, errors) → failed. Directory
+  picker via `WikiFilePanels.chooseDirectory`. Progress + results summary.
+- Toolbar + Files section header buttons ("Import Markdown Folder…") in `SidebarView`,
+  always shown (no configuration gate). Sheet binding alongside existing URL/Zotero
+  sheets.
+
+**Tests**
+- `MarkdownFolderReaderTests` — 14 unit tests with `FakeFileOperations` test double
+  (recursive walk, .md/.markdown filter, non-markdown exclusion, hidden file/dir
+  skip, filename dedup, read error collection, empty/no-markdown directory,
+  byte-identical content, Equatable conformance).
+- `WikiStoreModelMarkdownImportTests` — 12 integration tests with real SQLiteStore +
+  temp directory fixtures (all files land in ingested_files, filenames match,
+  content byte-identical, non-markdown ignored, signal fires, empty dir handled,
+  dedup works, YAML/wikilinks/callouts preserved, hidden dirs skipped, idempotent
+  second import, .markdown extension handled).
+
+**Skill pass.** Before and after code: `swiftui-pro` kept the sheet as a thin leaf
+surface with a phase-enum state machine; `macos-design` placed the action in the
+toolbar and Files section header alongside the existing URL/Zotero buttons;
+`typography-designer` used semantic system fonts (`.headline`, `.subheadline`,
+`.callout`, `.caption`).
+
+**Verified.** `make check` clean; `swift test` passes (**476/476** — 26 new tests,
+no regressions). Full build (debug) produces a clean signed bundle.
+
+See `plans/markdown-folder-import.md`.
+
 ## 2026-06-18 — Semantic search via sqlite-vec + NLEmbedding
 
 Added meaning-based search over wiki pages. sqlite-vec ranks by cosine similarity
