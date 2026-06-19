@@ -144,4 +144,45 @@ struct NavigationHistoryTests {
 
         #expect(!model.canNavigateBack)
     }
+
+    // MARK: - Sort order integration
+
+    @Test func changingSortOrderReloadsSummaries() throws {
+        let (model, store) = try tempModel()
+        _ = try store.createPage(title: "Banana")
+        Thread.sleep(forTimeInterval: 0.002)
+        _ = try store.createPage(title: "apple")
+        model.reloadFromStore()
+
+        // Default: lastUpdated — both pages have the same updated_at,
+        // so we just verify two pages are loaded.
+        #expect(model.summaries.count == 2)
+
+        // Switch to title A–Z: "apple" then "Banana" (case-insensitive).
+        model.pageSortOrder = .titleAZ
+        #expect(model.summaries.map(\.title) == ["apple", "Banana"])
+
+        // Switch back to lastUpdated.
+        model.pageSortOrder = .lastUpdated
+        #expect(model.summaries.count == 2)
+    }
+
+    @Test func snapshotIgnoresSortPreference() throws {
+        let (model, store) = try tempModel()
+        let a = try store.createPage(title: "A")
+        Thread.sleep(forTimeInterval: 0.002)
+        let b = try store.createPage(title: "B")
+        // Touch A so it becomes most-recently-edited under lastUpdated.
+        try store.updatePage(id: a.id, title: "A", body: "edited")
+        model.reloadFromStore()
+
+        // User sorts by title A–Z in the sidebar.
+        model.pageSortOrder = .titleAZ
+
+        // Snapshot must still report titles most-recently-edited first.
+        let snapshot = model.currentStateSnapshot()
+        // A was edited last, so it should sort first in the snapshot
+        // regardless of the sidebar's titleAZ preference.
+        #expect(snapshot.pageTitles.first == "A")
+    }
 }

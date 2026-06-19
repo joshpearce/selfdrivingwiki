@@ -28,7 +28,7 @@ struct ReadOnlyStoreTests {
         #expect(page.title == "Home")
         #expect(page.bodyMarkdown == "# Welcome\n\nlive body")
 
-        let summaries = try reader.listPages()
+        let summaries = try reader.listPages(sortBy: .lastUpdated)
         #expect(summaries.contains { $0.id == id })
 
         let all = try reader.listAllPagesOrderedByID()

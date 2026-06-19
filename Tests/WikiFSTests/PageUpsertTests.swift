@@ -33,7 +33,7 @@ struct PageUpsertTests {
         // Same page resolved by title, not a second one.
         #expect(updated.id == created.id)
         #expect(try store.getPage(id: created.id).bodyMarkdown == "v2")
-        #expect(try store.listPages().count == 1)
+        #expect(try store.listPages(sortBy: .lastUpdated).count == 1)
     }
 
     @Test func upsertByExplicitIDUpdatesThatPage() throws {

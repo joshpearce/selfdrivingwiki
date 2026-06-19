@@ -141,6 +141,6 @@ struct WikiLinkStoreTests {
 
         // Deleting A (the former link source) must also succeed.
         try store.deletePage(id: a.id)
-        #expect(try store.listPages().isEmpty)
+        #expect(try store.listPages(sortBy: .lastUpdated).isEmpty)
     }
 }

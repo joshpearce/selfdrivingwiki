@@ -66,7 +66,7 @@ public enum PageCommand {
     // MARK: - list
 
     private static func list(in store: WikiStore, json: Bool) throws -> Result {
-        let summaries = try store.listPages()
+        let summaries = try store.listPages(sortBy: .lastUpdated)
         if json {
             let rows = summaries.map { summary in
                 JSONRow(

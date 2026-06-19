@@ -68,7 +68,7 @@ struct SQLiteWikiStoreTests {
         #expect(userVersion == "6")
         let reopened = try SQLiteWikiStore(databaseURL: url)
         // If bootstrap weren't guarded, the CREATE TABLE would throw here.
-        #expect((try? reopened.listPages()) != nil)
+        #expect((try? reopened.listPages(sortBy: .lastUpdated)) != nil)
         _ = store  // keep first store alive through the test
     }
 
@@ -97,9 +97,51 @@ struct SQLiteWikiStoreTests {
         let b = try store.createPage(title: "B")
         // Touch A last so it should sort first.
         try store.updatePage(id: a.id, title: "A", body: "later edit")
-        let summaries = try store.listPages()
+        let summaries = try store.listPages(sortBy: .lastUpdated)
         #expect(summaries.first?.id == a.id)
         #expect(summaries.contains { $0.id == b.id })
+    }
+
+    @Test func listPagesOrdersByNewestFirst() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        // Insert a tiny sleep so the two pages get distinct created_at timestamps.
+        let a = try store.createPage(title: "A")
+        Thread.sleep(forTimeInterval: 0.002)
+        let b = try store.createPage(title: "B")
+        // B was created later, so it should sort first under newestFirst.
+        let summaries = try store.listPages(sortBy: .newestFirst)
+        #expect(summaries.first?.id == b.id)
+        #expect(summaries.last?.id == a.id)
+    }
+
+    @Test func listPagesOrdersByTitleAZ() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        _ = try store.createPage(title: "Banana")
+        _ = try store.createPage(title: "apple")
+        _ = try store.createPage(title: "Cherry")
+        let summaries = try store.listPages(sortBy: .titleAZ)
+        // Case-insensitive: "apple" < "Banana" < "Cherry"
+        #expect(summaries.map(\.title) == ["apple", "Banana", "Cherry"])
+    }
+
+    @Test func listPagesDefaultIsLastUpdated() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        let a = try store.createPage(title: "A")
+        _ = try store.createPage(title: "B")
+        try store.updatePage(id: a.id, title: "A", body: "later edit")
+        // The explicit .lastUpdated call must match the existing ordering expectation.
+        let summaries = try store.listPages(sortBy: .lastUpdated)
+        #expect(summaries.count == 2)
+        #expect(summaries.first?.id == a.id)
+    }
+
+    @Test func pageSortOrderAllCases() {
+        // Guard against accidental reorder / removal.
+        let cases = PageSortOrder.allCases
+        #expect(cases.count == 3)
+        #expect(cases.contains(.lastUpdated))
+        #expect(cases.contains(.newestFirst))
+        #expect(cases.contains(.titleAZ))
     }
 
     // MARK: - Change token (Phase 3 sync anchor)
