@@ -17,8 +17,7 @@ let package = Package(
         // running app (SWIFTUI-RULES §9.1 — model logic in its own target).
         .target(
             name: "WikiFSCore",
-            path: "Sources/WikiFSCore",
-            linkerSettings: [.linkedFramework("NaturalLanguage")]
+            path: "Sources/WikiFSCore"
         ),
         .executableTarget(
             name: "WikiFS",
