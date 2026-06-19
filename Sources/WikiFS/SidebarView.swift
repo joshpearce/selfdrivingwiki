@@ -17,6 +17,11 @@ struct SidebarView: View {
     @State private var showingAddFromURL = false
     /// Drives the "Add from Zotero…" sheet (browse the library → ingested file).
     @State private var showingAddFromZotero = false
+    /// Whether the "Pages" section is expanded. Pure UI state — not persisted.
+    @State private var isPagesExpanded = true
+    @State private var isToolsExpanded = true
+    @State private var isSystemExpanded = true
+    @State private var isFilesExpanded = true
 
     var body: some View {
         List(selection: $store.selection) {
@@ -25,63 +30,142 @@ struct SidebarView: View {
             WikiSwitcher(manager: manager)
                 .listRowSeparator(.hidden)
 
-            Section("Tools") {
-                SidebarModeRow(
-                    title: "Query",
-                    subtitle: "Ask or update",
-                    systemImage: "bubble.left.and.text.bubble.right"
-                )
-                .tag(WikiSelection.query)
-                .help("Ask questions and decide whether Claude should update the wiki")
+            Section {
+                if isToolsExpanded {
+                    SidebarModeRow(
+                        title: "Query",
+                        subtitle: "Ask or update",
+                        systemImage: "bubble.left.and.text.bubble.right"
+                    )
+                    .tag(WikiSelection.query)
+                    .help("Ask questions and decide whether Claude should update the wiki")
+                }
+            } header: {
+                HStack(spacing: 4) {
+                    Image(systemName: isToolsExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Tools")
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isToolsExpanded.toggle()
+                    }
+                }
             }
 
-            Section("System") {
-                SidebarModeRow(
-                    title: "Activity",
-                    subtitle: "Operation log",
-                    systemImage: "clock.arrow.circlepath"
-                )
-                .tag(WikiSelection.changeLog)
-                .help("Operation history, projected read-only as log.md")
+            Section {
+                if isSystemExpanded {
+                    SidebarModeRow(
+                        title: "Activity",
+                        subtitle: "Operation log",
+                        systemImage: "clock.arrow.circlepath"
+                    )
+                    .tag(WikiSelection.changeLog)
+                    .help("Operation history, projected read-only as log.md")
 
-                SidebarModeRow(
-                    title: "Instructions",
-                    subtitle: "Agent prompt",
-                    systemImage: "sparkles"
-                )
-                .tag(WikiSelection.systemPrompt)
-                .help("Agent instructions, projected read-only as CLAUDE.md and AGENTS.md")
+                    SidebarModeRow(
+                        title: "Instructions",
+                        subtitle: "Agent prompt",
+                        systemImage: "sparkles"
+                    )
+                    .tag(WikiSelection.systemPrompt)
+                    .help("Agent instructions, projected read-only as CLAUDE.md and AGENTS.md")
+                }
+            } header: {
+                HStack(spacing: 4) {
+                    Image(systemName: isSystemExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("System")
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isSystemExpanded.toggle()
+                    }
+                }
             }
 
-            Section("Pages") {
-                ForEach(store.summaries) { summary in
-                    SidebarPageRow(summary: summary)
-                        .tag(WikiSelection.page(summary.id))
-                        .contextMenu {
-                            Button("Rename") { beginRename(summary) }
-                            Button("Delete", role: .destructive) { store.delete(summary.id) }
+            Section {
+                if isPagesExpanded {
+                    ForEach(store.summaries) { summary in
+                        SidebarPageRow(summary: summary)
+                            .tag(WikiSelection.page(summary.id))
+                            .contextMenu {
+                                Button("Rename") { beginRename(summary) }
+                                Button("Delete", role: .destructive) { store.delete(summary.id) }
+                            }
+                            .swipeActions(edge: .trailing) {
+                                Button("Delete", role: .destructive) { store.delete(summary.id) }
+                            }
+                    }
+                }
+            } header: {
+                HStack(spacing: 0) {
+                    HStack(spacing: 4) {
+                        Image(systemName: isPagesExpanded ? "chevron.down" : "chevron.right")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("Pages")
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            isPagesExpanded.toggle()
                         }
-                        .swipeActions(edge: .trailing) {
-                            Button("Delete", role: .destructive) { store.delete(summary.id) }
-                        }
+                    }
+                    Spacer()
+                    Picker("Sort", selection: $store.pageSortOrder) {
+                        Text("Last Updated").tag(PageSortOrder.lastUpdated)
+                        Text("Newest First").tag(PageSortOrder.newestFirst)
+                        Text("Title A–Z").tag(PageSortOrder.titleAZ)
+                    }
+                    .pickerStyle(.menu)
+                    .buttonStyle(.borderless)
+                    .labelsHidden()
+                    .fixedSize()
+                    .help("Sort pages by date or title")
                 }
             }
             // Files are most-recently-added first (the store orders by created_at
             // DESC). Selecting one opens a detail pane with direct ingest controls.
             if !store.ingestedFiles.isEmpty {
                 Section {
-                    ForEach(store.ingestedFiles) { file in
-                        IngestedFileRow(
-                            file: file,
-                            hasBeenIngested: store.hasIngestedFile(file),
-                            onOpen: { Task { await fileProvider.openIngestedFile(id: file.id) } },
-                            onRemove: { store.deleteIngestedFile(file.id) }
-                        )
-                        .tag(WikiSelection.ingestedFile(file.id))
+                    if isFilesExpanded {
+                        ForEach(store.ingestedFiles) { file in
+                            IngestedFileRow(
+                                file: file,
+                                hasBeenIngested: store.hasIngestedFile(file),
+                                onOpen: { Task { await fileProvider.openIngestedFile(id: file.id) } },
+                                onRemove: { store.deleteIngestedFile(file.id) }
+                            )
+                            .tag(WikiSelection.ingestedFile(file.id))
+                        }
                     }
                 } header: {
-                    HStack {
-                        Text("Files")
+                    HStack(spacing: 0) {
+                        HStack(spacing: 4) {
+                            Image(systemName: isFilesExpanded ? "chevron.down" : "chevron.right")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text("Files")
+                                .font(.headline)
+                                .foregroundStyle(.primary)
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                isFilesExpanded.toggle()
+                            }
+                        }
                         Spacer()
                         if isZoteroConfigured {
                             Button("Add from Zotero…", systemImage: "books.vertical") {

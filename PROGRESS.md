@@ -2,6 +2,15 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-18 — Collapsible sidebar sections + page sort order
+
+All four sidebar sections (Tools, System, Pages, Files) are now collapsible via
+chevron toggles. The Pages section gains a sort Picker: Last Updated, Newest
+First, Title A–Z. `WikiPageSummary` now carries `createdAt`. `WikiStore.listPages()`
+accepts a `PageSortOrder` parameter; `WikiStoreModel` holds the user's preference
+and `currentStateSnapshot()` always passes `.lastUpdated` so the agent prompt is
+stable regardless of sidebar sort. 441 tests green. PR #12.
+
 ## 2026-06-18 — PDF extraction pipeline: PdfExtractionService + pdf2md integration
 
 Add pdf2md to integrate docling/granite-docling VLM/spacy pipeline to convert PDF to markdown without going through Claude.  Refactor the ingestion UI to show PDF conversion and ingestion results.

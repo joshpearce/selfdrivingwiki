@@ -15,6 +15,13 @@ import Observation
 @Observable
 public final class WikiStoreModel {
     public private(set) var summaries: [WikiPageSummary] = []
+    /// Sort order for the sidebar pages list. Changing this triggers a reload.
+    public var pageSortOrder: PageSortOrder = .lastUpdated {
+        didSet {
+            guard pageSortOrder != oldValue else { return }
+            reloadSummaries()
+        }
+    }
     /// The sidebar selection: a page, the system-prompt document, or nothing.
     public var selection: WikiSelection?
     public private(set) var backStack: [WikiSelection] = []
@@ -520,7 +527,7 @@ public final class WikiStoreModel {
     /// read failure degrades to an emptier-but-valid snapshot rather than blocking
     /// the run.
     public func currentStateSnapshot() -> WikiStateSnapshot {
-        let titles = ((try? store.listPages()) ?? []).map(\.title)
+        let titles = ((try? store.listPages(sortBy: .lastUpdated)) ?? []).map(\.title)
         let indexBody = (try? store.getWikiIndex())?.body ?? WikiIndex.defaultBody
         let logEntries = (try? store.recentLogEntries(limit: WikiStateSnapshot.maxLogEntries)) ?? []
         // Render each tail entry with the SAME formatter the `log.md` projection
@@ -565,8 +572,12 @@ public final class WikiStoreModel {
         pruneHistoryToCurrentStore()
     }
 
-    private func reloadSummaries() {
-        summaries = (try? store.listPages()) ?? []
+    /// Rebuild the sidebar page list from the store using the current sort order.
+    /// Public so `SidebarView` can trigger a reload when the sort picker changes
+    /// (via the `pageSortOrder` didSet), and so the Phase A change bridge can
+    /// refresh after an external write.
+    public func reloadSummaries() {
+        summaries = (try? store.listPages(sortBy: pageSortOrder)) ?? []
     }
 
     private func reloadIngestedFiles() {

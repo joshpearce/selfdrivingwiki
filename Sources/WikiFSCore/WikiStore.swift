@@ -23,8 +23,8 @@ public enum WikiStoreError: Error, CustomStringConvertible {
 /// implementation is the source of truth; the Phase 2 File Provider extension
 /// will adopt a read-only subset (`WikiReadStore`) of this.
 public protocol WikiStore {
-    /// Page summaries ordered by `updated_at` DESC (most-recently-edited first).
-    func listPages() throws -> [WikiPageSummary]
+    /// Page summaries ordered by the given sort criterion.
+    func listPages(sortBy: PageSortOrder) throws -> [WikiPageSummary]
     func getPage(id: PageID) throws -> WikiPage
     func createPage(title: String) throws -> WikiPage
     func updatePage(id: PageID, title: String, body: String) throws

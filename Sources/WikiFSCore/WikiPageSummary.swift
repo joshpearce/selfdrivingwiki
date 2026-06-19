@@ -7,10 +7,12 @@ public struct WikiPageSummary: Identifiable, Hashable, Sendable {
     public let id: PageID
     public let title: String
     public let updatedAt: Date
+    public let createdAt: Date
 
-    public init(id: PageID, title: String, updatedAt: Date) {
+    public init(id: PageID, title: String, updatedAt: Date, createdAt: Date) {
         self.id = id
         self.title = title
         self.updatedAt = updatedAt
+        self.createdAt = createdAt
     }
 }

@@ -253,17 +253,27 @@ public final class SQLiteWikiStore: WikiStore {
 
     // MARK: - WikiStore
 
-    public func listPages() throws -> [WikiPageSummary] {
-        let stmt = try statement(
-            "SELECT id, title, updated_at FROM pages ORDER BY updated_at DESC;"
-        )
+    public func listPages(sortBy: PageSortOrder) throws -> [WikiPageSummary] {
+        let orderClause: String
+        switch sortBy {
+        case .lastUpdated:
+            orderClause = "ORDER BY updated_at DESC"
+        case .newestFirst:
+            orderClause = "ORDER BY created_at DESC"
+        case .titleAZ:
+            orderClause = "ORDER BY title COLLATE NOCASE ASC"
+        }
+
+        let sql = "SELECT id, title, updated_at, created_at FROM pages \(orderClause);"
+        let stmt = try statement(sql)
         defer { stmt.reset() }
         var out: [WikiPageSummary] = []
         while try stmt.step() {
             out.append(WikiPageSummary(
                 id: PageID(rawValue: stmt.text(at: 0)),
                 title: stmt.text(at: 1),
-                updatedAt: Date(timeIntervalSince1970: stmt.double(at: 2))
+                updatedAt: Date(timeIntervalSince1970: stmt.double(at: 2)),
+                createdAt: Date(timeIntervalSince1970: stmt.double(at: 3))
             ))
         }
         return out

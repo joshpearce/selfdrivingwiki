@@ -160,7 +160,7 @@ struct WikiCtlCommandTests {
         let id = PageID(rawValue: created.output)
         let result = try PageCommand.run(.delete(id: id), in: store)
         #expect(result.didCommit)
-        #expect(try store.listPages().isEmpty)
+        #expect(try store.listPages(sortBy: .lastUpdated).isEmpty)
     }
 
     // MARK: - Darwin notification naming
