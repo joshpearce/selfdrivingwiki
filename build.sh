@@ -170,6 +170,13 @@ if [ "${REAL_SIGNING}" = "1" ]; then
     "${HELPERS_DIR}/${CTL_NAME}"
   codesign --force --timestamp=none --sign "${IDENTITY}" \
     "${HELPERS_DIR}/vec0.dylib"
+  # pdf2md is a plain script bundled in Helpers/ — must also be signed, or the
+  # outer app's seal fails ("code object is not signed at all"). The ad-hoc
+  # branch already signs it; the real-signing branch did not.
+  if [ -f "${HELPERS_DIR}/${PDF2MD_NAME}" ]; then
+    codesign --force --timestamp=none --sign "${IDENTITY}" \
+      "${HELPERS_DIR}/${PDF2MD_NAME}"
+  fi
   echo "→ codesign appex (${IDENTITY})"
   codesign --force --timestamp=none --sign "${IDENTITY}" \
     --entitlements "${EXT_ENTITLEMENTS}" \
