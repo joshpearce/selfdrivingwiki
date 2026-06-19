@@ -498,6 +498,44 @@ public final class WikiStoreModel {
         }
     }
 
+    /// Import every `.md` / `.markdown` file in `directory` (recursively) as an
+    /// ingested file — a one-shot migration of an Obsidian vault, LogSeq graph, or
+    /// any folder of Markdown notes. Hidden files/directories are skipped.
+    /// Duplicate filenames get a disambiguating suffix (`Note.md`, `Note-1.md`, …).
+    ///
+    /// All files land via the shared `store.ingestFile(filename:data:)` seam —
+    /// exactly the same path as drag-drop, URL fetch, and Zotero ingest.
+    ///
+    /// - Returns: `(imported: count, errors: [localized messages])`.
+    public func importFromMarkdownFolder(directory: URL) async -> (imported: Int, errors: [String]) {
+        let result = await Task.detached(priority: .userInitiated) {
+            MarkdownFolderReader.walk(
+                directory: directory,
+                fileOps: MarkdownFolderReader.FileManagerFileOperations()
+            )
+        }.value
+
+        var imported = 0
+        var errorMessages: [String] = []
+
+        for file in result.files {
+            do {
+                _ = try store.ingestFile(filename: file.filename, data: file.data)
+                imported += 1
+            } catch {
+                errorMessages.append("\(file.filename): \(error.localizedDescription)")
+            }
+        }
+        for walkError in result.errors {
+            errorMessages.append(walkError.errorDescription
+                ?? "\(walkError.path): unknown error")
+        }
+
+        reloadIngestedFiles()
+        onPageDidChange?()
+        return (imported: imported, errors: errorMessages)
+    }
+
     /// Remove an ingested file from the list and the store, then signal so the
     /// `files/` tree drops it.
     public func deleteIngestedFile(_ id: PageID) {

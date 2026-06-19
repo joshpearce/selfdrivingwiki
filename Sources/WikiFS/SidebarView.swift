@@ -11,20 +11,57 @@ struct SidebarView: View {
     @Bindable var manager: WikiManager
     /// Used to open an ingested file in its default app via its user-visible URL.
     let fileProvider: FileProviderSpike
+    /// Callback when the user clicks "Ingest N Files" in batch mode.
+    var onBatchIngest: (([PageID]) -> Void)? = nil
+    /// Files currently being ingested — shows a spinner on those rows.
+    var ingestingFileIDs: Set<PageID> = []
+
     @State private var renameTarget: WikiPageSummary?
     @State private var renameText: String = ""
     /// Drives the "Add from URL…" sheet (fetch a URL → ingested file).
     @State private var showingAddFromURL = false
     /// Drives the "Add from Zotero…" sheet (browse the library → ingested file).
     @State private var showingAddFromZotero = false
+    /// Drives the "Import Markdown Folder…" sheet (recursively import .md files).
+    @State private var showingImportMarkdown = false
     /// Whether the "Pages" section is expanded. Pure UI state — not persisted.
     @State private var isPagesExpanded = true
     @State private var isToolsExpanded = true
     @State private var isSystemExpanded = true
     @State private var isFilesExpanded = true
 
+    // MARK: - File filter & batch select
+
+    @State private var fileFilter: FileFilter = .all
+    /// Native multi-select binding for the List — supports Shift+Arrow,
+    /// Shift+Click, and Command+Click. Synced to `store.selection` for
+    /// single-item navigation.
+    @State private var listSelection: Set<WikiSelection> = []
+
+    /// File IDs currently selected in the list (extracted from listSelection).
+    private var selectedFileIDs: Set<PageID> {
+        Set(listSelection.compactMap { sel in
+            if case .ingestedFile(let id) = sel { return id }
+            return nil
+        })
+    }
+
+    private enum FileFilter: String, CaseIterable {
+        case all = "All"
+        case ready = "Ready"
+        case ingested = "Ingested"
+    }
+
+    private var filteredFiles: [IngestedFileSummary] {
+        switch fileFilter {
+        case .all: return store.ingestedFiles
+        case .ready: return store.ingestedFiles.filter { !store.hasIngestedFile($0) }
+        case .ingested: return store.ingestedFiles.filter { store.hasIngestedFile($0) }
+        }
+    }
+
     var body: some View {
-        List(selection: $store.selection) {
+        List(selection: $listSelection) {
             // The wiki switcher — the top-level container switch (which knowledge
             // base am I in). No `.tag`, so it never feeds the page selection.
             WikiSwitcher(manager: manager)
@@ -172,12 +209,19 @@ struct SidebarView: View {
             if !store.ingestedFiles.isEmpty {
                 Section {
                     if isFilesExpanded {
-                        ForEach(store.ingestedFiles) { file in
+                        let files = filteredFiles
+                        ForEach(files) { file in
                             IngestedFileRow(
                                 file: file,
                                 hasBeenIngested: store.hasIngestedFile(file),
+                                isIngesting: ingestingFileIDs.contains(file.id),
+                                isSelected: selectedFileIDs.contains(file.id),
                                 onOpen: { Task { await fileProvider.openIngestedFile(id: file.id) } },
-                                onRemove: { store.deleteIngestedFile(file.id) }
+                                onRemove: { store.deleteIngestedFile(file.id) },
+                                onIngestSelected: selectedFileIDs.isEmpty ? nil : {
+                                    let ids = Array(selectedFileIDs)
+                                    onBatchIngest?(ids)
+                                }
                             )
                             .tag(WikiSelection.ingestedFile(file.id))
                         }
@@ -199,20 +243,24 @@ struct SidebarView: View {
                             }
                         }
                         Spacer()
-                        if isZoteroConfigured {
-                            Button("Add from Zotero…", systemImage: "books.vertical") {
-                                showingAddFromZotero = true
+                        if !selectedFileIDs.isEmpty {
+                            Button("Ingest Selected") {
+                                let ids = Array(selectedFileIDs)
+                                onBatchIngest?(ids)
                             }
-                            .labelStyle(.iconOnly)
-                            .buttonStyle(.borderless)
-                            .help("Browse your Zotero library and ingest a PDF or Markdown attachment")
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
                         }
-                        Button("Add from URL…", systemImage: "link.badge.plus") {
-                            showingAddFromURL = true
+                        Picker("Filter", selection: $fileFilter) {
+                            ForEach(FileFilter.allCases, id: \.self) { filter in
+                                Text(filter.rawValue).tag(filter)
+                            }
                         }
-                        .labelStyle(.iconOnly)
+                        .pickerStyle(.menu)
                         .buttonStyle(.borderless)
-                        .help("Fetch a web page or PDF by URL and ingest it")
+                        .labelsHidden()
+                        .fixedSize()
+                        .help("Filter files by ingest status")
                     }
                 }
             }
@@ -220,6 +268,18 @@ struct SidebarView: View {
         .listStyle(.inset)
         .scrollContentBackground(.hidden)
         .navigationTitle(activeWikiName)
+        .onChange(of: listSelection) { _, newValue in
+            // Forward single-item selection to the store for detail navigation.
+            if newValue.count == 1, let first = newValue.first {
+                store.selection = first
+            }
+        }
+        .onChange(of: store.selection) { _, newValue in
+            // Programmatic navigation (back/forward) updates the list.
+            if let sel = newValue, !listSelection.contains(sel) {
+                listSelection = [sel]
+            }
+        }
         .navigationSplitViewColumnWidth(
             min: PageEditorMetrics.sidebarMinWidth,
             ideal: PageEditorMetrics.sidebarIdealWidth
@@ -240,6 +300,12 @@ struct SidebarView: View {
                 .help("Fetch a web page or PDF by URL and ingest it into this wiki")
             }
             ToolbarItem {
+                Button("Import Markdown Folder…", systemImage: "doc.badge.plus") {
+                    showingImportMarkdown = true
+                }
+                .help("Import all .md files from a folder as source material")
+            }
+            ToolbarItem {
                 Button("New Page", systemImage: "plus") { store.newPage() }
             }
             ToolbarItem {
@@ -254,6 +320,9 @@ struct SidebarView: View {
         }
         .sheet(isPresented: $showingAddFromZotero) {
             AddFromZoteroSheet(store: store, containerDirectory: zoteroContainerDirectory)
+        }
+        .sheet(isPresented: $showingImportMarkdown) {
+            ImportMarkdownSheet(store: store)
         }
         .alert("Rename Page", isPresented: renamePresented) {
             TextField("Title", text: $renameText)

@@ -12,10 +12,22 @@ import WikiFSCore
 /// names (`AgentStaging`), the tiny-vs-non-tiny decision (`IngestPlan.decide`), and
 /// the prompts (`WikiOperation`) — are all unit-tested in the core.
 enum OperationRequest {
-  /// Ingest one source. `sourceBytes` are the verbatim bytes read from SQLite (NOT
-  /// the mount); `ext` is the source's lowercased extension; `sourcePath` is the
-  /// mount-relative reference path; `stateMarkdown` is the rendered `WIKI_STATE.md`.
-  case ingest(sourceBytes: Data, ext: String, sourcePath: String, stateMarkdown: String)
+  /// One source for ingest: raw bytes + extension + mount-relative display path.
+  struct StagedSource: Equatable, Sendable {
+    let bytes: Data
+    let ext: String         // lowercased, e.g. "md", "pdf"
+    let displayPath: String  // mount-relative, e.g. "files/by-id/<ulid>.md"
+
+    init(bytes: Data, ext: String, displayPath: String) {
+      self.bytes = bytes
+      self.ext = ext
+      self.displayPath = displayPath
+    }
+  }
+
+  /// Ingest one or more sources in a single agent run. `stateMarkdown` is the
+  /// rendered `WIKI_STATE.md`.
+  case ingest(sources: [StagedSource], stateMarkdown: String)
 
   /// Answer a question. `stateMarkdown` is the rendered `WIKI_STATE.md`.
   case query(question: String, stateMarkdown: String)
@@ -25,18 +37,20 @@ enum OperationRequest {
 
   /// Stage this request's inputs into `scratch` and return the finalized
   /// `WikiOperation`. Writes `WIKI_STATE.md` (always) and, for Ingest, the raw
-  /// `source.<ext>`; the Ingest plan (single Opus pass vs Opus curator + Sonnet
-  /// `source-reader` digesters) is decided from the staged source's byte size. Throws
-  /// if a write fails.
+  /// `source-1.<ext>`, `source-2.<ext>`, …; the Ingest plan (single Opus pass vs
+  /// Opus curator + Sonnet `source-reader` digesters) is decided from the total
+  /// staged byte size. Throws if a write fails.
   func stage(into scratch: URL) throws -> WikiOperation {
     switch self {
-    case .ingest(let sourceBytes, let ext, let sourcePath, let stateMarkdown):
+    case .ingest(let sources, let stateMarkdown):
       let stateFilePath = try AgentStaging.stageStateFile(stateMarkdown, in: scratch)
-      let stagedSourcePath = try AgentStaging.stageSource(sourceBytes, ext: ext, in: scratch)
-      let plan = IngestPlan.decide(sourceByteSize: sourceBytes.count)
+      let stagedSourcePaths = try AgentStaging.stageSources(
+        sources.map { ($0.bytes, $0.ext) }, in: scratch)
+      let totalBytes = sources.reduce(0) { $0 + $1.bytes.count }
+      let plan = IngestPlan.decide(sourceByteSize: totalBytes)
       return .ingest(
-        sourcePath: sourcePath,
-        stagedSourcePath: stagedSourcePath,
+        sourcePaths: sources.map(\.displayPath),
+        stagedSourcePaths: stagedSourcePaths,
         stateFilePath: stateFilePath,
         plan: plan)
 

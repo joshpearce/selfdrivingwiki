@@ -43,6 +43,7 @@ with a plain-folder export, even though that would dodge the signing requirement
 | [`plans/zotero-integration.md`](plans/zotero-integration.md) | browse a Zotero library from inside the app, ingest PDF/Markdown attachments through the existing ingest pipeline. |
 | [`plans/pdf-extraction.md`](plans/pdf-extraction.md) | Add docling + granite-docling pipeline. A `pdf2md` CLI converts PDFs to markdown at ingest time; extracted markdown stored as a sibling `ingested_files` row, projected on the mount. Agent prefers `.md` siblings, falls back to `Read` on the original. |
 | [`plans/semantic-search.md`](plans/semantic-search.md) | Semantic (meaning-based) search over pages using sqlite-vec + Apple NLEmbedding. Embedding at save time, cosine-similarity ranking inside SQLite, search bar in the sidebar, `wikictl search` for the agent. v7 migration. |
+| [`plans/markdown-folder-import.md`](plans/markdown-folder-import.md) | Import an entire folder of Markdown files (Obsidian vault, LogSeq graph, or any `.md` directory) as source material. Recursive walk, .md filter, filename dedup; lands files in `ingested_files` for the agent to curate via Ingest. |
 | [`SWIFTUI-RULES.md`](SWIFTUI-RULES.md) | Hard-won SwiftUI/macOS rules. Apply when writing or reviewing any view. |
 | [`CLAUDE.md`](CLAUDE.md) | Working agreement (docs, skills to use, PR rules). |
 | [`ISSUES.md`](ISSUES.md) | Known limitations we've chosen to live with (with context to revisit), e.g. the ~5s replicated-File-Provider read-after-write window. |
@@ -63,7 +64,18 @@ features below are merged to `main` (single-branch repo, ready for developer
 handoff). 341 tests green; clean signed bundle (app + appex + `wikictl`).**
 
 **Post-completion features (also on `main`):**
-- **Wiki backup/restore management** — the wiki switcher can rename the active
+- **File filter + batch ingest** — the Files section has a filter picker
+  (All / Ready / Ingested) and a "Select…" button that enables batch mode with
+  checkboxes. Selected files are ingested in a SINGLE agent run — all sources staged
+  together so the agent cross-references and synthesizes holistically. The ingest
+  pipeline was generalized from one source → N sources (`WikiOperation.ingest`,
+  `AgentStaging.stageSources`, `AgentOperationRunner.runMultiIngest`).
+- **Import Markdown Folder** — a one-shot "Import Markdown Folder…" action that
+  recursively walks a directory of `.md` / `.markdown` files (Obsidian vault, LogSeq
+  graph, or any folder) and lands them in `ingested_files` for the agent to curate
+  via Ingest. Hidden files/dirs are skipped; duplicate filenames get a disambiguating
+  suffix. `MarkdownFolderReader` (pure core) + `ImportMarkdownSheet` (phase-enum UI).
+  26 new tests. See `plans/markdown-folder-import.md`.
   wiki, export its checkpointed standalone SQLite file, and import a SQLite wiki
   backup under a new display name/new ULID. Rename refreshes the File Provider
   display name while preserving identity; export refuses to overwrite its source.

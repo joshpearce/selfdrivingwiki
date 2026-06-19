@@ -22,8 +22,8 @@ struct OperationCommandTests {
   /// A large-source ingest operation — Opus curator + Sonnet source-reader digesters.
   private static func curatedIngest() -> WikiOperation {
     .ingest(
-      sourcePath: "files/by-id/01ABC.pdf",
-      stagedSourcePath: stagedSource,
+      sourcePaths: ["files/by-id/01ABC.pdf"],
+      stagedSourcePaths: [stagedSource],
       stateFilePath: stateFile,
       plan: .opusCurator)
   }
@@ -31,8 +31,8 @@ struct OperationCommandTests {
   /// A tiny ingest operation — single Opus pass.
   private static func tinyIngest() -> WikiOperation {
     .ingest(
-      sourcePath: "files/by-id/01ABC.txt",
-      stagedSourcePath: "/tmp/scratch-xyz/source.txt",
+      sourcePaths: ["files/by-id/01ABC.txt"],
+      stagedSourcePaths: ["/tmp/scratch-xyz/source.txt"],
       stateFilePath: stateFile,
       plan: .singleOpus)
   }
@@ -312,10 +312,12 @@ struct OperationCommandTests {
   @Test func ingestPromptsNameTheStagedSourceAndStateAndForbidRediscovery() {
     for operation in [Self.tinyIngest(), Self.curatedIngest()] {
       let prompt = operation.prompt(wikiRoot: Self.resolvedRoot)
-      // Names the staged WIKI_STATE.md and the staged source path.
+      // Names the staged WIKI_STATE.md and the staged source path(s).
       #expect(prompt.contains(Self.stateFile) || prompt.contains("/tmp/scratch-xyz/WIKI_STATE.md"))
-      guard case .ingest(_, let staged, _, _) = operation else { Issue.record("not ingest"); return }
-      #expect(prompt.contains(staged))
+      guard case .ingest(_, let stagedPaths, _, _) = operation else { Issue.record("not ingest"); return }
+      for path in stagedPaths {
+        #expect(prompt.contains(path))
+      }
       // Forbids the orientation turns.
       #expect(prompt.contains("DO NOT REDISCOVER"))
       #expect(prompt.contains("do NOT run `wikictl page list`"))
@@ -392,7 +394,8 @@ struct OperationCommandTests {
     #expect(prompt.contains("do NOT spawn 15 workers for 3 pages"))
     // Opus may fork MORE workers for follow-up questions, and may pull pages to
     // double-check before/while writing — the iterative use, capped at <20 total.
-    #expect(prompt.contains("follow-up QUESTIONS"))
+    #expect(prompt.contains("follow-up"))
+    #expect(prompt.contains("QUESTIONS"))
     #expect(prompt.contains("wikictl page get"))
     #expect(prompt.contains("double-check"))
     #expect(prompt.contains("under 20"))

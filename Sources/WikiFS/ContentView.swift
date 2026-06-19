@@ -21,7 +21,9 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(store: store, manager: manager, fileProvider: fileProvider)
+            SidebarView(store: store, manager: manager, fileProvider: fileProvider,
+                        onBatchIngest: batchIngest,
+                        ingestingFileIDs: agentLauncher.ingestingFileIDs)
         } detail: {
             HStack(spacing: 0) {
                 WikiDetailView(
@@ -127,8 +129,8 @@ struct ContentView: View {
         // Auto-open the transcript the moment an ingest starts — even during the
         // PDF-conversion phase, before the agent process spawns — so the
         // conversion box is visible.
-        .onChange(of: agentLauncher.ingestingFileID) { _, newValue in
-            if newValue != nil && !isQuerySelected {
+        .onChange(of: agentLauncher.ingestingFileIDs) { _, newValue in
+            if !newValue.isEmpty && !isQuerySelected {
                 isTranscriptExpanded = true
             }
         }
@@ -137,13 +139,13 @@ struct ContentView: View {
     /// The agent is doing work — running, or in the local PDF-conversion phase of
     /// an ingest (which precedes the agent process). Drives the toolbar glow.
     private var agentBusy: Bool {
-        agentLauncher.isRunning || agentLauncher.ingestingFileID != nil
+        agentLauncher.isRunning || !agentLauncher.ingestingFileIDs.isEmpty
     }
 
     private var canShowTranscript: Bool {
         !isQuerySelected
             && (agentLauncher.isRunning
-                || agentLauncher.ingestingFileID != nil
+                || !agentLauncher.ingestingFileIDs.isEmpty
                 || !agentLauncher.events.isEmpty
                 || agentLauncher.preflightError != nil
                 || !agentLauncher.stderr.isEmpty)
@@ -171,6 +173,20 @@ struct ContentView: View {
             defer { agentLauncher.ingestTask = nil }
             await AgentOperationRunner.runIngest(
                 fileID: fileID,
+                launcher: agentLauncher,
+                store: store,
+                manager: manager,
+                fileProvider: fileProvider)
+        }
+        agentLauncher.ingestTask = task
+    }
+
+    private func batchIngest(fileIDs: [PageID]) {
+        DebugLog.ingest("ContentView.batchIngest: user pressed Ingest \(fileIDs.count) files")
+        let task = Task {
+            defer { agentLauncher.ingestTask = nil }
+            await AgentOperationRunner.runMultiIngest(
+                fileIDs: fileIDs,
                 launcher: agentLauncher,
                 store: store,
                 manager: manager,

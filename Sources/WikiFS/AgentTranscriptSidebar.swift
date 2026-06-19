@@ -36,7 +36,7 @@ struct AgentTranscriptSidebar: View {
     /// Show the local pdf2md conversion box only while THIS ingest is converting a
     /// PDF (or has just finished) — not for Markdown ingests, queries, or lints.
     private var showsConversion: Bool {
-        launcher.ingestingFileID != nil
+        !launcher.ingestingFileIDs.isEmpty
             && (launcher.isExtracting || !launcher.extractionLog.isEmpty)
     }
 
@@ -185,7 +185,7 @@ struct AgentTranscriptSidebar: View {
     /// conversion phase, before the agent process spawns). The Stop button stops
     /// whichever is active.
     private var isBusy: Bool {
-        launcher.isRunning || launcher.ingestingFileID != nil
+        launcher.isRunning || !launcher.ingestingFileIDs.isEmpty
     }
 }
 

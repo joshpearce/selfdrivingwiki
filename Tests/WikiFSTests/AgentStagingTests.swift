@@ -43,6 +43,44 @@ struct AgentStagingTests {
     #expect(try Data(contentsOf: URL(fileURLWithPath: sourcePath)) == Data("raw bytes".utf8))
   }
 
+  // MARK: - Multi-source staging
+
+  @Test func sourceFileNameWithIndex() {
+    #expect(AgentStaging.sourceFileName(ext: "md", index: 1) == "source-1.md")
+    #expect(AgentStaging.sourceFileName(ext: "pdf", index: 2) == "source-2.pdf")
+    #expect(AgentStaging.sourceFileName(ext: "", index: 3) == "source-3")
+    #expect(AgentStaging.sourceFileName(ext: ".txt", index: 10) == "source-10.txt")
+  }
+
+  @Test func stagesMultipleSourcesIntoScratch() throws {
+    let scratch = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: scratch) }
+
+    let sources: [(bytes: Data, ext: String)] = [
+      (Data("first".utf8), "md"),
+      (Data("second".utf8), "pdf"),
+    ]
+    let paths = try AgentStaging.stageSources(sources, in: scratch)
+
+    #expect(paths.count == 2)
+    #expect(paths[0] == scratch.appendingPathComponent("source-1.md").path)
+    #expect(paths[1] == scratch.appendingPathComponent("source-2.pdf").path)
+    #expect(try Data(contentsOf: URL(fileURLWithPath: paths[0])) == Data("first".utf8))
+    #expect(try Data(contentsOf: URL(fileURLWithPath: paths[1])) == Data("second".utf8))
+  }
+
+  @Test func stagesEmptySourcesListReturnsEmpty() throws {
+    let scratch = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: scratch) }
+
+    let paths = try AgentStaging.stageSources([], in: scratch)
+    #expect(paths.isEmpty)
+  }
+
   // MARK: - WIKI_STATE.md rendering
 
   @Test func stateFileRendersTitlesIndexAndLog() {

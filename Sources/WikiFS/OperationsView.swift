@@ -39,7 +39,7 @@ struct OperationsView: View {
     /// True while an ingest is in flight (its conversion or agent run). Query and
     /// Lint share one `AgentLauncher` and write the same wiki, so they must wait.
     private var isIngestBusy: Bool {
-        launcher.ingestingFileID != nil
+        !launcher.ingestingFileIDs.isEmpty
     }
 
     private var ingestBusyNotice: some View {
