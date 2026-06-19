@@ -283,13 +283,14 @@ public final class SQLiteWikiStore: WikiStore {
     /// extension loading on a throwaway connection so the module is available
     /// on every subsequent `sqlite3_load_extension` call across connections.
     /// Failure is non-fatal: logged, semantic search degrades to LIKE fallback.
-    /// Written before any concurrent access — `nonisolated(unsafe)` tells Swift 6
-    /// we accept responsibility for that invariant.
-    nonisolated(unsafe) private static var vecDylibPath: String?
-    nonisolated(unsafe) private static var vecLoadAttempted = false
+    private static let vecInitQueue = DispatchQueue(label: "wiki.vec.init")
+    nonisolated(unsafe) private static var _vecDylibPath: String?
+    nonisolated(unsafe) private static var _vecLoadAttempted = false
 
     private static func ensureVecExtensionLoaded() {
-        guard !vecLoadAttempted else { return }  // already attempted
+        vecInitQueue.sync {
+            guard !_vecLoadAttempted else { return }
+            _vecLoadAttempted = true
         // Production: dylib lives in Contents/Helpers/ (copied by build.sh).
         // Development (swift build / Xcode): the binary runs from a build
         // directory.  We walk up from the bundle URL to find the project
@@ -315,15 +316,15 @@ public final class SQLiteWikiStore: WikiStore {
         }
         for path in candidatePaths {
             if FileManager.default.fileExists(atPath: path) {
-                vecDylibPath = path
+                _vecDylibPath = path
                 break
             }
         }
-        vecLoadAttempted = true
-        guard vecDylibPath != nil else {
+        guard _vecDylibPath != nil else {
             FileHandle.standardError.write(Data("SQLiteWikiStore: vec0.dylib not found — semantic search disabled\n".utf8))
             return
         }
+        }  // end vecInitQueue.sync
         // Spin a throwaway connection just to enable extension loading once.
         var tmp: OpaquePointer?
         guard sqlite3_open(":memory:", &tmp) == SQLITE_OK, let tmp else { return }
@@ -340,7 +341,7 @@ public final class SQLiteWikiStore: WikiStore {
     /// symbols ARE present in the system libsqlite3.dylib — we resolve them
     /// via `dlsym(RTLD_DEFAULT)` so no experimental compiler flags are needed.
     private static func loadVecExtension(on db: OpaquePointer) {
-        guard let dylibPath = vecDylibPath else { return }
+        guard let dylibPath = _vecDylibPath else { return }
 
         typealias EnableFn = @convention(c) (OpaquePointer?, Int32) -> Int32
         typealias LoadFn = @convention(c) (
