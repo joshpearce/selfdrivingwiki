@@ -44,7 +44,7 @@ struct FileProviderSetupWarning: Identifiable, Sendable {
 }
 
 enum FileProviderSetupVerifier {
-    private static let providerID = "org.sockpuppet.WikiFS.FileProvider"
+    private static let providerID = WikiIdentifiers.fileProviderID
     private static let extensionName = "WikiFSFileProvider"
     private static let pluginKitURL = URL(fileURLWithPath: "/usr/bin/pluginkit")
 

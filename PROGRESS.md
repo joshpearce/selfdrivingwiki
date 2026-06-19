@@ -215,6 +215,51 @@ no regressions). Full build (debug) produces a clean signed bundle.
 
 See `plans/markdown-folder-import.md`.
 
+## 2026-06-19 — Parameterized signing for any Apple Developer account
+
+Signing was hardcoded to one developer's team. Bundle ids and App Groups are
+globally unique across App Store Connect, so nobody who clones can reuse them —
+signing is now parameterized, with per-developer values kept out of git. Full
+design + the asc/keychain runbook in `plans/signing.md` (§ Multi-developer
+signing).
+
+**Added**
+
+- `signing/local.config` (gitignored) + `signing/local.config.example` — single
+  source of truth for `TEAM_ID`/`DEV_IDENTITY`/`BUNDLE_ID`/`EXT_BUNDLE_ID`/
+  `APP_GROUP`. Absent → upstream defaults, so a fresh clone still builds +
+  ad-hoc signs unchanged.
+- `signing/setup.sh` — `asc`-driven provisioning (mint/discover cert, register
+  this Mac, create bundle ids + App Groups capability, create + download
+  profiles, write `local.config`). Pauses for the one portal step the API can't
+  do — creating + binding the App Group. Idempotent.
+- `Sources/WikiFSCore/WikiIdentifiers.swift` — resolves the ids at runtime
+  (env → `Bundle.main` Info.plist → `wiki-identifiers.env` sidecar → default),
+  so the app, the sandboxed extension, and the bundle-less `wikictl` all agree.
+
+**Changed**
+
+- `build.sh` sources `local.config`, generates both `.entitlements` into
+  `build/`, injects the ids into the Info.plists + the `wikictl` sidecar, and
+  signs with `SIGN_IDENTITY` → `DEV_IDENTITY` → ad-hoc. `Makefile` reads the
+  config via a `cfg` helper. `DatabaseLocation`/`FileProviderSetupVerifier`
+  delegate to `WikiIdentifiers`. Removed the committed `WikiFS/*.entitlements`
+  (now generated — they baked in one team).
+
+**Verified**
+
+- `swift test` → all 450 pass. End-to-end on a real paid account: `make run`
+  builds + signs with a dev cert, the File Provider extension loads, registers,
+  and its mount appears with projected pages. Requires full Xcode (not just the
+  Command Line Tools — the app's `swiftui-math` macros need Xcode.app).
+
+**Fixes found during bring-up**
+
+- The bundled `pdf2md` script wasn't signed in the real-signing path (only the
+  ad-hoc path was), so codesign rejected the unsigned file. Now signed.
+- The `wiki-identifiers.env` sidecar must live in `Contents/Resources/`, not the
+  code-only `Contents/Helpers/`.
+
 ## 2026-06-18 — Semantic search via sqlite-vec + NLEmbedding
 
 Added meaning-based search over wiki pages. sqlite-vec ranks by cosine similarity
