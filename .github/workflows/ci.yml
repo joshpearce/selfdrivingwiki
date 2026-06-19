@@ -11,12 +11,18 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Swift version
-        run: swift --version
+      - name: Environment
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --show-sdk-version
+          xcrun --show-sdk-path
+          which swift || echo "swift not in PATH"
+          swift --version || xcrun swift --version
       - name: Build
-        run: swift build
+        run: swift build || xcrun swift build
       - name: Test
-        run: swift test
+        run: swift test || xcrun swift test
 
   python:
     runs-on: ubuntu-latest
