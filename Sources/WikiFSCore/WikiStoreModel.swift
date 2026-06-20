@@ -621,7 +621,8 @@ public final class WikiStoreModel {
                 continue
             }
             do {
-                _ = try store.ingestFile(filename: filename, data: data)
+                _ = try store.ingestFile(
+                    filename: filename, data: data, zoteroItemKey: nil, zoteroItemTitle: nil)
                 didIngestAny = true
             } catch {
                 print("WikiStoreModel.ingest store failed for \(filename): \(error)")
@@ -660,7 +661,8 @@ public final class WikiStoreModel {
         // Pure dispatch decides the filename + bytes; we store directly on the main
         // actor (no @Sendable store closure crossing the actor boundary).
         let plan = URLIngestService.plan(for: response)
-        _ = try store.ingestFile(filename: plan.filename, data: plan.data)
+        _ = try store.ingestFile(
+            filename: plan.filename, data: plan.data, zoteroItemKey: nil, zoteroItemTitle: nil)
         reloadIngestedFiles()
         onPageDidChange?()
         return URLIngestService.IngestOutcome(
@@ -671,7 +673,8 @@ public final class WikiStoreModel {
     /// the bytes, rebuilds the list, and signals the daemon.
     public func ingestFile(filename: String, data: Data) {
         do {
-            _ = try store.ingestFile(filename: filename, data: data)
+            _ = try store.ingestFile(
+                filename: filename, data: data, zoteroItemKey: nil, zoteroItemTitle: nil)
             reloadIngestedFiles()
             onPageDidChange?()
         } catch {
@@ -680,14 +683,20 @@ public final class WikiStoreModel {
     }
 
     /// Ingest one Zotero attachment by reading its local file and storing the
-    /// verbatim bytes — exactly like a drag-dropped file. We already know the
-    /// filename and bytes from Zotero's metadata, so this goes straight to the
+    /// verbatim bytes — exactly like a drag-dropped file, but threading the
+    /// parent item's key + title into the row as provenance so the detail view
+    /// can show "From Zotero" and link back. We already know the filename and
+    /// bytes from Zotero's metadata, so this goes straight to the
     /// `ingestFile(filename:data:)` seam rather than `URLIngestService`'s
     /// content-type dispatch (that dispatch exists for the unknown-bytes-from-a-
     /// URL case, which doesn't apply here). No network fallback in v1: an
     /// attachment that isn't synced to `~/Zotero/storage` yet throws
     /// `ZoteroIngestError.unavailable` rather than downloading it.
-    public func ingestFromZotero(_ attachment: ZoteroAttachment, zoteroDir: URL) async throws {
+    public func ingestFromZotero(
+        _ attachment: ZoteroAttachment,
+        parentItem: ZoteroItem,
+        zoteroDir: URL
+    ) async throws {
         switch ZoteroLocalStorage.resolve(attachment, zoteroDir: zoteroDir) {
         case .local(let path):
             // Read off the main actor — same rationale as `ingest(fileURLs:)`:
@@ -695,7 +704,16 @@ public final class WikiStoreModel {
             let data = try await Task.detached(priority: .userInitiated) {
                 try Data(contentsOf: path)
             }.value
-            ingestFile(filename: path.lastPathComponent, data: data)
+            do {
+                _ = try store.ingestFile(
+                    filename: path.lastPathComponent, data: data,
+                    zoteroItemKey: parentItem.key, zoteroItemTitle: parentItem.title)
+                reloadIngestedFiles()
+                onPageDidChange?()
+            } catch {
+                print("WikiStoreModel.ingestFromZotero failed: \(error)")
+                throw error
+            }
         case .unavailable(let reason):
             throw ZoteroIngestError.unavailable(reason)
         }
@@ -723,7 +741,8 @@ public final class WikiStoreModel {
 
         for file in result.files {
             do {
-                _ = try store.ingestFile(filename: file.filename, data: file.data)
+                _ = try store.ingestFile(
+                    filename: file.filename, data: file.data, zoteroItemKey: nil, zoteroItemTitle: nil)
                 imported += 1
             } catch {
                 errorMessages.append("\(file.filename): \(error.localizedDescription)")

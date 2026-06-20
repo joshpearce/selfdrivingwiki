@@ -47,6 +47,41 @@ struct IngestedFilesTests {
         #expect(noExt.mimeType == nil)
     }
 
+    // MARK: - Zotero provenance (v8 → v9)
+
+    /// A drag-drop / URL ingest passes no Zotero provenance, so the two new
+    /// columns stay NULL and round-trip as nil through the read path.
+    @Test func ingestWithoutZoteroProvenanceRoundTripsNil() throws {
+        let store = try tempStore()
+        let summary = try store.ingestFile(
+            filename: "drop.pdf", data: Data("%PDF".utf8),
+            zoteroItemKey: nil, zoteroItemTitle: nil)
+        #expect(summary.zoteroItemKey == nil)
+        #expect(summary.zoteroItemTitle == nil)
+
+        let readBack = try store.getIngestedFile(id: summary.id)
+        #expect(readBack.zoteroItemKey == nil)
+        #expect(readBack.zoteroItemTitle == nil)
+
+        let listed = try store.listIngestedFiles()
+        #expect(listed.first?.zoteroItemKey == nil)
+        #expect(listed.first?.zoteroItemTitle == nil)
+    }
+
+    /// The Zotero seam writes the item key + title and they survive a read-back.
+    @Test func ingestWithZoteroProvenanceRoundTripsKeyAndTitle() throws {
+        let store = try tempStore()
+        let summary = try store.ingestFile(
+            filename: "paper.pdf", data: Data("%PDF".utf8),
+            zoteroItemKey: "ABC123", zoteroItemTitle: "A Study in Scarlet")
+        #expect(summary.zoteroItemKey == "ABC123")
+        #expect(summary.zoteroItemTitle == "A Study in Scarlet")
+
+        let readBack = try store.getIngestedFile(id: summary.id)
+        #expect(readBack.zoteroItemKey == "ABC123")
+        #expect(readBack.zoteroItemTitle == "A Study in Scarlet")
+    }
+
     // MARK: - Content is byte-identical (== and sha256)
 
     @Test func ingestedContentRoundTripsByteIdentical() throws {
@@ -165,7 +200,8 @@ struct IngestedFilesTests {
         #expect(page.title == "Kept")
         #expect(page.bodyMarkdown == "# kept")
 
-        // user_version is now 6 (migration runs through every step to head).
+        // user_version advances through every migration step to head (v9 after the
+        // v8→v9 Zotero-provenance step).
         var check: OpaquePointer?
         #expect(sqlite3_open(url.path, &check) == SQLITE_OK)
         defer { sqlite3_close(check) }
@@ -173,7 +209,7 @@ struct IngestedFilesTests {
         #expect(sqlite3_prepare_v2(check, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK)
         defer { sqlite3_finalize(stmt) }
         #expect(sqlite3_step(stmt) == SQLITE_ROW)
-        #expect(sqlite3_column_int(stmt, 0) == 8)
+        #expect(sqlite3_column_int(stmt, 0) == 9)
         _ = store
     }
 }

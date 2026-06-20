@@ -220,7 +220,7 @@ struct SystemPromptTests {
         #expect(file.filename == "keep.txt")
         #expect(try store.ingestedFileContent(id: file.id) == Data("keep".utf8))
 
-        // user_version is now 6 (migration runs through every step to head).
+        // user_version advances through every migration step to head (v9).
         var check: OpaquePointer?
         #expect(sqlite3_open(url.path, &check) == SQLITE_OK)
         defer { sqlite3_close(check) }
@@ -228,7 +228,7 @@ struct SystemPromptTests {
         #expect(sqlite3_prepare_v2(check, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK)
         defer { sqlite3_finalize(stmt) }
         #expect(sqlite3_step(stmt) == SQLITE_ROW)
-        #expect(sqlite3_column_int(stmt, 0) == 8)
+        #expect(sqlite3_column_int(stmt, 0) == 9)
         _ = store
     }
 }

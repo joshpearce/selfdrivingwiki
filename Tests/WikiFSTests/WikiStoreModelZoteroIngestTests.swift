@@ -36,6 +36,12 @@ struct WikiStoreModelZoteroIngestTests {
             filename: filename, contentType: "application/pdf", title: nil)
     }
 
+    private func parentItem(key: String = "PARENT1", title: String? = "Sample Paper") -> ZoteroItem {
+        ZoteroItem(
+            key: key, version: 1, itemType: "journalArticle",
+            title: title, creatorSummary: "Ito, K.", date: "2016")
+    }
+
     @Test func localAttachmentLandsInIngestedFilesList() async throws {
         let store = try tempStore()
         let model = WikiStoreModel(store: store)
@@ -48,7 +54,8 @@ struct WikiStoreModelZoteroIngestTests {
         try writeFixture(zoteroDir: zoteroDir, key: "DJLXA7DG", filename: "report.pdf", data: pdf)
 
         try await model.ingestFromZotero(
-            attachment(key: "DJLXA7DG", filename: "report.pdf"), zoteroDir: zoteroDir)
+            attachment(key: "DJLXA7DG", filename: "report.pdf"),
+            parentItem: parentItem(), zoteroDir: zoteroDir)
 
         #expect(model.ingestedFiles.count == 1)
         #expect(model.ingestedFiles.first?.filename == "report.pdf")
@@ -58,6 +65,29 @@ struct WikiStoreModelZoteroIngestTests {
         #expect(try store.ingestedFileContent(id: id) == pdf)  // byte-identical
     }
 
+    /// The Zotero ingest seam threads the parent item's key + title into the
+    /// ingested-file row so the detail view can show "From Zotero" + link back.
+    @Test func zoteroIngestThreadsItemKeyAndTitleIntoSummary() async throws {
+        let store = try tempStore()
+        let model = WikiStoreModel(store: store)
+        let zoteroDir = try tempZoteroDir()
+        try writeFixture(zoteroDir: zoteroDir, key: "DJLXA7DG", filename: "report.pdf", data: Data("pdf".utf8))
+
+        try await model.ingestFromZotero(
+            attachment(key: "DJLXA7DG", filename: "report.pdf"),
+            parentItem: parentItem(key: "PARENT1", title: "The Road Not Taken"), zoteroDir: zoteroDir)
+
+        #expect(model.ingestedFiles.count == 1)
+        let summary = model.ingestedFiles.first!
+        #expect(summary.zoteroItemKey == "PARENT1")
+        #expect(summary.zoteroItemTitle == "The Road Not Taken")
+
+        // The stored row round-trips the provenance too (read-back path).
+        let readBack = try store.getIngestedFile(id: summary.id)
+        #expect(readBack.zoteroItemKey == "PARENT1")
+        #expect(readBack.zoteroItemTitle == "The Road Not Taken")
+    }
+
     @Test func missingLocalFileThrowsUnavailableAndLeavesListUnchanged() async throws {
         let store = try tempStore()
         let model = WikiStoreModel(store: store)
@@ -65,7 +95,8 @@ struct WikiStoreModelZoteroIngestTests {
 
         await #expect(throws: ZoteroIngestError.self) {
             try await model.ingestFromZotero(
-                attachment(key: "MISSING1", filename: "ghost.pdf"), zoteroDir: zoteroDir)
+                attachment(key: "MISSING1", filename: "ghost.pdf"),
+                parentItem: parentItem(), zoteroDir: zoteroDir)
         }
         #expect(model.ingestedFiles.isEmpty)
     }
@@ -79,7 +110,8 @@ struct WikiStoreModelZoteroIngestTests {
 
         await #expect(throws: ZoteroIngestError.self) {
             try await model.ingestFromZotero(
-                attachment(key: "L1", linkMode: "linked_file", filename: "stray.pdf"), zoteroDir: zoteroDir)
+                attachment(key: "L1", linkMode: "linked_file", filename: "stray.pdf"),
+                parentItem: parentItem(), zoteroDir: zoteroDir)
         }
         #expect(model.ingestedFiles.isEmpty)
     }
@@ -94,9 +126,9 @@ struct WikiStoreModelZoteroIngestTests {
             zoteroDir: zoteroDir, key: "K1", filename: "notes.md", data: Data("# Notes".utf8))
 
         try await model.ingestFromZotero(
-            attachment(key: "K1", filename: "paper.pdf"), zoteroDir: zoteroDir)
+            attachment(key: "K1", filename: "paper.pdf"), parentItem: parentItem(), zoteroDir: zoteroDir)
         try await model.ingestFromZotero(
-            attachment(key: "K1", filename: "notes.md"), zoteroDir: zoteroDir)
+            attachment(key: "K1", filename: "notes.md"), parentItem: parentItem(), zoteroDir: zoteroDir)
 
         #expect(model.ingestedFiles.count == 2)
         let filenames = Set(model.ingestedFiles.map(\.filename))

@@ -14,6 +14,7 @@ struct WikiDetailView: View {
     @Binding var showingImportMarkdown: Bool
     @Binding var showingAddFromZotero: Bool
     let isZoteroConfigured: Bool
+    let zoteroLibraryID: String?
 
     var body: some View {
         switch store.selection {
@@ -69,7 +70,8 @@ struct WikiDetailView: View {
                     isIngesting: launcher.ingestingFileIDs.contains(file.id),
                     isRunning: launcher.isRunning,
                     runIngest: runIngest,
-                    store: store
+                    store: store,
+                    zoteroLibraryID: zoteroLibraryID
                 )
             } else {
                 ContentUnavailableView {

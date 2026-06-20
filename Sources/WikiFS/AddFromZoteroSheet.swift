@@ -327,13 +327,13 @@ struct AddFromZoteroSheet: View {
     /// shouldn't block the others. Dismisses only on full success.
     private func addSelected() {
         let toIngest = attachmentRows.filter { selectedAttachmentKeys.contains($0.id) }.map(\.attachment)
-        guard !toIngest.isEmpty else { return }
+        guard !toIngest.isEmpty, let item = selectedItem else { return }
         ingestPhase = .ingesting
         Task {
             var failures: [String] = []
             for attachment in toIngest {
                 do {
-                    try await store.ingestFromZotero(attachment, zoteroDir: zoteroDir)
+                    try await store.ingestFromZotero(attachment, parentItem: item, zoteroDir: zoteroDir)
                 } catch {
                     let name = attachment.filename ?? attachment.title ?? attachment.key
                     failures.append("\(name): \(errorMessage(error))")

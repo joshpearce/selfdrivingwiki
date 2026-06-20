@@ -2,6 +2,42 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-20 — Zotero source link on ingested files
+
+Implemented `plans/zotero-source-link.md`. Files ingested from Zotero now carry
+their parent library item's key + title as provenance, so the **Ingested File
+Detail View** shows a "Zotero" tag with the item title and a "View in Zotero"
+link back to the web library (`zotero.org/users/<id>/items/<key>/`).
+
+- **Schema v8→v9:** two nullable TEXT columns (`zotero_item_key`,
+  `zotero_item_title`) on `ingested_files`. NULL for drag-drop / URL /
+  folder-import (no provenance).
+- **`IngestedFileSummary`** grew `zoteroItemKey` / `zoteroItemTitle` (defaulted
+  `nil` so existing callers compile).
+- **Write seam:** `WikiStore.ingestFile` gained defaulted
+  `zoteroItemKey`/`zoteroItemTitle` params; only `ingestFromZotero` passes
+  non-nil. `WikiStoreModel.ingestFromZotero(_:parentItem:zoteroDir:)` now takes
+  the parent `ZoteroItem`; `AddFromZoteroSheet.addSelected()` passes
+  `selectedItem`.
+- **Read path:** `listIngestedFiles`, `getIngestedFile`, and the
+  `ingestedSummary` decoder extended for the two new columns (NULL→nil). The
+  `listAllIngestedFilesOrderedByID` projection (files.jsonl / File Provider
+  mount) is intentionally left unchanged for v1 — provenance is UI-only.
+- **Detail view:** a small `zoteroOriginRow` in `headerSection` (Zotero tag +
+  title + borderless "View in Zotero" button via `NSWorkspace.shared.open`).
+  Library ID plumbed `ContentView → WikiDetailView → IngestedFileDetailView`
+  from `ZoteroConfig`. Non-Zotero files show nothing (clean header).
+
+Open questions resolved with the plan's recommended defaults: **web URL** link
+target (universal, no Zotero install needed), **no** neutral "Imported" tag
+for non-Zotero files, **UI-only** for v1 (no files.jsonl change).
+
+3 new tests (NULL round-trip, Zotero-seam write, Zotero-seam threads key+title)
++ updated the 4 `ingestFromZotero` call sites in
+`WikiStoreModelZoteroIngestTests`; bumped the 5 `user_version`-to-head
+assertions across the suite to 9. Full `swift test` — 570 tests, 48 suites, 0
+failures. `make check` compiles.
+
 ## 2026-06-20 — PR2: File browsing/editing + git-lite versioned processed markdown
 
 Implemented `plans/file-versioned-editing.md`. Added a `file_markdown_versions`
