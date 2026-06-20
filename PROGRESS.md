@@ -2,6 +2,26 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-20 — Fix transcript sidebar disappearing on tab switch
+
+The `AgentTranscriptSidebar` had Query-specific suppression that forced
+`isTranscriptExpanded = false` when entering the Query tab and guarded
+visibility/auto-open/toggle-enable with `!isQuerySelected`. This caused the
+sidebar to collapse on entry to Query and stay collapsed when switching back to
+other tabs — the state didn't recover.
+
+- **`ContentView`:** removed `!isQuerySelected` from the sidebar visibility
+  guard, the auto-open-on-agent-start guard, the auto-open-on-ingest guard,
+  and `canShowTranscript`. Removed the forced `isTranscriptExpanded = false`
+  in `onChange(of: store.selection)`. Removed the now-unused
+  `isQuerySelected` computed property. (-16/+8)
+
+The sidebar now persists across all tab switches and works consistently
+regardless of which detail view is active.
+
+**Verified.** `swift build` clean; `swift test` — 570 tests, 48 suites, 0
+failures. PR #27.
+
 ## 2026-06-20 — Fix Zotero "View in Zotero" link + PageDetailView markdown alignment
 
 Fixed two bugs found in live use after the Zotero source-link feature landed:
