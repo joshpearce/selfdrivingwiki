@@ -15,7 +15,8 @@ import SQLite3
 ///   `containerURL(forSecurityApplicationGroupIdentifier:)`, which resolves to
 ///   the same on-disk file.
 public enum DatabaseLocation {
-    public static let appGroupID = "group.org.sockpuppet.wiki"
+    /// The App Group id, resolved per-developer at runtime. See ``WikiIdentifiers``.
+    public static let appGroupID = WikiIdentifiers.appGroupID
 
     /// The single v0 / pre-multi-wiki database filename. Phase 0 migrates this
     /// file into the registry as wiki #1; new wikis are named `<ulid>.sqlite`.

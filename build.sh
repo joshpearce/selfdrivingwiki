@@ -20,19 +20,28 @@ set -euo pipefail
 
 CONFIG="${1:-debug}"
 
+# Per-developer signing identifiers + dev identity. The defaults below are the
+# upstream author's; bundle ids and App Groups are GLOBALLY UNIQUE across App
+# Store Connect and cannot be reused, so anyone building against their own Apple
+# Developer account overrides them via signing/local.config (gitignored). Write
+# it from signing/local.config.example by hand, or generate the whole signing
+# setup with signing/setup.sh. See plans/signing.md.
+LOCAL_CONFIG="signing/local.config"
+# shellcheck disable=SC1090
+[ -f "${LOCAL_CONFIG}" ] && . "${LOCAL_CONFIG}"
+
 APP_NAME="Self Driving Wiki"
 APP_TARGET_NAME="WikiFS"
 EXT_NAME="WikiFSFileProvider"
 CTL_NAME="wikictl"
 PDF2MD_NAME="pdf2md"
 PDF2MD_SRC="tools/pdf2md/pdf2md"
-BUNDLE_ID="org.sockpuppet.WikiFS"
-EXT_BUNDLE_ID="org.sockpuppet.WikiFS.FileProvider"
-APP_GROUP="group.org.sockpuppet.wiki"
+BUNDLE_ID="${BUNDLE_ID:-org.sockpuppet.WikiFS}"
+EXT_BUNDLE_ID="${EXT_BUNDLE_ID:-org.sockpuppet.WikiFS.FileProvider}"
+APP_GROUP="${APP_GROUP:-group.org.sockpuppet.wiki}"
+TEAM_ID="${TEAM_ID:-KK7E9G89GW}"
 MIN_MACOS="14.0"
 
-APP_ENTITLEMENTS="WikiFS/WikiFS.entitlements"
-EXT_ENTITLEMENTS="WikiFS/WikiFSFileProvider.entitlements"
 APP_PROFILE="signing/WikiFS.provisionprofile"
 EXT_PROFILE="signing/WikiFSFileProvider.provisionprofile"
 APP_ICON="build/AppIcon.icns"
@@ -50,6 +59,12 @@ APPEX_MACOS="${APPEX_CONTENTS}/MacOS"
 # at a stable bundle-relative path; it is ALSO copied to build/wikictl for the
 # Phase A gate to invoke directly.
 HELPERS_DIR="${CONTENTS}/Helpers"
+
+# Entitlements are GENERATED into build/ from the identifiers above, so the team
+# prefix + App Group always track signing/local.config (no stale committed file
+# baked to one developer's team). Written just before codesign.
+APP_ENTITLEMENTS="${BUILD_DIR}/WikiFS.entitlements"
+EXT_ENTITLEMENTS="${BUILD_DIR}/WikiFSFileProvider.entitlements"
 
 VERSION="$(git describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null | sed 's/^v//' || true)"
 if [ -z "${VERSION}" ] && [ -f VERSION ]; then VERSION="$(sed -n '1p' VERSION | tr -d '[:space:]')"; fi
@@ -76,6 +91,20 @@ cp "${EXT_BIN}" "${APPEX_MACOS}/${EXT_NAME}"
 cp "${CTL_BIN}" "${HELPERS_DIR}/${CTL_NAME}"
 # Also drop a copy at build/wikictl for the Phase A gate to invoke directly.
 cp "${CTL_BIN}" "${BUILD_DIR}/${CTL_NAME}"
+# wikictl is a plain CLI with no Info.plist, so it can't read the App Group id
+# the way the .app/.appex do. Drop a sidecar that WikiIdentifiers reads. It must
+# NOT live in Contents/Helpers (a code location — codesign rejects unsigned
+# plain files there), so the bundled copy goes in Contents/Resources; wikictl
+# resolves it via ../Resources. The build/ copy sits beside build/wikictl for
+# the Phase A gate. See Sources/WikiFSCore/WikiIdentifiers.swift.
+write_id_sidecar () {
+  cat > "$1/wiki-identifiers.env" <<EOF
+WIKI_APP_GROUP_ID=${APP_GROUP}
+WIKI_FILE_PROVIDER_ID=${EXT_BUNDLE_ID}
+EOF
+}
+write_id_sidecar "${RESOURCES_DIR}"
+write_id_sidecar "${BUILD_DIR}"
 # Bundle the pdf2md PEP 723 script alongside wikictl so PdfExtractionService
 # can spawn it at ingest time.
 if [ -f "${PDF2MD_SRC}" ]; then
@@ -111,6 +140,9 @@ cat > "${CONTENTS}/Info.plist" <<PLIST
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
 	<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+	<!-- Per-developer ids read at runtime by WikiIdentifiers (Bundle.main path). -->
+	<key>WIKIAppGroupID</key><string>${APP_GROUP}</string>
+	<key>WIKIFileProviderID</key><string>${EXT_BUNDLE_ID}</string>
 </dict>
 </plist>
 PLIST
@@ -139,6 +171,8 @@ cat > "${APPEX_CONTENTS}/Info.plist" <<PLIST
 		<key>NSExtensionFileProviderDocumentGroup</key><string>${APP_GROUP}</string>
 		<key>NSExtensionFileProviderEnabledByDefault</key><true/>
 	</dict>
+	<!-- Read at runtime by WikiIdentifiers (Bundle.main path) in the extension. -->
+	<key>WIKIAppGroupID</key><string>${APP_GROUP}</string>
 </dict>
 </plist>
 PLIST
@@ -146,7 +180,9 @@ PLIST
 # ---------------------------------------------------------------------------
 # Codesign
 # ---------------------------------------------------------------------------
-IDENTITY="${SIGN_IDENTITY:--}"
+# Identity precedence: SIGN_IDENTITY env (Makefile passes this) → DEV_IDENTITY
+# from signing/local.config → ad-hoc ("-").
+IDENTITY="${SIGN_IDENTITY:-${DEV_IDENTITY:--}}"
 if [ "${IDENTITY}" != "-" ] && ! security find-identity -v -p codesigning 2>/dev/null | grep -qF "${IDENTITY}"; then
   echo "  (identity '${IDENTITY}' not in keychain — falling back to ad-hoc)"
   IDENTITY="-"
@@ -158,6 +194,40 @@ if [ "${IDENTITY}" != "-" ] && [ -f "${APP_PROFILE}" ] && [ -f "${EXT_PROFILE}" 
 fi
 
 if [ "${REAL_SIGNING}" = "1" ]; then
+  # Generate entitlements from the resolved identifiers. Each entitlement MUST be
+  # a subset of what the embedded profile authorizes, or AMFI SIGKILLs at exec.
+  echo "→ generating entitlements (team ${TEAM_ID}, group ${APP_GROUP})"
+  cat > "${APP_ENTITLEMENTS}" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.application-identifier</key>
+	<string>${TEAM_ID}.${BUNDLE_ID}</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>${TEAM_ID}</string>
+</dict>
+</plist>
+PLIST
+  cat > "${EXT_ENTITLEMENTS}" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.application-identifier</key>
+	<string>${TEAM_ID}.${EXT_BUNDLE_ID}</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>${TEAM_ID}</string>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>${APP_GROUP}</string>
+	</array>
+</dict>
+</plist>
+PLIST
+
   echo "→ embedding provisioning profiles"
   cp "${APP_PROFILE}" "${CONTENTS}/embedded.provisionprofile"
   cp "${EXT_PROFILE}" "${APPEX_CONTENTS}/embedded.provisionprofile"
@@ -170,6 +240,12 @@ if [ "${REAL_SIGNING}" = "1" ]; then
     "${HELPERS_DIR}/${CTL_NAME}"
   codesign --force --timestamp=none --sign "${IDENTITY}" \
     "${HELPERS_DIR}/vec0.dylib"
+  # pdf2md is a plain script bundled in Helpers/ — must also be signed, or the
+  # outer app's seal fails ("code object is not signed at all").
+  if [ -f "${HELPERS_DIR}/${PDF2MD_NAME}" ]; then
+    codesign --force --timestamp=none --sign "${IDENTITY}" \
+      "${HELPERS_DIR}/${PDF2MD_NAME}"
+  fi
   echo "→ codesign appex (${IDENTITY})"
   codesign --force --timestamp=none --sign "${IDENTITY}" \
     --entitlements "${EXT_ENTITLEMENTS}" \
