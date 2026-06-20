@@ -229,7 +229,7 @@ struct ContentView: View {
     @ViewBuilder
     private var keyboardShortcutButtons: some View {
         // Cmd+W: Close active tab
-        Button("") { store.closeTab(at: store.activeTabIndex) }
+        Button("") { if let id = store.activeTabID { store.closeTab(id: id) } }
             .keyboardShortcut("w", modifiers: .command)
             .opacity(0).allowsHitTesting(false)
             .disabled(store.tabs.isEmpty)
@@ -240,17 +240,11 @@ struct ContentView: View {
             .opacity(0).allowsHitTesting(false)
             .disabled(store.recentlyClosedTabs.isEmpty)
 
-        // Cmd+1 through Cmd+9: Switch to tab by index
-        let keys: [KeyEquivalent] = [
-            "1", "2", "3", "4", "5", "6", "7", "8", "9"
-        ]
-        ForEach(Array(zip(keys.indices, keys)), id: \.0) { i, key in
-            Button("") {
-                guard store.tabs.indices.contains(i) else { return }
-                store.selectTab(at: i)
-            }
-            .keyboardShortcut(key, modifiers: .command)
-            .opacity(0).allowsHitTesting(false)
+        // Cmd+1 through Cmd+9: Switch to tab by position (first 9 tabs only)
+        ForEach(Array(store.tabs.prefix(9).enumerated()), id: \.element.id) { i, tab in
+            Button("") { store.selectTab(id: tab.id) }
+                .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: .command)
+                .opacity(0).allowsHitTesting(false)
         }
     }
 }

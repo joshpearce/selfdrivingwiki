@@ -41,10 +41,24 @@ public final class WikiStoreModel {
 
     /// All open editor tabs, in display order (left to right).
     public private(set) var tabs: [EditorTab] = []
-    /// Index into `tabs` for the active tab. 0 when `tabs` is empty.
-    public var activeTabIndex: Int = 0
+    /// The active tab's stable identity — the single source of truth for "which
+    /// tab is focused." `nil` in the empty state (no tabs). All tab operations
+    /// find the active tab by this ID; indices are computed at the view layer
+    /// only (for `ForEach` / keyboard-shortcut numbering).
+    public var activeTabID: UUID?
     /// Stack of recently-closed tabs for Cmd+Shift+T reopen. Max 10.
     public private(set) var recentlyClosedTabs: [EditorTab] = []
+
+    /// View-layer convenience: the active tab's position. Computed from
+    /// `activeTabID`, never stored — so it can't go stale on a close/reorder.
+    /// Falls back to 0 in the empty state.
+    public var activeTabIndex: Int {
+        activeTabID.flatMap { id in tabs.firstIndex { $0.id == id } } ?? 0
+    }
+    /// The active tab value, or `nil` in the empty state.
+    public var activeTab: EditorTab? {
+        tabs.first { $0.id == activeTabID }
+    }
 
     /// The removable list of ingested files (Phase 5). Like `summaries`, this is
     /// ALWAYS rebuilt from `store.listIngestedFiles()` after a change, never
@@ -99,9 +113,11 @@ public final class WikiStoreModel {
     private var isDraftDirty = false
     /// Same for the system prompt draft (separate track).
     private var isSystemPromptDirty = false
-    /// Suppresses double-processing in `handleSelectionChange` during tab switches.
-    /// Follows the same pattern as `isApplyingHistorySelection`.
-    @ObservationIgnored private var isSwitchingTab = false
+    /// Suppresses double-processing in `handleSelectionChange` while a tab switch
+    /// is mid-flight (`setActiveTab` assigns `selection`, which fires the view's
+    /// `onChange(of: selection)` bridge). Set in exactly one place —
+    /// `setActiveTab(_:)`. Follows the same pattern as `isApplyingHistorySelection`.
+    @ObservationIgnored private var isApplyingTabSelection = false
     private static let navigationHistoryLimit = 100
     private static let maxRecentlyClosedTabs = 10
 
@@ -126,11 +142,7 @@ public final class WikiStoreModel {
         recordHistoryTransition(from: loadedSelection, to: newValue)
         selection = newValue
         loadDrafts(for: newValue)
-        // Keep the active tab in sync.
-        if tabs.indices.contains(activeTabIndex), let newValue {
-            tabs[activeTabIndex].selection = newValue
-            tabs[activeTabIndex].title = tabTitle(for: newValue)
-        }
+        syncActiveTabMetadata(to: newValue)
     }
 
     /// Bridge for SwiftUI's `List(selection:)`, which writes `selection`
@@ -140,20 +152,19 @@ public final class WikiStoreModel {
     /// persisted before we load the incoming one (§3.5).
     public func handleSelectionChange(to newValue: WikiSelection?) {
         // Skip if triggered programmatically by a tab switch.
-        guard !isSwitchingTab, newValue != loadedSelection else { return }
+        guard !isApplyingTabSelection, newValue != loadedSelection else { return }
         flushPendingSaves()     // persists drafts to loadedSelection
         recordHistoryTransition(from: loadedSelection, to: newValue)
         loadDrafts(for: newValue)
 
-        // Keep the active tab's metadata in sync after a sidebar-driven change.
-        // If no tabs exist yet, create the initial tab.
-        if tabs.isEmpty {
-            let label = tabTitle(for: newValue ?? .query)
-            tabs.append(EditorTab(selection: newValue ?? .query, title: label))
-            activeTabIndex = 0
-        } else if tabs.indices.contains(activeTabIndex), let newValue {
-            tabs[activeTabIndex].selection = newValue
-            tabs[activeTabIndex].title = tabTitle(for: newValue)
+        // Keep the active tab's metadata in sync after a sidebar-driven change
+        // (in-tab navigation). If no tabs exist yet, create the initial tab.
+        if tabs.isEmpty, let newValue {
+            let tab = EditorTab(selection: newValue, title: tabTitle(for: newValue))
+            tabs.append(tab)
+            activeTabID = tab.id
+        } else {
+            syncActiveTabMetadata(to: newValue)
         }
     }
 
@@ -184,103 +195,136 @@ public final class WikiStoreModel {
 
     /// Navigate to the page with `title` from a clicked `[[wiki-link]]` in the
     /// preview. Resolves title → id (lowest-ULID on a duplicate-title collision,
-    /// matching the link graph) and selects it through the SAME `select(_:)` seam
-    /// the sidebar uses — so the outgoing page's pending edits flush first and the
-    /// incoming draft loads (§3.5). Returns whether navigation happened, so the
-    /// click handler can report `.handled`. A no-op (returns `false`) if the title
-    /// has no page.
+    /// matching the link graph) and opens its tab — REUSING an already-open tab
+    /// for that page rather than spawning a duplicate. Records the jump in
+    /// navigation history first (so back/forward works), then routes through
+    /// `openTab`, whose `setActiveTab` flushes the outgoing page's pending edits
+    /// before loading the target (§3.5). Returns whether navigation happened, so
+    /// the click handler can report `.handled`. A no-op (`false`) if the title has
+    /// no page.
     @discardableResult
     public func selectPage(byTitle title: String) -> Bool {
         guard let id = (try? store.resolveTitleToID(title)) ?? nil else { return false }
-        select(.page(id))
+        let target = WikiSelection.page(id)
+        // Record history while `loadedSelection` still points at the outgoing
+        // page (openTab/setActiveTab don't record history themselves).
+        recordHistoryTransition(from: loadedSelection, to: target)
+        openTab(target)
         return true
     }
 
     // MARK: - Tab operations
 
-    /// Open a new tab with the given selection. For singleton selection types
-    /// (.query, .systemPrompt, .changeLog), switches to their existing tab instead
-    /// of creating a duplicate. Flushes the current tab's drafts first.
+    /// The single seam every tab switch routes through: flush the outgoing tab's
+    /// drafts, set the active ID, mirror the tab's selection into `selection`, and
+    /// load the incoming drafts — all under one re-entrancy guard so the view's
+    /// `onChange(of: selection)` bridge no-ops while the switch is mid-flight.
+    /// Pass `nil` to enter the empty state.
+    private func setActiveTab(_ id: UUID?) {
+        flushPendingSaves()
+        isApplyingTabSelection = true
+        activeTabID = id
+        let sel = tabs.first { $0.id == id }?.selection
+        selection = sel
+        loadDrafts(for: sel)
+        isApplyingTabSelection = false
+    }
+
+    /// Keep the active tab's metadata in sync with an in-tab navigation (sidebar
+    /// single-click within the active tab, `[[wiki-link]]` click, history). A
+    /// no-op in the empty state or when `newValue` is `nil`.
+    private func syncActiveTabMetadata(to newValue: WikiSelection?) {
+        guard let activeID = activeTabID,
+              let i = tabs.firstIndex(where: { $0.id == activeID }),
+              let newValue else { return }
+        tabs[i].selection = newValue
+        tabs[i].title = tabTitle(for: newValue)
+    }
+
+    /// Open the tab for `selection`: if one is already open, focus it (reuse,
+    /// never duplicate); otherwise create a new tab and focus it. This holds for
+    /// every selection type — pages and files reuse just like the singletons
+    /// (.query, .systemPrompt, .changeLog) — so clicking a page or a
+    /// `[[wiki-link]]` that's already open returns to its tab instead of spawning
+    /// a copy.
     public func openTab(_ selection: WikiSelection, title: String? = nil) {
-        // Singleton types: switch to existing tab if one exists.
-        switch selection {
-        case .query, .systemPrompt, .changeLog:
-            if let existingIndex = tabs.firstIndex(where: { $0.selection == selection }) {
-                selectTab(at: existingIndex)
-                return
-            }
-        default:
-            // Page/file tabs: always create new (Obsidian-style).
-            break
+        if let existing = tabs.first(where: { $0.selection == selection }) {
+            print("[tabs] openTab: focus existing tab for \(selection) (id=\(existing.id))")
+            setActiveTab(existing.id)
+            return
         }
-
-        flushPendingSaves()
-        let label = title ?? tabTitle(for: selection)
-        let tab = EditorTab(selection: selection, title: label)
+        let tab = EditorTab(selection: selection, title: title ?? tabTitle(for: selection))
         tabs.append(tab)
-        activeTabIndex = tabs.count - 1
-
-        // Switch to the new tab without recording history.
-        isSwitchingTab = true
-        self.selection = selection
-        loadDrafts(for: selection)
-        isSwitchingTab = false
+        print("[tabs] openTab: new tab for \(selection) (id=\(tab.id)), \(tabs.count) tabs total")
+        setActiveTab(tab.id)
     }
 
-    /// Switch to a specific tab by index. Flushes the outgoing tab's drafts and
-    /// loads the incoming tab's content. Does NOT record in navigation history.
-    public func selectTab(at index: Int) {
-        guard tabs.indices.contains(index), index != activeTabIndex else { return }
-        flushPendingSaves()
-        isSwitchingTab = true
-        activeTabIndex = index
-        selection = tabs[index].selection
-        loadDrafts(for: selection)
-        isSwitchingTab = false
+    /// Switch the active tab by ID. No-op if the ID is unknown or already active.
+    public func selectTab(id: UUID) {
+        guard tabs.contains(where: { $0.id == id }), id != activeTabID else { return }
+        setActiveTab(id)
     }
 
-    /// Close the tab at the given index. Preserves it in `recentlyClosedTabs`
-    /// for Cmd+Shift+T. Activates the right-neighbor tab (or left if closing the
-    /// rightmost). Closing the last tab shows the empty state.
-    public func closeTab(at index: Int) {
-        guard tabs.indices.contains(index) else { return }
-        flushPendingSaves()
-
-        // Save to recently-closed stack.
-        let closedTab = tabs[index]
-        recentlyClosedTabs.append(closedTab)
-        if recentlyClosedTabs.count > Self.maxRecentlyClosedTabs {
-            recentlyClosedTabs.removeFirst()
-        }
-
-        let wasActive = index == activeTabIndex
-        tabs.remove(at: index)
-
+    /// Close one tab by ID. Preserves it in `recentlyClosedTabs` for Cmd+Shift+T.
+    /// If the closed tab was active, activates the tab now at the same position
+    /// (right neighbor), or the last tab. Closing the final tab → empty state.
+    /// Closing a non-active tab leaves the active tab untouched.
+    public func closeTab(id: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let closed = tabs.remove(at: index)
+        pushRecentlyClosed(closed)
         if tabs.isEmpty {
-            // Last tab closed: show the empty state.
-            activeTabIndex = 0
-            isSwitchingTab = true
-            selection = nil
-            loadDrafts(for: nil)
-            isSwitchingTab = false
-        } else if wasActive {
-            // Activate the right neighbor, or left if removing the rightmost.
-            let newIndex = min(index, tabs.count - 1)
-            isSwitchingTab = true
-            activeTabIndex = newIndex
-            selection = tabs[newIndex].selection
-            loadDrafts(for: selection)
-            isSwitchingTab = false
-        } else if index < activeTabIndex {
-            // A tab to the left of the active one was closed — shift the index.
-            activeTabIndex -= 1
+            setActiveTab(nil)
+        } else if closed.id == activeTabID {
+            let neighborIndex = min(index, tabs.count - 1)
+            setActiveTab(tabs[neighborIndex].id)
         }
+        // else: active tab unchanged (it wasn't the closed one).
+    }
+
+    /// Close every tab except the one with `id`, which becomes active.
+    public func closeOtherTabs(id: UUID) {
+        guard let kept = tabs.first(where: { $0.id == id }) else { return }
+        let toClose = tabs.filter { $0.id != id }
+        guard !toClose.isEmpty else { return }
+        toClose.reversed().forEach { pushRecentlyClosed($0) }
+        tabs = [kept]
+        setActiveTab(kept.id)
+    }
+
+    /// Close every tab to the right of `id`. The anchor and tabs to its left
+    /// remain. If the active tab was among those closed, activates the anchor.
+    public func closeTabsAfter(id: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let toClose = Array(tabs.dropFirst(index + 1))
+        guard !toClose.isEmpty else { return }
+        toClose.reversed().forEach { pushRecentlyClosed($0) }
+        tabs = Array(tabs.prefix(index + 1))
+        if let active = activeTabID, !tabs.contains(where: { $0.id == active }) {
+            setActiveTab(tabs[index].id)
+        }
+    }
+
+    /// Close all tabs and enter the empty state.
+    public func closeAllTabs() {
+        guard !tabs.isEmpty else { return }
+        tabs.reversed().forEach { pushRecentlyClosed($0) }
+        tabs = []
+        setActiveTab(nil)
     }
 
     /// Reopen the last closed tab.
     public func reopenLastClosedTab() {
         guard let lastClosed = recentlyClosedTabs.popLast() else { return }
         openTab(lastClosed.selection, title: lastClosed.title)
+    }
+
+    /// Push a closed tab onto the reopen stack, capping at `maxRecentlyClosedTabs`.
+    private func pushRecentlyClosed(_ tab: EditorTab) {
+        recentlyClosedTabs.append(tab)
+        if recentlyClosedTabs.count > Self.maxRecentlyClosedTabs {
+            recentlyClosedTabs.removeFirst()
+        }
     }
 
     /// Create a new page and open it in a new tab.
@@ -352,10 +396,7 @@ public final class WikiStoreModel {
         loadDrafts(for: newValue)
         isApplyingHistorySelection = false
         // Update the active tab's metadata so the tab bar stays in sync.
-        if tabs.indices.contains(activeTabIndex) {
-            tabs[activeTabIndex].selection = newValue
-            tabs[activeTabIndex].title = tabTitle(for: newValue)
-        }
+        syncActiveTabMetadata(to: newValue)
     }
 
     private func trimBackStackIfNeeded() {
@@ -541,8 +582,8 @@ public final class WikiStoreModel {
             try store.deletePage(id: id)
             removeFromHistory(.page(id))
             // Close any tab showing this deleted page.
-            if let tabIndex = tabs.firstIndex(where: { $0.selection == .page(id) }) {
-                closeTab(at: tabIndex)
+            if let tab = tabs.first(where: { $0.selection == .page(id) }) {
+                closeTab(id: tab.id)
             }
             reloadSummaries()
             onPageDidChange?()
@@ -705,8 +746,8 @@ public final class WikiStoreModel {
             try store.deleteIngestedFile(id: id)
             removeFromHistory(.ingestedFile(id))
             // Close any tab showing this deleted file.
-            if let tabIndex = tabs.firstIndex(where: { $0.selection == .ingestedFile(id) }) {
-                closeTab(at: tabIndex)
+            if let tab = tabs.first(where: { $0.selection == .ingestedFile(id) }) {
+                closeTab(id: tab.id)
             }
             reloadIngestedFiles()
             onPageDidChange?()

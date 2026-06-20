@@ -56,6 +56,39 @@ struct WikiLinkNavigationTests {
         #expect(model.selection == .page(lowest))
     }
 
+    @Test func selectPageByTitleReusesAlreadyOpenTab() throws {
+        let (model, store) = try tempModel()
+        let from = try store.createPage(title: "From")
+        let to = try store.createPage(title: "To")
+        model.reloadFromStore()
+
+        // Open both pages in tabs, leaving `from` active.
+        model.openTab(.page(to.id))
+        let toTab = model.tabs.first { $0.selection == .page(to.id) }!.id
+        model.openTab(.page(from.id))
+        #expect(model.tabs.count == 2)
+
+        // Clicking a [[To]] link focuses the existing tab — no third tab.
+        #expect(model.selectPage(byTitle: "To"))
+        #expect(model.tabs.count == 2)
+        #expect(model.activeTabID == toTab)
+        #expect(model.selection == .page(to.id))
+    }
+
+    @Test func selectPageByTitleOpensNewTabWhenNotAlreadyOpen() throws {
+        let (model, store) = try tempModel()
+        let from = try store.createPage(title: "From")
+        let to = try store.createPage(title: "To")
+        model.reloadFromStore()
+
+        model.openTab(.page(from.id))
+        #expect(model.tabs.count == 1)
+
+        #expect(model.selectPage(byTitle: "To"))
+        #expect(model.tabs.count == 2)
+        #expect(model.selection == .page(to.id))
+    }
+
     @Test func selectPageByTitleFlushesPendingEditsToOutgoingPage() throws {
         let (model, store) = try tempModel()
         let from = try store.createPage(title: "From")

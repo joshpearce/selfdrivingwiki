@@ -19,12 +19,14 @@ enum DebugLog {
     static func agent(_ message: @autoclosure () -> String) { emit("agent", message()) }
     static func ingest(_ message: @autoclosure () -> String) { emit("ingest", message()) }
     static func extraction(_ message: @autoclosure () -> String) { emit("extraction", message()) }
+    static func tabs(_ message: @autoclosure () -> String) { emit("tabs", message()) }
 
     private static let subsystem = "com.selfdrivingwiki.debug"
     private static let loggers: [String: Logger] = [
         "agent": Logger(subsystem: subsystem, category: "agent"),
         "ingest": Logger(subsystem: subsystem, category: "ingest"),
         "extraction": Logger(subsystem: subsystem, category: "extraction"),
+        "tabs": Logger(subsystem: subsystem, category: "tabs"),
     ]
 
     private static func emit(_ category: String, _ message: String) {
