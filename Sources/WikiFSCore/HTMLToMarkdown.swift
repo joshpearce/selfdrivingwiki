@@ -92,6 +92,13 @@ public enum HTMLToMarkdown {
         return denoised
     }
 
+    /// Metadata elements allowed inside `<head>`. Per HTML5 the `</head>` end tag is
+    /// optional: the head is implicitly closed by the first start tag that is NOT one
+    /// of these (in practice `<body>`). We use this to terminate the head-skip below.
+    private static let headMetadata: Set<String> = [
+        "base", "link", "meta", "noscript", "script", "style", "template", "title",
+    ]
+
     /// Remove every token inside (and including) any element whose name is in
     /// `names`. Nesting-aware: tracks a depth counter per opened noise container so
     /// a `<nav>` inside a `<nav>` is fully removed. Void/self-closing noise tags are
@@ -102,16 +109,28 @@ public enum HTMLToMarkdown {
         var skipName: String?
         for token in tokens {
             if skipDepth > 0 {
-                switch token {
-                case let .startTag(name, _, selfClosing) where name == skipName && !selfClosing:
-                    skipDepth += 1
-                case let .endTag(name) where name == skipName:
-                    skipDepth -= 1
-                    if skipDepth == 0 { skipName = nil }
-                default:
-                    break
+                // `<head>` has an OPTIONAL end tag: HTML5 implicitly closes it at the
+                // first non-metadata start tag (normally `<body>`). Bikeshed/W3C pages
+                // omit `</head>` entirely, so a literal "skip until </head>" swallows
+                // the whole document. Detect the implicit close, end the skip, and fall
+                // through so the terminating token (the body) is processed normally.
+                if skipName == "head",
+                   case let .startTag(name, _, _) = token,
+                   !headMetadata.contains(name) {
+                    skipDepth = 0
+                    skipName = nil
+                } else {
+                    switch token {
+                    case let .startTag(name, _, selfClosing) where name == skipName && !selfClosing:
+                        skipDepth += 1
+                    case let .endTag(name) where name == skipName:
+                        skipDepth -= 1
+                        if skipDepth == 0 { skipName = nil }
+                    default:
+                        break
+                    }
+                    continue
                 }
-                continue
             }
             if case let .startTag(name, _, selfClosing) = token, names.contains(name) {
                 if !selfClosing {
