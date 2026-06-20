@@ -93,23 +93,6 @@ struct IngestedFileDetailView: View {
         .onChange(of: store.isAgentRunning) {
             if $1 { flushEditIfDirty(); isEditing = false }
         }
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                if isEditing {
-                    Button("Done Editing", systemImage: "checkmark") { commitEdit() }
-                        .keyboardShortcut("e", modifiers: .command)
-                        .help("Save changes and return to reader")
-                } else if isMarkdownEditable {
-                    Button("Edit", systemImage: "pencil") {
-                        editBuffer = headVersion?.content ?? ""
-                        isEditing = true
-                    }
-                    .keyboardShortcut("e", modifiers: .command)
-                    .disabled(store.isAgentRunning)
-                    .help("Edit processed markdown")
-                }
-            }
-        }
     }
 
     // MARK: - Header
@@ -136,26 +119,42 @@ struct IngestedFileDetailView: View {
             .foregroundStyle(.secondary)
 
             HStack(spacing: 10) {
-                Button(isIngesting ? "Ingesting…" : "Ingest into Wiki",
-                       systemImage: "text.badge.plus") {
-                    DebugLog.ingest("IngestedFileDetailView: Ingest tapped — id=\(file.id.rawValue)")
-                    runIngest(file.id)
-                }
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(isRunning || isIngesting)
-                if isPDF, !hasMarkdown {
-                    Button(isExtracting ? "Extracting…" : "Extract Markdown",
-                           systemImage: "doc.plaintext") {
-                        Task { await runExtraction() }
+                if isEditing {
+                    Button("Save Changes", systemImage: "checkmark.circle") {
+                        commitEdit()
                     }
-                    .disabled(isExtracting || isRunning)
-                }
-                if isMarkdownEditable {
-                    Button("Edit", systemImage: "pencil") {
-                        editBuffer = headVersion?.content ?? ""
-                        isEditing = true
+                    .keyboardShortcut("s", modifiers: .command)
+                    .disabled(store.isAgentRunning
+                              || editBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || (headVersion?.content == editBuffer))
+
+                    Button("Cancel", systemImage: "xmark.circle") {
+                        isEditing = false
                     }
-                    .disabled(isRunning || isEditing)
+                    .keyboardShortcut(.escape, modifiers: [])
+                } else {
+                    Button(isIngesting ? "Ingesting…" : "Ingest into Wiki",
+                           systemImage: "text.badge.plus") {
+                        DebugLog.ingest("IngestedFileDetailView: Ingest tapped — id=\(file.id.rawValue)")
+                        runIngest(file.id)
+                    }
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .disabled(isRunning || isIngesting)
+                    if isPDF, !hasMarkdown {
+                        Button(isExtracting ? "Extracting…" : "Extract Markdown",
+                               systemImage: "doc.plaintext") {
+                            Task { await runExtraction() }
+                        }
+                        .disabled(isExtracting || isRunning)
+                    }
+                    if isMarkdownEditable {
+                        Button("Edit", systemImage: "pencil") {
+                            editBuffer = headVersion?.content ?? ""
+                            isEditing = true
+                        }
+                        .keyboardShortcut("e", modifiers: .command)
+                        .disabled(isRunning)
+                    }
                 }
             }
 
@@ -247,30 +246,11 @@ struct IngestedFileDetailView: View {
     @ViewBuilder
     private var markdownContent: some View {
         if isEditing {
-            VStack(spacing: 0) {
-                TextEditor(text: $editBuffer)
-                    .font(.system(.body, design: .monospaced))
-                    .scrollContentBackground(.hidden)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(PageEditorMetrics.contentInset)
-
-                HStack(spacing: 10) {
-                    Button("Save Changes", systemImage: "checkmark.circle") {
-                        commitEdit()
-                    }
-                    .keyboardShortcut("s", modifiers: .command)
-                    .disabled(editBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              || (headVersion?.content == editBuffer))
-
-                    Button("Cancel", systemImage: "xmark.circle") {
-                        isEditing = false
-                    }
-                    .keyboardShortcut(.escape, modifiers: [])
-                }
-                .padding(.horizontal, PageEditorMetrics.contentInset)
-                .padding(.bottom, PageEditorMetrics.sectionSpacing)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-            }
+            TextEditor(text: $editBuffer)
+                .font(.system(.body, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(PageEditorMetrics.contentInset)
         } else if let head = headVersion {
             MarkdownPreview(store: store, markdown: head.content)
         } else {
