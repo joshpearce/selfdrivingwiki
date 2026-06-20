@@ -43,7 +43,7 @@ struct ContentView: View {
                     )
                     .frame(maxWidth: .infinity)
 
-                    if isTranscriptExpanded && !isQuerySelected {
+                    if isTranscriptExpanded {
                         Divider()
                         AgentTranscriptSidebar(launcher: agentLauncher)
                         .transition(.move(edge: .trailing).combined(with: .opacity))
@@ -99,12 +99,9 @@ struct ContentView: View {
         // (§3.5). The view, not the binding, is the right place for this.
         .onChange(of: store.selection) { _, newValue in
             store.handleSelectionChange(to: newValue)
-            if newValue == .query {
-                isTranscriptExpanded = false
-            }
         }
         .onChange(of: agentLauncher.isRunning) { _, isRunning in
-            if isRunning && !isQuerySelected {
+            if isRunning {
                 isTranscriptExpanded = true
             }
         }
@@ -112,7 +109,7 @@ struct ContentView: View {
         // PDF-conversion phase, before the agent process spawns — so the
         // conversion box is visible.
         .onChange(of: agentLauncher.ingestingFileIDs) { _, newValue in
-            if !newValue.isEmpty && !isQuerySelected {
+            if !newValue.isEmpty {
                 isTranscriptExpanded = true
             }
         }
@@ -134,16 +131,11 @@ struct ContentView: View {
     }
 
     private var canShowTranscript: Bool {
-        !isQuerySelected
-            && (agentLauncher.isRunning
-                || !agentLauncher.ingestingFileIDs.isEmpty
-                || !agentLauncher.events.isEmpty
-                || agentLauncher.preflightError != nil
-                || !agentLauncher.stderr.isEmpty)
-    }
-
-    private var isQuerySelected: Bool {
-        store.selection == .query
+        agentLauncher.isRunning
+            || !agentLauncher.ingestingFileIDs.isEmpty
+            || !agentLauncher.events.isEmpty
+            || agentLauncher.preflightError != nil
+            || !agentLauncher.stderr.isEmpty
     }
 
     private func toggleTranscript() {
