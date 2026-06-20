@@ -43,6 +43,7 @@ struct MarkdownPreview: View {
             .frame(maxWidth: contentInset ? PageEditorMetrics.readableContentWidth : .infinity,
                    alignment: .leading)
             .padding(contentInset ? PageEditorMetrics.contentInset : 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         // Intercept clicks on the private wiki:// scheme and drive the SAME
         // selection seam the sidebar uses (§3.1/§3.5: go through the model, never

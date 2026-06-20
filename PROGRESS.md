@@ -2,6 +2,37 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-20 — Fix Zotero "View in Zotero" link + PageDetailView markdown alignment
+
+Fixed two bugs found in live use after the Zotero source-link feature landed:
+
+**"View in Zotero" link 404s.** The detail view constructed
+`https://www.zotero.org/users/<numericLibraryID>/items/<itemKey>/`, but
+Zotero's web library uses username slugs in URLs, not numeric IDs — the
+numeric ID only works on the API host (`api.zotero.org`). Confirmed this is
+the same root cause as [Zutilo #268](https://github.com/wshanks/Zutilo/issues/268).
+Switched to the `zotero://select/library/items/<key>` URI scheme, which
+opens items directly in the Zotero desktop app and needs no library ID at all.
+
+- **`IngestedFileDetailView`:** removed the `zoteroLibraryID` parameter
+  (no longer needed); `zoteroItemURL` now builds
+  `zotero://select/library/items/<key>` instead of the broken web URL.
+- **`WikiDetailView` / `ContentView`:** removed the `zoteroLibraryID`
+  plumbing — the property was only threaded for this one link.
+
+**Markdown preview appears centered.** `MarkdownPreview`'s VStack inside its
+`ScrollView` was centered by default (SwiftUI `ScrollView` centers its
+content). Added `.frame(maxWidth: .infinity, alignment: .leading)` after
+the VStack's padding so content left-aligns within the scroll area.
+
+**Page editor inset mismatch.** The `PageDetailView` editor used
+`contentInset - 5` (7pt) while the header used 12pt; the markdown preview
+was passed `contentInset: false` (0pt). Changed both to 12pt so the text
+lines up with the header title and Edit button.
+
+**Verified.** `swift build` clean; `swift test` — 570 tests, 48 suites, 0
+failures.
+
 ## 2026-06-20 — Zotero source link on ingested files
 
 Implemented `plans/zotero-source-link.md`. Files ingested from Zotero now carry

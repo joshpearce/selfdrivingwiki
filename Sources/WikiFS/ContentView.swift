@@ -39,8 +39,7 @@ struct ContentView: View {
                         showingAddFromURL: $showingAddFromURL,
                         showingImportMarkdown: $showingImportMarkdown,
                         showingAddFromZotero: $showingAddFromZotero,
-                        isZoteroConfigured: isZoteroConfigured,
-                        zoteroLibraryID: zoteroLibraryID
+                        isZoteroConfigured: isZoteroConfigured
                     )
                     .frame(maxWidth: .infinity)
 
@@ -132,14 +131,6 @@ struct ContentView: View {
     private var isZoteroConfigured: Bool {
         ZoteroConfig.load(from: zoteroContainerDirectory).isConfigured
             && KeychainZoteroCredentialStore().apiKey() != nil
-    }
-
-    /// The configured Zotero user library ID, loaded once from the same config
-    /// `isZoteroConfigured` reads. Plumbed down to the ingested-file detail view
-    /// so a "View in Zotero" link can open the item's web page. `nil` when
-    /// unconfigured (the link is hidden in that case).
-    private var zoteroLibraryID: String? {
-        ZoteroConfig.load(from: zoteroContainerDirectory).libraryID
     }
 
     private var canShowTranscript: Bool {
