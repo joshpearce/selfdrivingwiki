@@ -71,12 +71,12 @@ struct PageDetailView: View {
                 TextEditor(text: $store.draftBody)
                     .font(.system(.body, design: .monospaced))
                     .scrollContentBackground(.hidden)
-                    .padding(.horizontal, PageEditorMetrics.contentInset - 5)
+                    .padding(.horizontal, PageEditorMetrics.contentInset)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .frame(minHeight: PageEditorMetrics.editorMinHeight)
                     .onChange(of: store.draftBody) { store.bodyChanged() }
             } else {
-                MarkdownPreview(store: store, markdown: readerMarkdown, contentInset: false)
+                MarkdownPreview(store: store, markdown: readerMarkdown)
                     .frame(maxWidth: .infinity)
                     .frame(minHeight: PageEditorMetrics.previewMinHeight)
             }

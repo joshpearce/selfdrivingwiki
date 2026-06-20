@@ -50,8 +50,16 @@ public protocol WikiStore {
 
     /// Store a dropped file's verbatim bytes + metadata as a new ingested-file
     /// row, returning its summary. Throws if the data exceeds the soft size cap.
+    /// The optional `zoteroItemKey`/`zoteroItemTitle` capture provenance when the
+    /// file was ingested from a Zotero library item; they default to `nil` so
+    /// drag-drop / URL / folder-import callers are unchanged.
     @discardableResult
-    func ingestFile(filename: String, data: Data) throws -> IngestedFileSummary
+    func ingestFile(
+        filename: String,
+        data: Data,
+        zoteroItemKey: String?,
+        zoteroItemTitle: String?
+    ) throws -> IngestedFileSummary
 
     /// Ingested-file summaries (no content blob), most-recent-first.
     func listIngestedFiles() throws -> [IngestedFileSummary]

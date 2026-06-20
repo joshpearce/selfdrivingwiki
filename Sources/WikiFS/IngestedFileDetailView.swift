@@ -118,6 +118,10 @@ struct IngestedFileDetailView: View {
             .font(.callout)
             .foregroundStyle(.secondary)
 
+            if let zoteroItemKey = file.zoteroItemKey, !zoteroItemKey.isEmpty {
+                zoteroOriginRow(key: zoteroItemKey)
+            }
+
             HStack(spacing: 10) {
                 if isEditing {
                     Button("Save Changes", systemImage: "checkmark.circle") {
@@ -175,6 +179,54 @@ struct IngestedFileDetailView: View {
         }
         .frame(maxWidth: PageEditorMetrics.readableContentWidth, alignment: .leading)
         .padding(PageEditorMetrics.contentInset)
+    }
+
+    // MARK: - Zotero origin
+
+    /// A small provenance row shown only for files ingested from a Zotero library
+    /// item: a "Zotero" tag with the item's title, and a "View in Zotero" link
+    /// that opens the item via the `zotero://select` URI scheme in the Zotero
+    /// desktop app. Files ingested via drag-drop / URL / folder import show
+    /// nothing here — empty keeps the header clean rather than adding a neutral
+    /// "Imported" tag.
+    @ViewBuilder
+    private func zoteroOriginRow(key: String) -> some View {
+        HStack(spacing: 8) {
+            Label {
+                Text("Zotero")
+                    .font(.callout)
+                    .fontWeight(.medium)
+            } icon: {
+                Image(systemName: "books.vertical")
+                    .foregroundStyle(.secondary)
+            }
+            .labelStyle(.titleAndIcon)
+
+            if let title = file.zoteroItemTitle, !title.isEmpty {
+                Text(title)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            if let url = zoteroItemURL(itemKey: key) {
+                Spacer(minLength: 0)
+                Button("View in Zotero", systemImage: "arrow.up.right.square") {
+                    NSWorkspace.shared.open(url)
+                }
+                .buttonStyle(.borderless)
+                .font(.callout)
+            }
+        }
+    }
+
+    /// Build a `zotero://select` URI that opens the item directly in the Zotero
+    /// desktop app. The `select/library/items/<key>` path targets "My Library"
+    /// and needs no library ID — perfect for a personal-library workflow.
+    private func zoteroItemURL(itemKey: String) -> URL? {
+        guard !itemKey.isEmpty else { return nil }
+        return URL(string: "zotero://select/library/items/\(itemKey)")
     }
 
     // MARK: - Content area

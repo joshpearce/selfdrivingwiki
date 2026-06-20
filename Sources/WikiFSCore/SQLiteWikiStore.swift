@@ -299,6 +299,18 @@ public final class SQLiteWikiStore: WikiStore {
             try exec("PRAGMA user_version=8;")
             version = 8
         }
+
+        // v8 → v9: provenance for files ingested from Zotero. Two nullable TEXT
+        // columns capture the parent library item at ingest time so the detail
+        // view can show "From Zotero: <title>" and link back without re-hitting
+        // the API (the item could be renamed/deleted between ingest and view).
+        // NULL for drag-drop / URL / folder-import (no Zotero provenance).
+        if version < 9 {
+            try exec("ALTER TABLE ingested_files ADD COLUMN zotero_item_key TEXT;")
+            try exec("ALTER TABLE ingested_files ADD COLUMN zotero_item_title TEXT;")
+            try exec("PRAGMA user_version=9;")
+            version = 9
+        }
     }
 
     // MARK: - vec extension loading
@@ -723,9 +735,15 @@ public final class SQLiteWikiStore: WikiStore {
     /// `ext` is the lowercased extension (no dot, `""` if none); `mime_type` is
     /// the best-effort UTI→MIME for that extension. `byte_size` mirrors
     /// `length(content)`. The id is a fresh ULID (sortable == ingest order).
-    /// Throws if `data` exceeds `ingestByteCap`.
+    /// Throws if `data` exceeds `ingestByteCap`. The optional Zotero provenance
+    /// is written to `zotero_item_key`/`zotero_item_title` (NULL when nil).
     @discardableResult
-    public func ingestFile(filename: String, data: Data) throws -> IngestedFileSummary {
+    public func ingestFile(
+        filename: String,
+        data: Data,
+        zoteroItemKey: String? = nil,
+        zoteroItemTitle: String? = nil
+    ) throws -> IngestedFileSummary {
         guard data.count <= Self.ingestByteCap else {
             throw WikiStoreError.unexpected(
                 "ingested file \(data.count) bytes exceeds cap \(Self.ingestByteCap)")
@@ -737,8 +755,9 @@ public final class SQLiteWikiStore: WikiStore {
 
         let stmt = try statement("""
         INSERT INTO ingested_files
-          (id, filename, ext, mime_type, byte_size, content, created_at, updated_at, version)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1);
+          (id, filename, ext, mime_type, byte_size, content, created_at, updated_at, version,
+           zotero_item_key, zotero_item_title)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1, ?8, ?9);
         """)
         defer { stmt.reset() }
         try stmt.bind(id.rawValue, at: 1)
@@ -748,11 +767,14 @@ public final class SQLiteWikiStore: WikiStore {
         try stmt.bind(Int64(data.count), at: 5)
         try stmt.bind(data, at: 6)
         try stmt.bind(now.timeIntervalSince1970, at: 7)
+        if let zoteroItemKey { try stmt.bind(zoteroItemKey, at: 8) }  // else leave NULL
+        if let zoteroItemTitle { try stmt.bind(zoteroItemTitle, at: 9) }  // else leave NULL
         _ = try stmt.step()
 
         return IngestedFileSummary(
             id: id, filename: filename, ext: ext, mimeType: mime,
-            byteSize: data.count, createdAt: now, updatedAt: now, version: 1
+            byteSize: data.count, createdAt: now, updatedAt: now, version: 1,
+            zoteroItemKey: zoteroItemKey, zoteroItemTitle: zoteroItemTitle
         )
     }
 
@@ -760,7 +782,8 @@ public final class SQLiteWikiStore: WikiStore {
     /// management list. `id` is a ULID so `created_at DESC` orders by ingest.
     public func listIngestedFiles() throws -> [IngestedFileSummary] {
         let stmt = try statement("""
-        SELECT id, filename, ext, mime_type, byte_size, created_at, updated_at, version
+        SELECT id, filename, ext, mime_type, byte_size, created_at, updated_at, version,
+               zotero_item_key, zotero_item_title
         FROM ingested_files ORDER BY created_at DESC, id DESC;
         """)
         defer { stmt.reset() }
@@ -774,7 +797,8 @@ public final class SQLiteWikiStore: WikiStore {
     /// One ingested-file summary (NO content blob). Throws `.notFound` if absent.
     public func getIngestedFile(id: PageID) throws -> IngestedFileSummary {
         let stmt = try statement("""
-        SELECT id, filename, ext, mime_type, byte_size, created_at, updated_at, version
+        SELECT id, filename, ext, mime_type, byte_size, created_at, updated_at, version,
+               zotero_item_key, zotero_item_title
         FROM ingested_files WHERE id = ?1;
         """)
         defer { stmt.reset() }
@@ -850,11 +874,16 @@ public final class SQLiteWikiStore: WikiStore {
     }
 
     /// Map the current row of an `ingested_files` SELECT (column order: id,
-    /// filename, ext, mime_type, byte_size, created_at, updated_at, version) to a
-    /// summary. `mime_type` is read as NULL→nil via the column type.
+    /// filename, ext, mime_type, byte_size, created_at, updated_at, version,
+    /// zotero_item_key, zotero_item_title) to a summary. `mime_type` and the two
+    /// Zotero columns are read as NULL→nil via the column type.
     private func ingestedSummary(from stmt: SQLiteStatement) -> IngestedFileSummary {
         let mime = sqlite3_column_type(stmt.handle, 3) == SQLITE_NULL
             ? nil : stmt.text(at: 3)
+        let zoteroItemKey = sqlite3_column_type(stmt.handle, 8) == SQLITE_NULL
+            ? nil : stmt.text(at: 8)
+        let zoteroItemTitle = sqlite3_column_type(stmt.handle, 9) == SQLITE_NULL
+            ? nil : stmt.text(at: 9)
         return IngestedFileSummary(
             id: PageID(rawValue: stmt.text(at: 0)),
             filename: stmt.text(at: 1),
@@ -863,7 +892,9 @@ public final class SQLiteWikiStore: WikiStore {
             byteSize: Int(stmt.int(at: 4)),
             createdAt: Date(timeIntervalSince1970: stmt.double(at: 5)),
             updatedAt: Date(timeIntervalSince1970: stmt.double(at: 6)),
-            version: Int(stmt.int(at: 7))
+            version: Int(stmt.int(at: 7)),
+            zoteroItemKey: zoteroItemKey,
+            zoteroItemTitle: zoteroItemTitle
         )
     }
 
