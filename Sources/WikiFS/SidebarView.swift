@@ -194,7 +194,20 @@ struct SidebarView: View {
             case .ingestedFile: activeSection = .files
             default: break
             }
-            // Obsidian-style: single-click opens/activates a tab.
+            // The `listSelection` set is also written programmatically by the
+            // `.onChange(of: store.selection)` sync below whenever the model
+            // changes the active tab (tab click, close→neighbor, history nav).
+            // In that case `first` already equals the active tab's selection, so
+            // opening a tab would spawn a duplicate to the right. Only a *fresh*
+            // sidebar click lands on a selection that isn't already the active
+            // tab — that's the one that should open/focus a tab.
+            if first == store.activeTab?.selection {
+                DebugLog.tabs(
+                    "SidebarView.selectionDidChange: \(first) already active tab — skip openTab (programmatic sync)")
+                return
+            }
+            DebugLog.tabs("SidebarView.selectionDidChange: click \(first) → openTab")
+            // Single-click opens the page's tab — reused if already open, else new.
             store.openTab(first)
         }
     }

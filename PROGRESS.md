@@ -2,6 +2,82 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-19 — Tab system rebuild: ID-based active tab + right-click context menu
+
+Rebuilt the multi-tab system from scratch (plan:
+`plans/tab-context-menu-rebuild.md`) to fix architectural defects in the merged
+version and add the right-click context menu it lacked.
+
+**What was broken in the merged system:**
+- `activeTabIndex: Int` as the source of truth forced fragile index arithmetic
+  (`min(index, count-1)`, `index < activeTabIndex ? -= 1`) in every close path —
+  the root of the off-by-one / "wrong tab activates" bugs.
+- `isSwitchingTab` re-entrancy guard was duplicated around every programmatic
+  `selection = …` / `loadDrafts` pair (easy to miss one site).
+- The uncommitted context menu used an `NSViewRepresentable` overlay setting
+  `NSView.menu`, which fought SwiftUI's responder/gesture system (the "severe
+  bugs"). Close button used insert-on-hover, reflowing tab width on hover.
+
+**The rebuild (`WikiStoreModel`):**
+- **`activeTabID: UUID?`** is now the single source of truth; `activeTabIndex` /
+  `activeTab` are computed view-layer conveniences (never stored, can't go stale).
+- **`setActiveTab(_:)`** is the one seam every switch routes through: flush →
+  set `activeTabID` → mirror `selection` → `loadDrafts`, under a single
+  `isApplyingTabSelection` guard (replaces the scattered `isSwitchingTab`).
+- One intent per method: `openTab` (focus existing tab for any selection, else
+  create new — see post-rebuild fix below),
+  `selectTab(id:)`, `closeTab(id:)`, `closeOtherTabs(id:)`, `closeTabsAfter(id:)`,
+  `closeAllTabs()`, `reopenLastClosedTab()`. `handleSelectionChange` /
+  `select` / `applyHistorySelection` share one `syncActiveTabMetadata(to:)`
+  helper for in-tab navigation.
+- `delete` / `deleteIngestedFile` close affected tabs by ID.
+
+**The rebuild (`WikiFS` views):**
+- `TabBarItemView` uses native SwiftUI **`.contextMenu`** (Close / Close Others
+  / Close Tabs After / Close All) — the `NSViewRepresentable` `TabContextMenu` is
+  gone. Close button is always-present with **opacity-fade** (`.opacity` +
+  `.allowsHitTesting`), not insert-on-hover (SWIFTUI-RULES §4.5). Tap handled via
+  `.onTapGesture` so the nested close `Button` and context menu coexist cleanly.
+- `TabBarView` iterates `store.tabs` by `id`, `isActive` = `tab.id ==
+  activeTabID`. `ContentView` Cmd+W / Cmd+1–9 use the ID-based API.
+
+**Post-rebuild fixes (same day, from live testing):**
+- **Duplicate tab on tab click.** Clicking a tab set `store.selection`, which the
+  sidebar's `.onChange(of: store.selection)` mirrored into `listSelection`, which
+  re-fired `selectionDidChange` → `openTab` → a phantom tab to the right. Fixed in
+  `SidebarView.selectionDidChange`: skip `openTab` when the clicked selection
+  already equals `store.activeTab?.selection` (it's a programmatic sync, not a
+  fresh click).
+- **Tabs never reused.** `openTab` only de-duped the singleton types; pages/files
+  always spawned a new tab (the plan's "Obsidian always-new" rule). Per operator
+  request, `openTab` now **focuses an existing tab for any selection** if one is
+  open, else creates a new one. `selectPage(byTitle:)` (`[[wiki-link]]` clicks)
+  now routes through `openTab` (records history first, then reuses/creates) so
+  clicking a link to an already-open page returns to its tab.
+- Logging: added a `tabs` category to `DebugLog` (subsystem
+  `com.selfdrivingwiki.debug`) used in `SidebarView`; `print("[tabs] …")` traces
+  in `WikiStoreModel.openTab`.
+- **Responsive tab strip.** Replaced the horizontal `ScrollView` (tabs ran past
+  the window edge) with a `GeometryReader`-driven layout: tabs share the
+  available width evenly, shrinking from 200pt toward 110pt as more open; past
+  that they spill into a `⌄` overflow menu (a full tab switcher listing every
+  open tab, active one checkmarked). The **active tab is always kept visible** —
+  pinned into the last visible slot if it would otherwise overflow. The
+  fit/overflow arithmetic is a pure `TabBarLayout.compute` in Core with 7 unit
+  tests (`TabBarLayoutTests`); `TabBarItemView` now takes a uniform `width` and
+  truncates its title within.
+
+Shared-draft model retained (per-tab drafts remain an explicit non-goal).
+**43 `EditorTabTests`** (was 31) cover the ID-based API plus the three new
+close-variants and edge cases (leftmost-active close, anchor-active
+`closeTabsAfter`, kept-non-active `closeOtherTabs`, recently-closed cap at 10),
+plus tab-reuse coverage (`openTabForExistingPageReusesTab`, and
+`WikiLinkNavigationTests` reuse/new-tab cases for `selectPage`).
+Full suite green (531 tests, incl. 7 `TabBarLayoutTests`); `make check` clean;
+signed bundle builds. Design
+skills (swiftui-pro / macos-design / typography-designer) were not installed in
+the build session — SWIFTUI-RULES applied inline.
+
 ## 2026-06-19 — Multi-tab editor space (Obsidian-style)
 
 Added a multi-tab editor space: a horizontal tab bar above the detail pane lets

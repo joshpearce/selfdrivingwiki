@@ -18,6 +18,8 @@ struct EditorTabTests {
     @Test func startsWithNoTabs() throws {
         let (model, _) = try tempModel()
         #expect(model.tabs.isEmpty)
+        #expect(model.activeTabID == nil)
+        #expect(model.activeTab == nil)
         #expect(model.activeTabIndex == 0)
         #expect(model.recentlyClosedTabs.isEmpty)
     }
@@ -37,7 +39,7 @@ struct EditorTabTests {
         #expect(model.tabs.count == 1)
         #expect(model.tabs[0].selection == .page(a.id))
         #expect(model.tabs[0].title == "A")
-        #expect(model.activeTabIndex == 0)
+        #expect(model.activeTabID == model.tabs[0].id)
     }
 
     @Test func sidebarSingleClickReplacesActiveTabContent() throws {
@@ -50,11 +52,13 @@ struct EditorTabTests {
         model.handleSelectionChange(to: .page(a.id))
         #expect(model.tabs.count == 1)
         #expect(model.tabs[0].title == "A")
+        let tabID = model.tabs[0].id
 
         model.selection = .page(b.id)
         model.handleSelectionChange(to: .page(b.id))
 
         #expect(model.tabs.count == 1)  // Still one tab — content replaced
+        #expect(model.tabs[0].id == tabID)  // Same tab, not a new one
         #expect(model.tabs[0].selection == .page(b.id))
         #expect(model.tabs[0].title == "B")
     }
@@ -78,24 +82,28 @@ struct EditorTabTests {
         #expect(model.tabs.count == 2)
         #expect(model.tabs[0].selection == .page(a.id))
         #expect(model.tabs[1].selection == .page(b.id))
-        #expect(model.activeTabIndex == 1)  // New tab is active
+        #expect(model.activeTabID == model.tabs[1].id)  // New tab is active
         #expect(model.selection == .page(b.id))
     }
 
-    @Test func openTabForExistingPageCreatesNewTab() throws {
+    @Test func openTabForExistingPageReusesTab() throws {
         let (model, store) = try tempModel()
         let a = try store.createPage(title: "A")
+        let b = try store.createPage(title: "B")
         model.reloadFromStore()
 
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
-        #expect(model.tabs.count == 1)
+        let tabA = model.tabs[0].id
+        model.openTab(.page(b.id))  // active is B now
+        #expect(model.tabs.count == 2)
 
-        // Opening the same page again creates a new tab (Obsidian-style).
+        // Opening a page that's already open focuses its existing tab — no
+        // duplicate (tab reuse, the operator's requested behavior).
         model.openTab(.page(a.id))
         #expect(model.tabs.count == 2)
-        #expect(model.tabs[0].selection == .page(a.id))
-        #expect(model.tabs[1].selection == .page(a.id))
+        #expect(model.activeTabID == tabA)
+        #expect(model.selection == .page(a.id))
     }
 
     // MARK: - Singleton reuse
@@ -109,11 +117,12 @@ struct EditorTabTests {
         model.handleSelectionChange(to: .page(a.id))
         model.openTab(.query)
         #expect(model.tabs.count == 2)
+        let queryTabID = model.tabs[1].id
 
-        // Opening query again should switch to the existing query tab.
+        // Opening query again should focus the existing query tab.
         model.openTab(.query)
         #expect(model.tabs.count == 2)  // No duplicate
-        #expect(model.activeTabIndex == 1)  // Query tab is active
+        #expect(model.activeTabID == queryTabID)  // Query tab is active
     }
 
     @Test func singletonSystemPromptReusesExistingTab() throws {
@@ -142,11 +151,12 @@ struct EditorTabTests {
 
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
         model.openTab(.page(b.id))
-        // Both tabs open, B is active (index 1).
+        // Both tabs open, B is active.
 
-        model.selectTab(at: 0)
-        #expect(model.activeTabIndex == 0)
+        model.selectTab(id: tabA)
+        #expect(model.activeTabID == tabA)
         #expect(model.selection == .page(a.id))
     }
 
@@ -158,18 +168,19 @@ struct EditorTabTests {
 
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
         model.openTab(.page(b.id))
         model.draftBody = "B content has been edited"
         model.bodyChanged()
         model.flushPendingSave()
 
         // Switch back to tab A. B's draft should have been persisted.
-        model.selectTab(at: 0)
+        model.selectTab(id: tabA)
         let bPage = try store.getPage(id: b.id)
         #expect(bPage.bodyMarkdown == "B content has been edited")
     }
 
-    @Test func selectTabWithSameIndexIsNoOp() throws {
+    @Test func selectTabWithActiveIDIsNoOp() throws {
         let (model, store) = try tempModel()
         let a = try store.createPage(title: "A")
         model.reloadFromStore()
@@ -177,11 +188,26 @@ struct EditorTabTests {
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
         model.draftBody = "some text"
+        let activeID = model.activeTabID!
 
         // Selecting the already-active tab should not flush/change anything.
-        model.selectTab(at: 0)
-        #expect(model.activeTabIndex == 0)
+        model.selectTab(id: activeID)
+        #expect(model.activeTabID == activeID)
         #expect(model.draftBody == "some text")
+    }
+
+    @Test func selectTabWithUnknownIDIsNoOp() throws {
+        let (model, store) = try tempModel()
+        let a = try store.createPage(title: "A")
+        model.reloadFromStore()
+
+        model.selection = .page(a.id)
+        model.handleSelectionChange(to: .page(a.id))
+        let activeID = model.activeTabID!
+
+        model.selectTab(id: UUID())  // never opened
+        #expect(model.activeTabID == activeID)
+        #expect(model.tabs.count == 1)
     }
 
     // MARK: - closeTab
@@ -195,19 +221,22 @@ struct EditorTabTests {
 
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
         model.openTab(.page(b.id))
+        let tabB = model.tabs[1].id
         model.openTab(.page(c.id))
+        let tabC = model.tabs[2].id
         #expect(model.tabs.count == 3)
-        #expect(model.activeTabIndex == 2)
 
-        // Close tab 1 (B). Active is 2 > 1, stays at 1 (C shifts left).
-        model.closeTab(at: 1)
+        // Make B active, then close it. The tab now at B's position (C) activates.
+        model.selectTab(id: tabB)
+        model.closeTab(id: tabB)
         #expect(model.tabs.count == 2)
-        #expect(model.tabs[1].selection == .page(c.id))
-        #expect(model.activeTabIndex == 1)
+        #expect(model.tabs.map(\.id) == [tabA, tabC])
+        #expect(model.activeTabID == tabC)
     }
 
-    @Test func closeTabRightmostActivatesLeftNeighbor() throws {
+    @Test func closeRightmostActiveTabActivatesLeftNeighbor() throws {
         let (model, store) = try tempModel()
         let a = try store.createPage(title: "A")
         let b = try store.createPage(title: "B")
@@ -215,14 +244,38 @@ struct EditorTabTests {
 
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
         model.openTab(.page(b.id))
-        #expect(model.activeTabIndex == 1)
+        let tabB = model.tabs[1].id
+        #expect(model.activeTabID == tabB)
 
-        // Close tab 1 (rightmost, active).
-        model.closeTab(at: 1)
+        // Close the rightmost (active) tab.
+        model.closeTab(id: tabB)
         #expect(model.tabs.count == 1)
-        #expect(model.activeTabIndex == 0)
+        #expect(model.activeTabID == tabA)
         #expect(model.tabs[0].selection == .page(a.id))
+    }
+
+    @Test func closeActiveLeftmostTabActivatesNewLeftmost() throws {
+        let (model, store) = try tempModel()
+        let a = try store.createPage(title: "A")
+        let b = try store.createPage(title: "B")
+        let c = try store.createPage(title: "C")
+        model.reloadFromStore()
+
+        model.selection = .page(a.id)
+        model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
+        model.openTab(.page(b.id))
+        let tabB = model.tabs[1].id
+        model.openTab(.page(c.id))
+        let tabC = model.tabs[2].id
+
+        // Activate leftmost (index 0) and close it. The new leftmost (B) activates.
+        model.selectTab(id: tabA)
+        model.closeTab(id: tabA)
+        #expect(model.tabs.map(\.id) == [tabB, tabC])
+        #expect(model.activeTabID == tabB)
     }
 
     @Test func closeLastTabShowsEmptyState() throws {
@@ -233,13 +286,39 @@ struct EditorTabTests {
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
         #expect(model.tabs.count == 1)
+        let tabA = model.tabs[0].id
 
-        model.closeTab(at: 0)
+        model.closeTab(id: tabA)
         #expect(model.tabs.isEmpty)
+        #expect(model.activeTabID == nil)
         #expect(model.selection == nil)
     }
 
-    @Test func closeNonActiveTabDoesNotChangeSelection() throws {
+    @Test func closeNonActiveTabDoesNotChangeActive() throws {
+        let (model, store) = try tempModel()
+        let a = try store.createPage(title: "A")
+        let b = try store.createPage(title: "B")
+        let c = try store.createPage(title: "C")
+        model.reloadFromStore()
+
+        model.selection = .page(a.id)
+        model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
+        model.openTab(.page(b.id))
+        model.openTab(.page(c.id))
+        let tabC = model.tabs[2].id
+        // Active is C.
+
+        // Close A (not active, to the left of active).
+        model.closeTab(id: tabA)
+        #expect(model.tabs.count == 2)
+        #expect(model.activeTabID == tabC)  // Unchanged
+        #expect(model.selection == .page(c.id))
+    }
+
+    // MARK: - closeOtherTabs
+
+    @Test func closeOtherTabsKeepsOnlySpecifiedActiveTab() throws {
         let (model, store) = try tempModel()
         let a = try store.createPage(title: "A")
         let b = try store.createPage(title: "B")
@@ -249,14 +328,161 @@ struct EditorTabTests {
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
         model.openTab(.page(b.id))
+        let tabB = model.tabs[1].id
         model.openTab(.page(c.id))
-        // Active is tab 2 (C).
+        // C active, three tabs.
 
-        // Close tab 0 (A, not active, to the left of active).
-        model.closeTab(at: 0)
+        model.selectTab(id: tabB)
+        model.closeOtherTabs(id: tabB)
+        #expect(model.tabs.count == 1)
+        #expect(model.tabs[0].id == tabB)
+        #expect(model.activeTabID == tabB)
+        #expect(model.selection == .page(b.id))
+        #expect(model.recentlyClosedTabs.count == 2)
+    }
+
+    @Test func closeOtherTabsActivatesKeptTabWhenNotActive() throws {
+        let (model, store) = try tempModel()
+        let a = try store.createPage(title: "A")
+        let b = try store.createPage(title: "B")
+        let c = try store.createPage(title: "C")
+        model.reloadFromStore()
+
+        model.selection = .page(a.id)
+        model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
+        model.openTab(.page(b.id))
+        model.openTab(.page(c.id))
+        // C is active; keep A (not active).
+
+        model.closeOtherTabs(id: tabA)
+        #expect(model.tabs.count == 1)
+        #expect(model.tabs[0].id == tabA)
+        #expect(model.activeTabID == tabA)  // kept tab becomes active
+        #expect(model.selection == .page(a.id))
+    }
+
+    @Test func closeOtherTabsWithSingleTabIsNoOp() throws {
+        let (model, store) = try tempModel()
+        let a = try store.createPage(title: "A")
+        model.reloadFromStore()
+
+        model.selection = .page(a.id)
+        model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
+
+        model.closeOtherTabs(id: tabA)
+        #expect(model.tabs.count == 1)
+        #expect(model.recentlyClosedTabs.isEmpty)
+    }
+
+    // MARK: - closeTabsAfter
+
+    @Test func closeTabsAfterClosesRightSideAndActivatesAnchor() throws {
+        let (model, store) = try tempModel()
+        let a = try store.createPage(title: "A")
+        let b = try store.createPage(title: "B")
+        let c = try store.createPage(title: "C")
+        model.reloadFromStore()
+
+        model.selection = .page(a.id)
+        model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
+        model.openTab(.page(b.id))
+        let tabB = model.tabs[1].id
+        model.openTab(.page(c.id))
+        // C active. Close tabs after A — B and C close, active (C) was closed.
+
+        model.closeTabsAfter(id: tabA)
+        #expect(model.tabs.map(\.id) == [tabA])
+        #expect(model.activeTabID == tabA)  // anchor activated
+        #expect(model.selection == .page(a.id))
+        #expect(model.recentlyClosedTabs.count == 2)
+        _ = tabB
+    }
+
+    @Test func closeTabsAfterLeavesActiveUnchangedWhenAnchorIsActive() throws {
+        let (model, store) = try tempModel()
+        let a = try store.createPage(title: "A")
+        let b = try store.createPage(title: "B")
+        let c = try store.createPage(title: "C")
+        model.reloadFromStore()
+
+        model.selection = .page(a.id)
+        model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
+        model.openTab(.page(b.id))
+        model.openTab(.page(c.id))
+
+        // Active is A (the anchor). Closing tabs after A keeps A active.
+        model.selectTab(id: tabA)
+        model.closeTabsAfter(id: tabA)
+        #expect(model.tabs.map(\.id) == [tabA])
+        #expect(model.activeTabID == tabA)
+    }
+
+    @Test func closeTabsAfterLeavesActiveUnchangedWhenActiveIsLeftOfAnchor() throws {
+        let (model, store) = try tempModel()
+        let a = try store.createPage(title: "A")
+        let b = try store.createPage(title: "B")
+        let c = try store.createPage(title: "C")
+        model.reloadFromStore()
+
+        model.selection = .page(a.id)
+        model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
+        model.openTab(.page(b.id))
+        let tabB = model.tabs[1].id
+        model.openTab(.page(c.id))
+
+        // Active is A (left of anchor B). Close tabs after B (closes C only).
+        model.selectTab(id: tabA)
+        model.closeTabsAfter(id: tabB)
+        #expect(model.tabs.map(\.id) == [tabA, tabB])
+        #expect(model.activeTabID == tabA)  // unchanged, A still present
+    }
+
+    @Test func closeTabsAfterRightmostIsNoOp() throws {
+        let (model, store) = try tempModel()
+        let a = try store.createPage(title: "A")
+        let b = try store.createPage(title: "B")
+        model.reloadFromStore()
+
+        model.selection = .page(a.id)
+        model.handleSelectionChange(to: .page(a.id))
+        model.openTab(.page(b.id))
+        let tabB = model.tabs[1].id
+
+        model.closeTabsAfter(id: tabB)  // nothing to the right
         #expect(model.tabs.count == 2)
-        #expect(model.activeTabIndex == 1)  // Shifted from 2 → 1
-        #expect(model.selection == .page(c.id))
+        #expect(model.recentlyClosedTabs.isEmpty)
+    }
+
+    // MARK: - closeAllTabs
+
+    @Test func closeAllTabsClearsAllAndEntersEmptyState() throws {
+        let (model, store) = try tempModel()
+        let a = try store.createPage(title: "A")
+        let b = try store.createPage(title: "B")
+        model.reloadFromStore()
+
+        model.selection = .page(a.id)
+        model.handleSelectionChange(to: .page(a.id))
+        model.openTab(.page(b.id))
+        #expect(model.tabs.count == 2)
+
+        model.closeAllTabs()
+        #expect(model.tabs.isEmpty)
+        #expect(model.activeTabID == nil)
+        #expect(model.selection == nil)
+        #expect(model.recentlyClosedTabs.count == 2)
+    }
+
+    @Test func closeAllTabsWithNoTabsIsNoOp() throws {
+        let (model, _) = try tempModel()
+        model.closeAllTabs()
+        #expect(model.tabs.isEmpty)
+        #expect(model.recentlyClosedTabs.isEmpty)
     }
 
     // MARK: - Reopen closed tab
@@ -268,13 +494,14 @@ struct EditorTabTests {
 
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
-        model.closeTab(at: 0)
+        let tabA = model.tabs[0].id
+        model.closeTab(id: tabA)
         #expect(model.tabs.isEmpty)
 
         model.reopenLastClosedTab()
         #expect(model.tabs.count == 1)
         #expect(model.tabs[0].selection == .page(a.id))
-        #expect(model.activeTabIndex == 0)
+        #expect(model.activeTabID == model.tabs[0].id)
     }
 
     @Test func closeTabPreservesInRecentlyClosedStack() throws {
@@ -284,7 +511,8 @@ struct EditorTabTests {
 
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
-        model.closeTab(at: 0)
+        let tabA = model.tabs[0].id
+        model.closeTab(id: tabA)
 
         #expect(model.recentlyClosedTabs.count == 1)
         #expect(model.recentlyClosedTabs[0].title == "A")
@@ -295,6 +523,25 @@ struct EditorTabTests {
         #expect(model.recentlyClosedTabs.isEmpty)
         model.reopenLastClosedTab()
         #expect(model.tabs.isEmpty)
+    }
+
+    @Test func recentlyClosedStackCapsAtTen() throws {
+        let (model, store) = try tempModel()
+        // Open and close 12 distinct pages.
+        var firstTitle: String?
+        for i in 0..<12 {
+            let title = "P\(i)"
+            if firstTitle == nil { firstTitle = title }
+            let page = try store.createPage(title: title)
+            model.reloadFromStore()
+            model.openTab(.page(page.id))
+            model.closeTab(id: model.tabs[0].id)
+        }
+        #expect(model.recentlyClosedTabs.count == 10)
+        // The two oldest entries (P0, P1) were evicted from the front.
+        #expect(!model.recentlyClosedTabs.contains { $0.title == "P0" })
+        #expect(!model.recentlyClosedTabs.contains { $0.title == "P1" })
+        #expect(model.recentlyClosedTabs.last?.title == "P11")
     }
 
     // MARK: - Delete page closes affected tab
@@ -309,7 +556,6 @@ struct EditorTabTests {
         model.handleSelectionChange(to: .page(a.id))
         model.openTab(.page(b.id))
         #expect(model.tabs.count == 2)
-        #expect(model.activeTabIndex == 1)  // B is active
 
         model.delete(a.id)
         #expect(model.tabs.count == 1)
@@ -324,12 +570,13 @@ struct EditorTabTests {
 
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
+        let tabA = model.tabs[0].id
         model.openTab(.page(b.id))
-        // Active is tab 1 (B).
+        // Active is B.
 
         model.delete(b.id)
         #expect(model.tabs.count == 1)
-        #expect(model.activeTabIndex == 0)
+        #expect(model.activeTabID == tabA)
         #expect(model.tabs[0].selection == .page(a.id))
     }
 
@@ -343,10 +590,12 @@ struct EditorTabTests {
         model.selection = .page(a.id)
         model.handleSelectionChange(to: .page(a.id))
         model.openTab(.page(b.id))
+        let activeBefore = model.activeTabID
 
         // Delete C — not open in any tab.
         model.delete(c.id)
         #expect(model.tabs.count == 2)
+        #expect(model.activeTabID == activeBefore)
     }
 
     // MARK: - Delete ingested file closes affected tab
@@ -395,12 +644,9 @@ struct EditorTabTests {
         #expect(model.tabs.count == 3)
 
         model.rename(a.id, to: "Renamed A")
-        // Tab 0 (page A) should be renamed.
-        #expect(model.tabs[0].title == "Renamed A")
-        // Tab 1 (page B) should be unchanged.
-        #expect(model.tabs[1].title == "B")
-        // Tab 2 (Query) should be unchanged.
-        #expect(model.tabs[2].title == "Query")
+        #expect(model.tabs[0].title == "Renamed A")  // page A
+        #expect(model.tabs[1].title == "B")          // page B unchanged
+        #expect(model.tabs[2].title == "Query")      // Query unchanged
     }
 
     // MARK: - newPageInNewTab
@@ -417,7 +663,7 @@ struct EditorTabTests {
             #expect(Bool(false), "Expected tab selection to be a page")
         }
         #expect(model.tabs[0].title == "Fresh Page")
-        #expect(model.activeTabIndex == 0)
+        #expect(model.activeTabID == model.tabs[0].id)
 
         let summaries = (try? store.listPages(sortBy: .lastUpdated)) ?? []
         #expect(summaries.contains(where: { $0.title == "Fresh Page" }))
