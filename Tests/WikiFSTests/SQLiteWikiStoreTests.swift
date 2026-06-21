@@ -149,11 +149,11 @@ struct SQLiteWikiStoreTests {
     @Test func changeTokenAdvancesOnEveryMutation() throws {
         let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
 
-        // v5 format:
-        //   "<pCount>:<pSum>:<fCount>:<fSum>:<spVersion>:<logCount>:<idxVersion>".
+        // Current format:
+        //   "<pCount>:<pSum>:<fCount>:<fSum>:<spVersion>:<logCount>:<idxVersion>:<smvCount>".
         // A fresh DB seeds the system_prompt AND wiki_index singletons at version
-        // 1, has no log rows, and no source_markdown_versions →
-        // trailing ":1:0:1:0".
+        // 1, has no log rows, no source_markdown_versions, and no processed
+        // markdown → trailing ":1:0:1:0".
         #expect(try store.changeToken() == "0:0:0:0:1:0:1:0")
 
         // Create bumps page COUNT and SUM (version starts at 1).
@@ -195,6 +195,87 @@ struct SQLiteWikiStoreTests {
         // Delete the first → file COUNT and SUM drop.
         try store.deleteSource(id: f.id)
         #expect(try store.changeToken() == "0:0:1:1:1:0:1:0")
+    }
+
+    /// The token MUST advance when a processed markdown version is appended,
+    /// or the `sources/` tree would never learn of new extracts.
+    @Test func changeTokenAdvancesOnAppendProcessedMarkdown() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        #expect(try store.changeToken() == "0:0:0:0:1:0:1:0")
+
+        // Add a source first.
+        let source = try store.addSource(filename: "doc.pdf", data: Data("pdf content".utf8))
+        #expect(try store.changeToken() == "0:0:1:1:1:0:1:0")
+
+        // Append processed markdown — smvCount goes 0 → 1.
+        _ = try store.appendProcessedMarkdown(
+            sourceID: source.id, content: "# Extracted", origin: "test", note: nil)
+        #expect(try store.changeToken() == "0:0:1:1:1:0:1:1")
+
+        // Append another version — smvCount advances again.
+        _ = try store.appendProcessedMarkdown(
+            sourceID: source.id, content: "# Edited", origin: "test", note: "edit")
+        #expect(try store.changeToken() == "0:0:1:1:1:0:1:2")
+
+        // Deleting the source removes its markdown versions (CASCADE).
+        try store.deleteSource(id: source.id)
+        #expect(try store.changeToken() == "0:0:0:0:1:0:1:0")
+    }
+
+    /// processedMarkdownHeadsBySource returns one row per source, keyed by
+    /// sourceID, with the head version for each.
+    @Test func processedMarkdownHeadsBySourceReturnsCorrectHeads() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+
+        // No sources → empty dict.
+        #expect(try store.processedMarkdownHeadsBySource().isEmpty)
+
+        // Add two sources.
+        let a = try store.addSource(filename: "a.pdf", data: Data("a".utf8))
+        let b = try store.addSource(filename: "b.pdf", data: Data("b".utf8))
+
+        // No markdown yet → still empty.
+        #expect(try store.processedMarkdownHeadsBySource().isEmpty)
+
+        // Append markdown for source a only.
+        let v1 = try store.appendProcessedMarkdown(
+            sourceID: a.id, content: "# A", origin: "test", note: nil)
+        var heads = try store.processedMarkdownHeadsBySource()
+        #expect(heads.count == 1)
+        #expect(heads[a.id.rawValue]?.id == v1.id)
+        #expect(heads[a.id.rawValue]?.content == "# A")
+
+        // Append markdown for source b.
+        let v2 = try store.appendProcessedMarkdown(
+            sourceID: b.id, content: "# B", origin: "test", note: nil)
+        heads = try store.processedMarkdownHeadsBySource()
+        #expect(heads.count == 2)
+        #expect(heads[a.id.rawValue]?.id == v1.id)
+        #expect(heads[b.id.rawValue]?.id == v2.id)
+
+        // Append a new head for source a — only that source's entry changes.
+        let v3 = try store.appendProcessedMarkdown(
+            sourceID: a.id, content: "# A Edited", origin: "test", note: "edit")
+        heads = try store.processedMarkdownHeadsBySource()
+        #expect(heads.count == 2)
+        #expect(heads[a.id.rawValue]?.id == v3.id)
+        #expect(heads[a.id.rawValue]?.content == "# A Edited")
+        #expect(heads[b.id.rawValue]?.id == v2.id)
+    }
+
+    // MARK: - Processed markdown head returns nil when empty (lazy-seed regression)
+
+    @Test func processedMarkdownHeadReturnsNilWhenNoVersionsExist() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        let source = try store.addSource(filename: "doc.pdf", data: Data("pdf".utf8))
+
+        // Head is nil when no markdown has been appended.
+        let head = try store.processedMarkdownHead(sourceID: source.id)
+        #expect(head == nil)
+
+        // No chain row was created by the nil read (lazy-seed regression).
+        #expect(try !store.hasProcessedMarkdown(sourceID: source.id))
+        #expect(try store.processedMarkdownHistory(sourceID: source.id).isEmpty)
     }
 
     // MARK: - ULID ordering

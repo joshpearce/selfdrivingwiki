@@ -235,4 +235,30 @@ struct WikiStoreModelMarkdownImportTests {
         let result = await model.importFromMarkdownFolder(directory: dir)
         #expect(result.imported == 2)
     }
+
+    // MARK: - Lazy-seed regression
+
+    /// processedMarkdownHead(for:) on an .md source MUST return nil when no
+    /// markdown has been appended, and MUST NOT create a chain row as a side
+    /// effect of the nil read. This guards against a lazy-seed regression where
+    /// merely querying a source's processed-markdown head would auto-create a
+    /// version row, cluttering the history with empty/extraneous entries.
+    @Test func processedMarkdownHeadOnMdSourceReturnsNilNoSideEffect() throws {
+        let store = try tempStore()
+        let model = WikiStoreModel(store: store)
+
+        // Add an .md source via the model.
+        model.addSource(filename: "note.md", data: Data("# Hello".utf8))
+        #expect(model.sources.count == 1)
+        let source = model.sources[0]
+
+        // Head must be nil — no processed markdown has been appended.
+        let head = model.processedMarkdownHead(for: source)
+        #expect(head == nil)
+
+        // No chain row was created by the nil read (lazy-seed regression).
+        // We verify at the store level, bypassing the model's nil-coalescing.
+        #expect(try !store.hasProcessedMarkdown(sourceID: source.id))
+        #expect(try store.processedMarkdownHistory(sourceID: source.id).isEmpty)
+    }
 }
