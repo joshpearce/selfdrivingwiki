@@ -4,15 +4,19 @@ Newest first. To get up to speed: read `PLAN.md` then this file.
 
 ## 2026-06-21 — Phase B: `[[source:display-name]]` wikilinks
 
+An adversarial multi-agent review of the parent design (`sources-redesign.md`) found
+23 issues: a self-contradictory render contract (`?id=` needs a ULID at render time
+but the closure is Bool), no shared normalizer, case-sensitive page resolution that
+diverged from the spec, and a claim that the rename would add a "general" link-rewrite
+scanner when none existed. A new grounded plan (`phase-b-source-wikilinks.md`) resolved
+all findings, then the implementation followed.
+
 Wiki pages can now link to sources with `[[source:display-name]]` syntax. Clicking a
 source link in the preview navigates to that source's detail view — the same seam
-page links use. The implementation spans the full stack: parser → renderer → resolver
-→ navigator → persistence → agent index.
-
-The architecture mirrors page links: source links render as
-`wiki://source?title=<display-name>` (not `?id=<ulid>`), resolution happens at click
-time via a new `selectSource(byDisplayName:)`, and the resolution closure stays
-uniform — a single `(String, LinkType) -> Bool` for both link kinds.
+page links use. Source links render as `wiki://source?title=<display-name>`
+(not `?id=<ulid>`), resolution happens at click time via
+`selectSource(byDisplayName:)`, and a single `(String, LinkType) -> Bool` closure
+serves both link kinds.
 
 **Changes:**
 
@@ -69,8 +73,8 @@ uniform — a single `(String, LinkType) -> Bool` for both link kinds.
   running `wikictl file` from its prompt instructions and getting "unknown
   command". Three commits pushed to the PR to stamp this out.
 
-**Tests.** `swift test` — 635 tests, 50 suites, 0 failures (+34 from the prior
-baseline of 601):
+**Tests.** `swift test` — 635 tests, 50 suites, 0 failures (+39 from Phase A's
+baseline of 596):
 
 - `WikiLinkParserTests` (+11): `source:` prefix, alias preservation, whitespace
   normalization, empty-prefix skip, `page:` escape, dedup across kinds, `classify`
@@ -101,37 +105,6 @@ renamed (`files/` → `sources/`), agent prompts updated. Six extension-check bu
 fixed (use `mimeType` instead of `ext` for behavioral decisions). 596 tests green.
 
 Branches `feature/sources-redesign` (PR #31) → `feature/phase-b-source-wikilinks` (PR #33).
-
-## 2026-06-21 — Phase B review + two follow-up plans
-
-Reviewed Phase B ("Wiki links to sources") of `plans/sources-redesign.md` against the
-actual codebase (adversarial multi-agent review; 23 findings, all verified real). Headline
-issues: (1) the render contract is self-contradictory — the plan injects a
-`(String, LinkType) -> Bool` closure but renders `wiki://source?id=<ulid>`, which needs the
-ULID at render time a Bool closure can't supply (page links render `?title=` and resolve at
-click time); (2) `source_links` shipped without `ON DELETE CASCADE`
-(`SQLiteWikiStore.swift:330`), so `deleteSource` will FK-violate once the table is
-populated; (3) "same normalization as page titles" is false — page resolution is
-case-sensitive and no shared normalizer exists. Also found a stale Phase A rename:
-`Projection.swift:407,409` still projects `files.jsonl`/`files/` instead of
-`sources.jsonl`/`sources/`.
-
-Wrote two implementation plans (both indexed in `PLAN.md`):
-
-- **`plans/fix-phase-a-source-bugs.md`** — the two shipped bugs, scoped tight so they land
-  first. v11 migration rebuilds `source_links` with `ON DELETE CASCADE` (data-preserving
-  rename→create→copy→drop); `Projection.swift` projected names corrected to
-  `sources.jsonl`/`sources/`. Blocks Phase B.
-- **`plans/phase-b-source-wikilinks.md`** — Phase B re-grounded. Adopts the review's
-  recommended architecture: render source links as `wiki://source?title=<display-name>`
-  (mirror pages, resolve at click time via new `selectSource(byDisplayName:)`), one shared
-  whitespace normalizer (consolidating the 3 `collapseWhitespace` copies), case-insensitive
-  resolution for both pages and sources, a `LinkType` enum with a `.page` default + a
-  `page:` escape for the `source:` namespace collision, a single-transaction `replaceLinks`
-  over both link tables, and a unified `links.jsonl` with a `type` field. Resolves all 23
-  findings and corrects the rename spec in `sources-redesign.md`.
-
-No code changed this session — planning only, on branch `feature/source-wikilinks`.
 
 ## 2026-06-20 — Standalone Extract Markdown fixes + Stop-button overhaul
 
