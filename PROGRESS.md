@@ -2,6 +2,37 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-21 — Phase B review + two follow-up plans
+
+Reviewed Phase B ("Wiki links to sources") of `plans/sources-redesign.md` against the
+actual codebase (adversarial multi-agent review; 23 findings, all verified real). Headline
+issues: (1) the render contract is self-contradictory — the plan injects a
+`(String, LinkType) -> Bool` closure but renders `wiki://source?id=<ulid>`, which needs the
+ULID at render time a Bool closure can't supply (page links render `?title=` and resolve at
+click time); (2) `source_links` shipped without `ON DELETE CASCADE`
+(`SQLiteWikiStore.swift:330`), so `deleteSource` will FK-violate once the table is
+populated; (3) "same normalization as page titles" is false — page resolution is
+case-sensitive and no shared normalizer exists. Also found a stale Phase A rename:
+`Projection.swift:407,409` still projects `files.jsonl`/`files/` instead of
+`sources.jsonl`/`sources/`.
+
+Wrote two implementation plans (both indexed in `PLAN.md`):
+
+- **`plans/fix-phase-a-source-bugs.md`** — the two shipped bugs, scoped tight so they land
+  first. v11 migration rebuilds `source_links` with `ON DELETE CASCADE` (data-preserving
+  rename→create→copy→drop); `Projection.swift` projected names corrected to
+  `sources.jsonl`/`sources/`. Blocks Phase B.
+- **`plans/phase-b-source-wikilinks.md`** — Phase B re-grounded. Adopts the review's
+  recommended architecture: render source links as `wiki://source?title=<display-name>`
+  (mirror pages, resolve at click time via new `selectSource(byDisplayName:)`), one shared
+  whitespace normalizer (consolidating the 3 `collapseWhitespace` copies), case-insensitive
+  resolution for both pages and sources, a `LinkType` enum with a `.page` default + a
+  `page:` escape for the `source:` namespace collision, a single-transaction `replaceLinks`
+  over both link tables, and a unified `links.jsonl` with a `type` field. Resolves all 23
+  findings and corrects the rename spec in `sources-redesign.md`.
+
+No code changed this session — planning only, on branch `feature/source-wikilinks`.
+
 ## 2026-06-20 — Standalone Extract Markdown fixes + Stop-button overhaul
 
 The standalone "Extract Markdown" button in `IngestedFileDetailView` had two bugs

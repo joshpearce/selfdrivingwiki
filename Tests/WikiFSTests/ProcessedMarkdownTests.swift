@@ -87,7 +87,7 @@ struct ProcessedMarkdownTests {
 
     @Test func freshDBHasV8Schema() throws {
         let store = try tempStore()
-        #expect(store.pragmaValue("user_version") == "10")
+        #expect(store.pragmaValue("user_version") == "11")
     }
 
     @Test func v7DBUpgradesToV8PreservingData() throws {
@@ -103,7 +103,7 @@ struct ProcessedMarkdownTests {
 
         // Opening runs v7→v8→v9 migration.
         let store = try SQLiteWikiStore(databaseURL: url)
-        #expect(store.pragmaValue("user_version") == "10")
+        #expect(store.pragmaValue("user_version") == "11")
         // Pre-existing file is intact.
         let content = try store.sourceContent(
             id: PageID(rawValue: "01J00000000000000000000000"))

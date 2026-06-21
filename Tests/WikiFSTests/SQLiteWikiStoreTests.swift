@@ -53,21 +53,19 @@ struct SQLiteWikiStoreTests {
         let tables = Set(rows(db,
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"))
         #expect(tables.isSuperset(of:
-            ["pages", "attachments", "page_links", "sources", "system_prompt",
-             "log", "wiki_index", "page_embeddings", "source_markdown_versions"]))
+            ["pages", "attachments", "page_links", "sources", "source_links",
+             "system_prompt", "log", "wiki_index", "page_embeddings",
+             "source_markdown_versions"]))
 
         let indexes = Set(rows(db,
             "SELECT name FROM sqlite_master WHERE type='index';"))
         #expect(indexes.contains("pages_slug_unique"))
         #expect(indexes.contains("ingested_files_created"))
 
-        // user_version guard: a fresh DB runs all migration steps → version 9
-        // (v4 `log`, v5 `wiki_index`, v6 `sources.ingested_at`,
-        //  v7 `page_embeddings`, v8 `file_markdown_versions`,
-        //  v9 `sources.zotero_item_key`/`zotero_item_title`); reopening
-        // must not re-run DDL (no-op bootstrap).
+        // user_version guard: a fresh DB runs all migration steps → version 11.
+        // Reopening must not re-run DDL (no-op bootstrap).
         let userVersion = scalarText(db, "PRAGMA user_version;")
-        #expect(userVersion == "10")
+        #expect(userVersion == "11")
         let reopened = try SQLiteWikiStore(databaseURL: url)
         // If bootstrap weren't guarded, the CREATE TABLE would throw here.
         #expect((try? reopened.listPages(sortBy: .lastUpdated)) != nil)
@@ -236,7 +234,7 @@ struct SQLiteWikiStoreTests {
         defer { sqlite3_close(db) }
 
         let userVersion = scalarText(db, "PRAGMA user_version;")
-        #expect(userVersion == "10")
+        #expect(userVersion == "11")
 
         let tables = Set(rows(db,
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"))
@@ -262,6 +260,53 @@ struct SQLiteWikiStoreTests {
         let count = store.recomputeMissingEmbeddings()
         // May be 0 if NLEmbedding unavailable in test, or 2 if available.
         #expect(count >= 0)
+    }
+
+    // MARK: - v11 migration (source_links ON DELETE CASCADE)
+
+    @Test func deleteSourceCascadesToSourceLinksAfterV11Migration() throws {
+        let url = tempDatabaseURL()
+        let store = try SQLiteWikiStore(databaseURL: url)
+        let page = try store.createPage(title: "Test")
+        let source = try store.addSource(filename: "test.txt", data: Data("hello".utf8))
+
+        // Simulate Phase B inserting a source_links row via a raw connection.
+        var db: OpaquePointer?
+        #expect(sqlite3_open(url.path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        #expect(sqlite3_exec(db, """
+            INSERT INTO source_links (from_page_id, to_source_id, link_text)
+            VALUES ('\(page.id.rawValue)', '\(source.id.rawValue)', 'test link');
+            """, nil, nil, nil) == SQLITE_OK)
+
+        // Deleting the source must NOT throw, and the source_links row must be gone.
+        try store.deleteSource(id: source.id)
+        #expect(scalarText(db, "SELECT count(*) FROM source_links WHERE to_source_id = '\(source.id.rawValue)';") == "0")
+    }
+
+    @Test func freshDBReachesUserVersion11() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        #expect(store.pragmaValue("user_version") == "11")
+    }
+
+    @Test func v11SourceLinksHasDeleteCascade() throws {
+        let url = tempDatabaseURL()
+        let store = try SQLiteWikiStore(databaseURL: url)
+        // Insert a page and source, then a source_links row via raw connection.
+        let page = try store.createPage(title: "Test")
+        let source = try store.addSource(filename: "t.txt", data: Data("x".utf8))
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        defer { sqlite3_close(raw) }
+        #expect(sqlite3_exec(raw, """
+            INSERT INTO source_links (from_page_id, to_source_id, link_text)
+            VALUES ('\(page.id.rawValue)', '\(source.id.rawValue)', 'link');
+            """, nil, nil, nil) == SQLITE_OK)
+        // Read back the DDL — must contain ON DELETE CASCADE.
+        let ddl = scalarText(raw,
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='source_links';") ?? ""
+        #expect(ddl.contains("ON DELETE CASCADE"))
+        _ = store
     }
 
     // MARK: - Helpers
