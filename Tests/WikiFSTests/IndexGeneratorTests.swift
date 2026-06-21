@@ -157,4 +157,21 @@ struct IndexGeneratorTests {
             .split(separator: "\n")
         #expect(linksLines.count == 1)
     }
+
+    // MARK: - Projected path names (Phase A Bug B fix)
+
+    @Test func sourcesJSONLPathIsCorrect() {
+        // The generator's advertised path must match what the File Provider projects.
+        #expect(IndexGenerators.sourceIndexPath == "indexes/sources.jsonl")
+        #expect(IndexGenerators.sourcesByIDPath == "sources/by-id")
+    }
+
+    @Test func manifestAdvertisesSourcePaths() throws {
+        let data = IndexGenerators.manifest(pages: [], sourceCount: 0,
+                                            generatedAt: Date(timeIntervalSince1970: 0))
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let paths = obj?["paths"] as? [String: Any]
+        #expect(paths?["sources_by_id"] as? String == "sources/by-id")
+        #expect(paths?["source_index"] as? String == "indexes/sources.jsonl")
+    }
 }

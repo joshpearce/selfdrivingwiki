@@ -335,6 +335,31 @@ public final class SQLiteWikiStore: WikiStore {
             try exec("PRAGMA user_version=10;")
             version = 10
         }
+
+        // v10 → v11: add ON DELETE CASCADE to source_links.to_source_id. SQLite cannot
+        // ALTER an FK constraint in place, so rebuild the table (rename old → create new
+        // with the cascade → copy rows → drop old). source_links is a leaf join table
+        // (nothing FKs to it), so the rename is safe. The rebuild is data-preserving for
+        // DBs that already have Phase B rows, and a no-op rebuild on empty ones.
+        // Mirrors the cascade already on source_markdown_versions (v8).
+        if version < 11 {
+            try exec("ALTER TABLE source_links RENAME TO source_links_v10;")
+            try exec("""
+            CREATE TABLE source_links (
+                from_page_id TEXT NOT NULL REFERENCES pages(id),
+                to_source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                link_text    TEXT NOT NULL,
+                PRIMARY KEY (from_page_id, to_source_id)
+            );
+            """)
+            try exec("""
+            INSERT INTO source_links (from_page_id, to_source_id, link_text)
+            SELECT from_page_id, to_source_id, link_text FROM source_links_v10;
+            """)
+            try exec("DROP TABLE source_links_v10;")
+            try exec("PRAGMA user_version=11;")
+            version = 11
+        }
     }
 
     // MARK: - vec extension loading

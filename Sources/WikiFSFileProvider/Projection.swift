@@ -404,9 +404,9 @@ struct Projection {
         case Identity.indexLinksJSONL:
             return indexFileNode(for: id, name: "links.jsonl", parent: Identity.indexes)
         case Identity.indexSourcesJSONL:
-            return indexFileNode(for: id, name: "files.jsonl", parent: Identity.indexes)
+            return indexFileNode(for: id, name: "sources.jsonl", parent: Identity.indexes)
         case Identity.sources:
-            return .folder(id: id, parent: .rootContainer, name: "files")
+            return .folder(id: id, parent: .rootContainer, name: "sources")
         case Identity.sourcesByID:
             return .folder(id: id, parent: Identity.sources, name: "by-id")
         case Identity.sourcesByName:

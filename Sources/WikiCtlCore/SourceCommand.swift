@@ -70,7 +70,7 @@ public enum SourceCommand {
     private static func list(in store: WikiStore, json: Bool) throws -> Result {
         let summaries = try store.listSources()
         if json {
-            // Sort by id (ULID = ingest order) to match indexes/files.jsonl.
+            // Sort by id (ULID = ingest order) to match indexes/sources.jsonl.
             let sorted = summaries.sorted { $0.id.rawValue < $1.id.rawValue }
             let rows = sorted.map { summary in
                 IndexGenerators.SourceIndexRow(
