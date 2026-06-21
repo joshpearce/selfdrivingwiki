@@ -240,6 +240,7 @@ struct SQLiteWikiStoreTests {
         // Append markdown for source a only.
         let v1 = try store.appendProcessedMarkdown(
             sourceID: a.id, content: "# A", origin: "test", note: nil)
+        usleep(2000)  // ensure ULID timestamp advances for MAX(id) ordering
         var heads = try store.processedMarkdownHeadsBySource()
         #expect(heads.count == 1)
         #expect(heads[a.id.rawValue]?.id == v1.id)
@@ -248,6 +249,7 @@ struct SQLiteWikiStoreTests {
         // Append markdown for source b.
         let v2 = try store.appendProcessedMarkdown(
             sourceID: b.id, content: "# B", origin: "test", note: nil)
+        usleep(2000)  // ensure ULID timestamp advances for MAX(id) ordering
         heads = try store.processedMarkdownHeadsBySource()
         #expect(heads.count == 2)
         #expect(heads[a.id.rawValue]?.id == v1.id)
@@ -256,6 +258,7 @@ struct SQLiteWikiStoreTests {
         // Append a new head for source a — only that source's entry changes.
         let v3 = try store.appendProcessedMarkdown(
             sourceID: a.id, content: "# A Edited", origin: "test", note: "edit")
+        usleep(2000)  // ensure ULID timestamp advances for MAX(id) ordering
         heads = try store.processedMarkdownHeadsBySource()
         #expect(heads.count == 2)
         #expect(heads[a.id.rawValue]?.id == v3.id)
