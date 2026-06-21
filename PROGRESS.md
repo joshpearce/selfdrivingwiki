@@ -2,6 +2,131 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-21 — Phase B: `[[source:display-name]]` wikilinks
+
+Wiki pages can now link to sources with `[[source:display-name]]` syntax. Clicking a
+source link in the preview navigates to that source's detail view — the same seam
+page links use. The implementation spans the full stack: parser → renderer → resolver
+→ navigator → persistence → agent index.
+
+The architecture mirrors page links: source links render as
+`wiki://source?title=<display-name>` (not `?id=<ulid>`), resolution happens at click
+time via a new `selectSource(byDisplayName:)`, and the resolution closure stays
+uniform — a single `(String, LinkType) -> Bool` for both link kinds.
+
+**Changes:**
+
+- **Parser (`WikiLinkParser`):** `ParsedLink` gains a `LinkType` enum (`.page` /
+  `.source`) with a `.page` default so every existing call site compiles unchanged.
+  A new `classify()` method extracts the `source:` / `page:` prefix and re-normalizes
+  the remainder (`[[source: X]]` → target `"X"`). `parse()` deduplicates per
+  `(kind, target)`; `[[source:]]` (empty prefix target) is skipped as a non-link.
+  The `page:` prefix is an explicit escape: `[[page:source:foo]]` links to a page
+  literally titled "source:foo".
+
+- **Shared normalizer (`WikiText`):** `WikiText.normalized()` replaces three private
+  `collapseWhitespace` copies (in `WikiLinkParser`, `WikiLinkMarkdown`,
+  `HTMLToMarkdown`). One source of truth for whitespace collapsing across the wiki
+  subsystem.
+
+- **Renderer (`WikiLinkMarkdown`):** `linkified` closure signature changed to
+  `(String, LinkType) -> Bool`; source links render as
+  `wiki://source?title=<display-name>` when resolved, `wiki://missing?title=…` when
+  not. `markdownLink` is now kind-aware; `resolvedKind(from:)` returns `.page` /
+  `.source` / `nil` for the click handler. `isEmptyPrefix()` skips `[[source:]]`
+  in both parser and renderer.
+
+- **Resolution (`SQLiteWikiStore`):** `resolveTitleToID` is now case-insensitive
+  (`COLLATE NOCASE`) for parity with source resolution. `resolveSourceByName`
+  matches `display_name` first, falling back to `filename`; multi-match tiebreak
+  by `updated_at DESC`. `WikiStore` protocol extended with `resolveSourceByName`.
+
+- **Navigation (`WikiStoreModel`):** `sourceExists(displayName:)` mirrors
+  `pageExists(title:)` for the render closure. `selectSource(byDisplayName:)`
+  mirrors `selectPage(byTitle:)` line for line — resolves display name → ULID,
+  records navigation history, opens the source's tab (reusing an already-open
+  tab). `MarkdownPreview`'s `OpenURLAction` dispatches by kind.
+
+- **Persistence (`SQLiteWikiStore.replaceLinks`):** extended to write BOTH
+  `page_links` and `source_links` in ONE `BEGIN IMMEDIATE` transaction. Wipes
+  both tables for the page, then re-inserts resolved subsets atomically.
+  `listAllSourceLinks()` added with `type: "source"`.
+
+- **Index (`IndexGenerators`, `Projection`):** `LinkRow` gains `type: String`
+  (default `"page"`). `linksJSONL` emits `type` in fixed key order
+  (`from, to, link_text, type`). The File Provider projection merges
+  `listAllLinks()` + `listAllSourceLinks()` — page rows first, then source rows,
+  each sorted by `(from, to)`.
+
+- **Agent prompts:** `SystemPrompt` cheatsheet now lists `wikictl source` commands
+  and documents the `type` field in `links.jsonl`. `WikiOperation` Ingest/Query
+  prompts updated from `wikictl file` to `wikictl source`. `wikictl --help`
+  usage string updated in `ArgumentParser`.
+
+- **Stale help text + prompt references fixed:** `ArgumentParser` usage string,
+  `main.swift` comment, `WikiOperation` Ingest/Query prompts, and `SystemPrompt`
+  cheatsheet all said `wikictl file` instead of `wikictl source`. The agent was
+  running `wikictl file` from its prompt instructions and getting "unknown
+  command". Three commits pushed to the PR to stamp this out.
+
+**Tests.** `swift test` — 635 tests, 50 suites, 0 failures (+34 from the prior
+baseline of 601):
+
+- `WikiLinkParserTests` (+11): `source:` prefix, alias preservation, whitespace
+  normalization, empty-prefix skip, `page:` escape, dedup across kinds, `classify`
+  edge cases.
+- `WikiLinkMarkdownTests` (+10): source host on resolve/missing, alias display,
+  `resolvedKind(from:)` / `target(from:)` round-trip, mixed page+source rendering,
+  `[[source:]]` literal emission, code-span and fenced-block protection.
+- `SQLiteWikiStoreTests` (+7): `resolveSourceByName` (display name hit, filename
+  fallback, case-insensitive, nil on unknown), `replaceLinks` mixed+atomic,
+  case-insensitive title resolution.
+- `IndexGeneratorTests` (+3): `linksJSONL` `type` field, byte stability,
+  manifest advertises source paths.
+- `WikiLinkNavigationTests` (+3): `selectSource(byDisplayName:)` navigation,
+  no-op on missing, tab reuse.
+
+On branch `feature/phase-b-source-wikilinks`. PR #33.
+
+## 2026-06-21 — Phase A bug fixes: source_links cascade + stale File Provider names
+
+Two shipped bugs from Phase A (PR #31) fixed before Phase B builds on top:
+
+**Bug A — `source_links` missing `ON DELETE CASCADE`:** the v10 migration created
+`source_links` without cascade, latent until Phase B populates the table.
+**Fix:** v10→v11 migration rebuilds `source_links` with `ON DELETE CASCADE` via
+rename→create→copy→drop (data-preserving, idempotent). `deleteSource` needs no
+change — the cascade is the single source of truth.
+
+**Bug B — File Provider projected `files.jsonl` / `files/`:** the Phase A rename
+updated enum cases and `IndexGenerators` paths but missed the display strings the
+File Provider projects. The on-disk tree still showed `indexes/files.jsonl` and a
+top-level `files/` folder, contradicting `manifest.json`.
+**Fix:** display names updated in `Projection.swift` to `sources.jsonl` / `sources`.
+Stale comment in `SourceCommand.swift` fixed.
+
+**Tests.** `swift test` — 601 tests, 50 suites, 0 failures (+5):
+`deleteSourceCascadesToSourceLinksAfterV11Migration`,
+`freshDBReachesUserVersion11`, `v11SourceLinksHasDeleteCascade`,
+`sourcesJSONLPathIsCorrect`, `manifestAdvertisesSourcePaths`.
+All `user_version` assertions bumped from 10→11.
+
+Branches `fix-source-bugs` (PR #32) → `feature/phase-b-source-wikilinks` (PR #33).
+
+## 2026-06-21 — Phase A: rename "ingested file" → "source" throughout (PR #31)
+
+Full rename across database, types, UI, CLI, File Provider, and agent prompts. v10
+migration renames `ingested_files` → `sources` and `file_markdown_versions` →
+`source_markdown_versions`; adds `display_name` column (backfilled from `filename`);
+creates `source_links` table. All Swift types renamed (`IngestedFileSummary` →
+`SourceSummary`, etc.), all views renamed (`IngestedFileDetailView` →
+`SourceDetailView`, `IngestedFileRow` → `SourceRow`, `FilesSectionView` →
+`SourcesSectionView`), CLI renamed (`wikictl file` → `wikictl source`), mount paths
+renamed (`files/` → `sources/`), agent prompts updated. Six extension-check bugs
+fixed (use `mimeType` instead of `ext` for behavioral decisions). 596 tests green.
+
+Branches `feature/sources-redesign` (PR #31) → `fix-source-bugs` (PR #32).
+
 ## 2026-06-21 — Phase B review + two follow-up plans
 
 Reviewed Phase B ("Wiki links to sources") of `plans/sources-redesign.md` against the
