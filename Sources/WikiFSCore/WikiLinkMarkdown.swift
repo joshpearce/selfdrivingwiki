@@ -82,7 +82,13 @@ public enum WikiLinkMarkdown {
 
             let (kind, bareTarget) = WikiLinkParser.classify(rawTarget)
             guard !bareTarget.isEmpty else {
-                // Empty bare target after prefix strip (e.g. `[[source:]]`): literal.
+                // Empty bare target after prefix strip: literal text.
+                out += ns.substring(with: full)
+                continue
+            }
+            // `[[source:]]` / `[[page:]]` — reserved prefix with no meaningful
+            // remainder: emit literal text (consistent with the parser's skip).
+            if WikiLinkParser.isEmptyPrefix(rawTarget) {
                 out += ns.substring(with: full)
                 continue
             }

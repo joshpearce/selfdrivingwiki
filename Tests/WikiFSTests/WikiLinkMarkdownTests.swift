@@ -182,6 +182,39 @@ struct WikiLinkMarkdownTests {
         #expect(WikiLinkMarkdown.isResolvedURL(URL(string: "wiki://source?title=X")!))
     }
 
+    // MARK: - Mixed page + source links
+
+    @Test func mixedPageAndSourceLinksRenderWithCorrectHosts() {
+        let out = WikiLinkMarkdown.linkified("[[Home]] and [[source:Paper]]") { name, kind in
+            kind == .source ? name == "Paper" : name == "Home"
+        }
+        #expect(out.contains("wiki://page?title=Home"))
+        #expect(out.contains("wiki://source?title=Paper"))
+    }
+
+    @Test func emptySourcePrefixRendersAsLiteral() {
+        // [[source:]] should stay verbatim, not become a link.
+        let out = WikiLinkMarkdown.linkified("before [[source:]] after") { _, _ in true }
+        #expect(out.contains("[[source:]]"))
+        #expect(!out.contains("wiki://"))
+    }
+
+    // MARK: - Code-span protection for source links
+
+    @Test func sourceLinkInsideCodeSpanIsLiteral() {
+        let out = WikiLinkMarkdown.linkified("`[[source:Paper]]` is a code span") { _, _ in true }
+        #expect(out.contains("[[source:Paper]]"))
+        #expect(!out.contains("wiki://source"))
+    }
+
+    @Test func sourceLinkInsideFencedCodeBlockIsLiteral() {
+        let out = WikiLinkMarkdown.linkified(
+            "```\n[[source:Paper]]\n```\n\nOutside [[source:Notes]]") { _, _ in true }
+        #expect(out.contains("[[source:Paper]]"))   // inside fence → verbatim
+        #expect(!out.contains("wiki://source?title=Paper"))
+        #expect(out.contains("wiki://source?title=Notes")) // outside fence → linkified
+    }
+
     // Pull the URL substring out of a single `[text](url)` for assertions.
     private func extractURL(_ markdownLink: String) -> String {
         guard let open = markdownLink.lastIndex(of: "("),

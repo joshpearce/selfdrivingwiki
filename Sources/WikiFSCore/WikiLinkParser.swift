@@ -58,6 +58,18 @@ public enum WikiLinkParser {
         return (.page, target) // target already normalized by the caller
     }
 
+    /// True when `target` starts with a reserved prefix (`source:` or `page:`) but
+    /// the remainder is empty/whitespace (e.g. `[[source:]]`, `[[page:   ]]`). Both
+    /// parse() and WikiLinkMarkdown.linkified() use this to emit literal text.
+    public static func isEmptyPrefix(_ target: String) -> Bool {
+        for prefix in ["page:", "source:"] {
+            guard target.hasPrefix(prefix) else { continue }
+            let rest = String(target.dropFirst(prefix.count))
+            return rest.allSatisfy(\.isWhitespace)
+        }
+        return false
+    }
+
     private static func peel(prefix: String, off s: String) -> String? {
         guard s.hasPrefix(prefix) else { return nil }
         let rest = String(s.dropFirst(prefix.count))
@@ -82,14 +94,7 @@ public enum WikiLinkParser {
 
             let (kind, bareTarget) = classify(target)
             guard !bareTarget.isEmpty else { continue } // empty target → skip
-            // `[[source:]]` / `[[page:   ]]` — reserved prefix with no meaningful
-            // remainder: skip the link entirely (consistent with `[[ ]]`).
-            if target.hasPrefix("source:") || target.hasPrefix("page:") {
-                let afterPrefix: String
-                if target.hasPrefix("page:") { afterPrefix = String(target.dropFirst(5)) }
-                else { afterPrefix = String(target.dropFirst(7)) }
-                if afterPrefix.allSatisfy(\.isWhitespace) { continue }
-            }
+            if isEmptyPrefix(target) { continue } // `[[source:]]` → literal
 
             let dedupKey = "\(kind.rawValue):\(bareTarget)"
             guard seen.insert(dedupKey).inserted else { continue }
