@@ -89,6 +89,10 @@ public struct SystemPrompt: Equatable, Sendable {
     printf '%s' "<body>" | wikictl index set --body-file -               rewrite index.md wholesale
     wikictl log append --kind ingest|query|lint --title "…" [--note "…"] [--source <file-id>]  record an action (--source marks an ingest done)
     wikictl search --query "…" [--limit N]    semantic search — find pages by meaning; defaults to 10 results, max 100
+    wikictl source list [--json]               list all sources (TSV, or JSON lines)
+    wikictl source cat --id I | --name N       write raw source bytes to stdout
+    wikictl source export --id I | --name N [--out <path>]
+                                                materialize a source to disk, print its path
     ```
 
     **Read back what you just wrote with `wikictl page get`** — the mount lags a
