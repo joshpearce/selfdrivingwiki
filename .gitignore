@@ -6,3 +6,4 @@ dist/
 .DS_Store
 signing/*.provisionprofile
 signing/local.config
+.claude/

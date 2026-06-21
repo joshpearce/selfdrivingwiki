@@ -36,8 +36,13 @@ public enum ZoomScale {
     // MARK: - Clamping
 
     /// Returns `scale` clamped to `minimum...maximum`.
+    ///
+    /// Non-finite input (`NaN`, `±∞`) cannot be ordered meaningfully and would
+    /// poison the font-size math downstream, so it coerces to `defaultScale`
+    /// rather than leaking through.
     public static func clamped(_ scale: CGFloat) -> CGFloat {
-        min(maximum, max(minimum, scale))
+        guard scale.isFinite else { return defaultScale }
+        return min(maximum, max(minimum, scale))
     }
 
     // MARK: - Stepping

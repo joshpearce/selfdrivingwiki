@@ -32,13 +32,23 @@ struct ZoomScaleTests {
     @Test func clampedAboveMaximumReturnsMaximum() {
         #expect(ZoomScale.clamped(10.0) == ZoomScale.maximum)
         #expect(ZoomScale.clamped(3.01) == ZoomScale.maximum)
-        #expect(ZoomScale.clamped(.infinity) == ZoomScale.maximum)
     }
 
     @Test func clampedWithinRangeIsUnchanged() {
         let values: [CGFloat] = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
         for v in values {
             #expect(ZoomScale.clamped(v) == v)
+        }
+    }
+
+    @Test func clampedNonFiniteReturnsDefault() {
+        // NaN and ±∞ cannot be ordered into the range and must never reach the
+        // font math, so they coerce to a finite, in-range default.
+        for value: CGFloat in [.nan, .infinity, -.infinity] {
+            let result = ZoomScale.clamped(value)
+            #expect(result == ZoomScale.defaultScale)
+            #expect(result.isFinite)
+            #expect(result >= ZoomScale.minimum && result <= ZoomScale.maximum)
         }
     }
 
