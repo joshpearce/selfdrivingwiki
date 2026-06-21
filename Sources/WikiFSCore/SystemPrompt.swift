@@ -52,7 +52,8 @@ public struct SystemPrompt: Equatable, Sendable {
     - `WIKI-STRUCTURE.md` — an orientation map of this layout plus live page/file counts.
     - `TREE.md` — legacy alias for `WIKI-STRUCTURE.md`.
     - `indexes/*.jsonl` — machine-readable indexes (`pages.jsonl`, `links.jsonl`,
-      `sources.jsonl`) for cheap programmatic navigation.
+      `sources.jsonl`) for cheap programmatic navigation. `links.jsonl` has a
+      `type` field (`"page"` or `"source"`) — the unified link graph spans both.
     - `manifest.json` — the generated wiki manifest.
     - `CLAUDE.md` / `AGENTS.md` — this document (identical bytes).
 

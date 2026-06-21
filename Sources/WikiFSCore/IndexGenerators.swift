@@ -17,16 +17,19 @@ import Foundation
 /// byte-for-byte stable, which lets the extension cache size==content by token.
 public enum IndexGenerators {
 
-    /// A single wiki link row, as read back from `page_links`.
+    /// A single wiki link row, as read back from `page_links` or `source_links`.
     public struct LinkRow: Equatable, Sendable {
         public let from: String
         public let to: String
         public let linkText: String
+        /// `"page"` or `"source"` — so the unified `links.jsonl` spans both kinds.
+        public let type: String
 
-        public init(from: String, to: String, linkText: String) {
+        public init(from: String, to: String, linkText: String, type: String = "page") {
             self.from = from
             self.to = to
             self.linkText = linkText
+            self.type = type
         }
     }
 
@@ -121,15 +124,16 @@ public enum IndexGenerators {
     }
 
     /// `indexes/links.jsonl` — one JSON object per line, one line per link,
-    /// ordered as given (the caller passes links ordered by (from,to)). Keys in
-    /// fixed order: from, to, link_text.
+    /// ordered as given (page rows first, then source rows, each sorted by
+    /// (from,to)). Keys in fixed order: from, to, link_text, type.
     public static func linksJSONL(links: [LinkRow]) -> Data {
         var out = ""
         for link in links {
             let from = jsonString(link.from)
             let to = jsonString(link.to)
             let text = jsonString(link.linkText)
-            out += "{\"from\":\(from),\"to\":\(to),\"link_text\":\(text)}\n"
+            let type = jsonString(link.type)
+            out += "{\"from\":\(from),\"to\":\(to),\"link_text\":\(text),\"type\":\(type)}\n"
         }
         return Data(out.utf8)
     }

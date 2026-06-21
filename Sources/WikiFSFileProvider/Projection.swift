@@ -206,8 +206,10 @@ struct Projection {
             guard let pages = try? store.listAllPagesOrderedByID() else { return nil }
             return IndexGenerators.pagesJSONL(pages: pages)
         case Identity.indexLinksJSONL:
-            guard let links = try? store.listAllLinks() else { return nil }
-            return IndexGenerators.linksJSONL(links: links)
+            guard let pageLinks = try? store.listAllLinks(),
+                  let sourceLinks = try? store.listAllSourceLinks() else { return nil }
+            // Page rows first, then source rows — each already sorted by (from,to).
+            return IndexGenerators.linksJSONL(links: pageLinks + sourceLinks)
         case Identity.indexSourcesJSONL:
             // Resilient to the table not existing yet → empty index, never nil,
             // so enumeration of `indexes/` never errors pre-migration.

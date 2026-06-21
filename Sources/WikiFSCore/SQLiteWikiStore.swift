@@ -712,38 +712,75 @@ public final class SQLiteWikiStore: WikiStore {
 
     public func resolveTitleToID(_ title: String) throws -> PageID? {
         // Lowest ULID == oldest page on a duplicate-title collision.
+        // COLLATE NOCASE: case-insensitive ASCII folding so [[home]] → "Home".
         let stmt = try statement(
-            "SELECT id FROM pages WHERE title = ?1 ORDER BY id ASC LIMIT 1;")
+            "SELECT id FROM pages WHERE title = ?1 COLLATE NOCASE ORDER BY id ASC LIMIT 1;")
         defer { stmt.reset() }
         try stmt.bind(title, at: 1)
         guard try stmt.step() else { return nil }
         return PageID(rawValue: stmt.text(at: 0))
     }
 
+    /// Resolve a `[[source:…]]` target to a source id. Matches display_name first,
+    /// falling back to filename. Case-insensitive. On a multi-match collision, the
+    /// most recently updated source wins.
+    public func resolveSourceByName(_ displayName: String) throws -> PageID? {
+        let stmt = try statement("""
+        SELECT id FROM sources
+        WHERE COALESCE(display_name, filename) = ?1 COLLATE NOCASE
+           OR filename = ?1 COLLATE NOCASE
+        ORDER BY updated_at DESC LIMIT 1;
+        """)
+        defer { stmt.reset() }
+        try stmt.bind(displayName, at: 1)
+        guard try stmt.step() else { return nil }
+        return PageID(rawValue: stmt.text(at: 0))
+    }
+
     public func replaceLinks(from pageID: PageID,
                              parsedLinks: [WikiLinkParser.ParsedLink]) throws {
-        // One transaction: wipe this page's outgoing links, then insert the
-        // resolved subset. Unresolved targets are OMITTED (NULL to_page_id is
-        // forbidden by the schema). `INSERT OR IGNORE` collapses duplicate
-        // (from,to) pairs from distinct titles that resolve to the same page.
+        // One transaction: wipe this page's outgoing links in BOTH tables, then
+        // insert the resolved subsets. Unresolved targets are OMITTED.
+        // `INSERT OR IGNORE` collapses duplicate (from,to) pairs.
+        // `source_links` inherits the same alias-collapsing behavior as
+        // `page_links` via its PRIMARY KEY (from_page_id, to_source_id).
         try exec("BEGIN IMMEDIATE;")
         do {
-            let del = try statement("DELETE FROM page_links WHERE from_page_id = ?1;")
-            del.reset()
-            try del.bind(pageID.rawValue, at: 1)
-            _ = try del.step()
+            let delPage = try statement("DELETE FROM page_links WHERE from_page_id = ?1;")
+            delPage.reset()
+            try delPage.bind(pageID.rawValue, at: 1)
+            _ = try delPage.step()
 
-            let ins = try statement("""
+            let delSource = try statement("DELETE FROM source_links WHERE from_page_id = ?1;")
+            delSource.reset()
+            try delSource.bind(pageID.rawValue, at: 1)
+            _ = try delSource.step()
+
+            let insPage = try statement("""
             INSERT OR IGNORE INTO page_links (from_page_id, to_page_id, link_text)
             VALUES (?1, ?2, ?3);
             """)
+            let insSource = try statement("""
+            INSERT OR IGNORE INTO source_links (from_page_id, to_source_id, link_text)
+            VALUES (?1, ?2, ?3);
+            """)
             for link in parsedLinks {
-                guard let target = try resolveTitleToID(link.target) else { continue }
-                ins.reset()
-                try ins.bind(pageID.rawValue, at: 1)
-                try ins.bind(target.rawValue, at: 2)
-                try ins.bind(link.linkText, at: 3)
-                _ = try ins.step()
+                switch link.linkType {
+                case .page:
+                    guard let target = try resolveTitleToID(link.target) else { continue }
+                    insPage.reset()
+                    try insPage.bind(pageID.rawValue, at: 1)
+                    try insPage.bind(target.rawValue, at: 2)
+                    try insPage.bind(link.linkText, at: 3)
+                    _ = try insPage.step()
+                case .source:
+                    guard let target = try resolveSourceByName(link.target) else { continue }
+                    insSource.reset()
+                    try insSource.bind(pageID.rawValue, at: 1)
+                    try insSource.bind(target.rawValue, at: 2)
+                    try insSource.bind(link.linkText, at: 3)
+                    _ = try insSource.step()
+                }
             }
             try exec("COMMIT;")
         } catch {
@@ -752,9 +789,9 @@ public final class SQLiteWikiStore: WikiStore {
         }
     }
 
-    /// All link rows, ordered by `(from_page_id, to_page_id)`. Read-side helper
-    /// for the File Provider projection's `links.jsonl` generator. Not on the
-    /// `WikiStore` protocol — like `listAllPagesOrderedByID`, it is a
+    /// All page→page link rows, ordered by `(from_page_id, to_page_id)`. Read-side
+    /// helper for the File Provider projection's `links.jsonl` generator. Not on
+    /// the `WikiStore` protocol — like `listAllPagesOrderedByID`, it is a
     /// read-projection helper, not part of the editing API.
     public func listAllLinks() throws -> [IndexGenerators.LinkRow] {
         let stmt = try statement("""
@@ -767,13 +804,35 @@ public final class SQLiteWikiStore: WikiStore {
             out.append(IndexGenerators.LinkRow(
                 from: stmt.text(at: 0),
                 to: stmt.text(at: 1),
-                linkText: stmt.text(at: 2)
+                linkText: stmt.text(at: 2),
+                type: "page"
             ))
         }
         return out
     }
 
-    // MARK: - Ingested files (Phase 5)
+    /// All page→source link rows, ordered by `(from_page_id, to_source_id)`. Same
+    /// shape as `listAllLinks` so the projection merges them into a unified
+    /// `links.jsonl` (page rows first, then source rows).
+    public func listAllSourceLinks() throws -> [IndexGenerators.LinkRow] {
+        let stmt = try statement("""
+        SELECT from_page_id, to_source_id, link_text
+        FROM source_links ORDER BY from_page_id, to_source_id;
+        """)
+        defer { stmt.reset() }
+        var out: [IndexGenerators.LinkRow] = []
+        while try stmt.step() {
+            out.append(IndexGenerators.LinkRow(
+                from: stmt.text(at: 0),
+                to: stmt.text(at: 1),
+                linkText: stmt.text(at: 2),
+                type: "source"
+            ))
+        }
+        return out
+    }
+
+    // MARK: - Sources (Phase 5, renamed v10)
 
     /// Reject any single dropped file larger than this. A soft guard so the
     /// verbatim-bytes-in-SQLite model can't be handed a multi-GB blob that would

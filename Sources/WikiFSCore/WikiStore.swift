@@ -35,6 +35,12 @@ public protocol WikiStore {
     /// `[[wiki-link]]` resolution (INITIAL §4 v1).
     func resolveTitleToID(_ title: String) throws -> PageID?
 
+    /// Resolve a `[[source:…]]` target to a source id. Matches display_name first,
+    /// falling back to filename (so a retired display name still resolves via its
+    /// original filename). Case-insensitive (COLLATE NOCASE). On a multi-match
+    /// collision, the most recently updated source wins.
+    func resolveSourceByName(_ displayName: String) throws -> PageID?
+
     /// Replace ALL outgoing links for `pageID` with the resolved subset of
     /// `parsedLinks`, in one transaction. Targets that don't resolve to a page
     /// are omitted (the schema forbids a NULL `to_page_id`). Self-links allowed.

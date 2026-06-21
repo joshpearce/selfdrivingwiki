@@ -213,6 +213,27 @@ public final class WikiStoreModel {
         return true
     }
 
+    // MARK: - Source link resolution
+
+    /// Existence check for `[[source:…]]` linkification: returns `true` when a
+    /// source with the given display name (or filename fallback) exists.
+    public func sourceExists(displayName: String) -> Bool {
+        (try? store.resolveSourceByName(displayName)) != nil
+    }
+
+    /// Navigate to the source with `displayName` from a clicked
+    /// `[[source:display-name]]` link in the preview. Resolves display name → id
+    /// (most-recently-updated on collision), records navigation history, and opens
+    /// the source's tab. Returns whether navigation happened.
+    @discardableResult
+    public func selectSource(byDisplayName displayName: String) -> Bool {
+        guard let id = (try? store.resolveSourceByName(displayName)) ?? nil else { return false }
+        let target = WikiSelection.source(id)
+        recordHistoryTransition(from: loadedSelection, to: target)
+        openTab(target)
+        return true
+    }
+
     // MARK: - Tab operations
 
     /// The single seam every tab switch routes through: flush the outgoing tab's
