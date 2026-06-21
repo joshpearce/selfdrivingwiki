@@ -55,12 +55,12 @@ struct WikiLinkMarkdownTests {
     // MARK: - Resolution / styling host
 
     @Test func unresolvedTargetUsesMissingHost() {
-        let out = WikiLinkMarkdown.linkified("[[Ghost]]") { _ in false }
+        let out = WikiLinkMarkdown.linkified("[[Ghost]]") { _, _ in false }
         #expect(out == "[Ghost](wiki://missing?title=Ghost)")
     }
 
     @Test func mixedResolutionPicksHostPerLink() {
-        let out = WikiLinkMarkdown.linkified("[[Real]] vs [[Fake]]") { $0 == "Real" }
+        let out = WikiLinkMarkdown.linkified("[[Real]] vs [[Fake]]") { name, _ in name == "Real" }
         #expect(out == "[Real](wiki://page?title=Real) vs "
             + "[Fake](wiki://missing?title=Fake)")
     }
@@ -137,6 +137,82 @@ struct WikiLinkMarkdownTests {
     @Test func targetRejectsForeignURLs() {
         #expect(WikiLinkMarkdown.target(from: URL(string: "https://example.com?title=X")!) == nil)
         #expect(WikiLinkMarkdown.target(from: URL(string: "wiki://page")!) == nil)
+    }
+
+    // MARK: - source: link rendering (Phase B)
+
+    @Test func resolvedSourceLinkUsesSourceHost() {
+        let out = WikiLinkMarkdown.linkified("[[source:My Notes]]") { _, _ in true }
+        #expect(out == "[My Notes](wiki://source?title=My%20Notes)")
+    }
+
+    @Test func unresolvedSourceLinkUsesMissingHost() {
+        let out = WikiLinkMarkdown.linkified("[[source:Ghost]]") { _, _ in false }
+        #expect(out == "[Ghost](wiki://missing?title=Ghost)")
+    }
+
+    @Test func sourceLinkWithAliasPreservesDisplay() {
+        let out = WikiLinkMarkdown.linkified("[[source:My Notes|the notes]]") { _, _ in true }
+        // Display text is the alias, URL carries the target.
+        #expect(out.contains("the notes"))
+        #expect(out.contains("wiki://source?title=My%20Notes"))
+    }
+
+    @Test func resolvedKindReturnsSourceForSourceHost() {
+        let url = URL(string: "wiki://source?title=X")!
+        #expect(WikiLinkMarkdown.resolvedKind(from: url) == .source)
+    }
+
+    @Test func resolvedKindReturnsPageForPageHost() {
+        let url = URL(string: "wiki://page?title=X")!
+        #expect(WikiLinkMarkdown.resolvedKind(from: url) == .page)
+    }
+
+    @Test func resolvedKindReturnsNilForMissingHost() {
+        let url = URL(string: "wiki://missing?title=X")!
+        #expect(WikiLinkMarkdown.resolvedKind(from: url) == nil)
+    }
+
+    @Test func targetFromAcceptsSourceHost() {
+        let url = URL(string: "wiki://source?title=My%20Notes")!
+        #expect(WikiLinkMarkdown.target(from: url) == "My Notes")
+    }
+
+    @Test func isResolvedURLTrueForSourceHost() {
+        #expect(WikiLinkMarkdown.isResolvedURL(URL(string: "wiki://source?title=X")!))
+    }
+
+    // MARK: - Mixed page + source links
+
+    @Test func mixedPageAndSourceLinksRenderWithCorrectHosts() {
+        let out = WikiLinkMarkdown.linkified("[[Home]] and [[source:Paper]]") { name, kind in
+            kind == .source ? name == "Paper" : name == "Home"
+        }
+        #expect(out.contains("wiki://page?title=Home"))
+        #expect(out.contains("wiki://source?title=Paper"))
+    }
+
+    @Test func emptySourcePrefixRendersAsLiteral() {
+        // [[source:]] should stay verbatim, not become a link.
+        let out = WikiLinkMarkdown.linkified("before [[source:]] after") { _, _ in true }
+        #expect(out.contains("[[source:]]"))
+        #expect(!out.contains("wiki://"))
+    }
+
+    // MARK: - Code-span protection for source links
+
+    @Test func sourceLinkInsideCodeSpanIsLiteral() {
+        let out = WikiLinkMarkdown.linkified("`[[source:Paper]]` is a code span") { _, _ in true }
+        #expect(out.contains("[[source:Paper]]"))
+        #expect(!out.contains("wiki://source"))
+    }
+
+    @Test func sourceLinkInsideFencedCodeBlockIsLiteral() {
+        let out = WikiLinkMarkdown.linkified(
+            "```\n[[source:Paper]]\n```\n\nOutside [[source:Notes]]") { _, _ in true }
+        #expect(out.contains("[[source:Paper]]"))   // inside fence → verbatim
+        #expect(!out.contains("wiki://source?title=Paper"))
+        #expect(out.contains("wiki://source?title=Notes")) // outside fence → linkified
     }
 
     // Pull the URL substring out of a single `[text](url)` for assertions.

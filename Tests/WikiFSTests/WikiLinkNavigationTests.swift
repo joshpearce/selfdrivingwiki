@@ -108,4 +108,36 @@ struct WikiLinkNavigationTests {
         let reloaded = try store.getPage(id: from.id)
         #expect(reloaded.bodyMarkdown == "edited body before clicking a link")
     }
+
+    // MARK: - selectSource(byDisplayName:) (Phase B)
+
+    @Test func selectSourceByDisplayNameNavigatesToThatSource() throws {
+        let (model, store) = try tempModel()
+        let source = try store.addSource(filename: "Paper.pdf", data: Data("pdf".utf8))
+        model.reloadFromStore()
+
+        let navigated = model.selectSource(byDisplayName: "Paper.pdf")
+        #expect(navigated)
+        #expect(model.selection == .source(source.id))
+        #expect(model.tabs.contains { $0.selection == .source(source.id) })
+    }
+
+    @Test func selectSourceByDisplayNameNoOpsOnMissingName() throws {
+        let (model, _) = try tempModel()
+        let navigated = model.selectSource(byDisplayName: "Ghost.pdf")
+        #expect(!navigated)
+    }
+
+    @Test func selectSourceByDisplayNameReusesAlreadyOpenTab() throws {
+        let (model, store) = try tempModel()
+        let source = try store.addSource(filename: "notes.md", data: Data("md".utf8))
+        model.reloadFromStore()
+
+        model.openTab(.source(source.id))
+        #expect(model.tabs.count == 1)
+
+        #expect(model.selectSource(byDisplayName: "notes.md"))
+        #expect(model.tabs.count == 1) // reused, not duplicated
+        #expect(model.selection == .source(source.id))
+    }
 }

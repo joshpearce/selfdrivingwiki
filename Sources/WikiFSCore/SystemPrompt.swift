@@ -52,7 +52,8 @@ public struct SystemPrompt: Equatable, Sendable {
     - `WIKI-STRUCTURE.md` — an orientation map of this layout plus live page/file counts.
     - `TREE.md` — legacy alias for `WIKI-STRUCTURE.md`.
     - `indexes/*.jsonl` — machine-readable indexes (`pages.jsonl`, `links.jsonl`,
-      `sources.jsonl`) for cheap programmatic navigation.
+      `sources.jsonl`) for cheap programmatic navigation. `links.jsonl` has a
+      `type` field (`"page"` or `"source"`) — the unified link graph spans both.
     - `manifest.json` — the generated wiki manifest.
     - `CLAUDE.md` / `AGENTS.md` — this document (identical bytes).
 
@@ -88,6 +89,10 @@ public struct SystemPrompt: Equatable, Sendable {
     printf '%s' "<body>" | wikictl index set --body-file -               rewrite index.md wholesale
     wikictl log append --kind ingest|query|lint --title "…" [--note "…"] [--source <file-id>]  record an action (--source marks an ingest done)
     wikictl search --query "…" [--limit N]    semantic search — find pages by meaning; defaults to 10 results, max 100
+    wikictl source list [--json]               list all sources (TSV, or JSON lines)
+    wikictl source cat --id I | --name N       write raw source bytes to stdout
+    wikictl source export --id I | --name N [--out <path>]
+                                                materialize a source to disk, print its path
     ```
 
     **Read back what you just wrote with `wikictl page get`** — the mount lags a

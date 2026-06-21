@@ -309,6 +309,85 @@ struct SQLiteWikiStoreTests {
         _ = store
     }
 
+    // MARK: - Phase B: resolveSourceByName + mixed replaceLinks
+
+    @Test func resolveSourceByNameMatchesDisplayName() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        let source = try store.addSource(filename: "report.pdf", data: Data("pdf".utf8))
+        // display_name defaults to filename.
+        let id = try store.resolveSourceByName("report.pdf")
+        #expect(id == source.id)
+    }
+
+    @Test func resolveSourceByNameMatchesFilenameFallback() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        let source = try store.addSource(filename: "data.csv", data: Data("csv".utf8))
+        // Even without a custom display_name, filename match works.
+        let id = try store.resolveSourceByName("data.csv")
+        #expect(id == source.id)
+    }
+
+    @Test func resolveSourceByNameIsCaseInsensitive() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        _ = try store.addSource(filename: "My Report.PDF", data: Data("pdf".utf8))
+        let id = try store.resolveSourceByName("my report.pdf")
+        #expect(id != nil)
+    }
+
+    @Test func resolveSourceByNameReturnsNilForUnknown() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        #expect(try store.resolveSourceByName("nonexistent") == nil)
+    }
+
+    @Test func replaceLinksWritesBothPageAndSourceLinks() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        let page = try store.createPage(title: "Test Page")
+        let source = try store.addSource(filename: "note.md", data: Data("md".utf8))
+
+        // Mixed links: one page link, one source link.
+        let links: [WikiLinkParser.ParsedLink] = [
+            .init(linkType: .page, target: "Test Page", linkText: "self"),
+            .init(linkType: .source, target: source.filename, linkText: "the note"),
+        ]
+        try store.replaceLinks(from: page.id, parsedLinks: links)
+
+        // Both tables are populated.
+        let pageLinks = try store.listAllLinks()
+        #expect(pageLinks.count == 1)
+        #expect(pageLinks[0].type == "page")
+
+        let sourceLinks = try store.listAllSourceLinks()
+        #expect(sourceLinks.count == 1)
+        #expect(sourceLinks[0].type == "source")
+        #expect(sourceLinks[0].linkText == "the note")
+    }
+
+    @Test func replaceLinksIsAtomicAcrossBothTables() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        let page = try store.createPage(title: "P")
+        let source = try store.addSource(filename: "s.txt", data: Data("x".utf8))
+
+        // First write a page link.
+        try store.replaceLinks(from: page.id, parsedLinks: [
+            .init(linkType: .page, target: "P", linkText: "p"),
+        ])
+        #expect(try store.listAllLinks().count == 1)
+
+        // Re-write with only source links — page links should be wiped.
+        try store.replaceLinks(from: page.id, parsedLinks: [
+            .init(linkType: .source, target: source.filename, linkText: "src"),
+        ])
+        #expect(try store.listAllLinks().isEmpty)
+        #expect(try store.listAllSourceLinks().count == 1)
+    }
+
+    @Test func resolveTitleToIDIsCaseInsensitive() throws {
+        let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
+        _ = try store.createPage(title: "Home Page")
+        let id = try store.resolveTitleToID("home page")
+        #expect(id != nil)
+    }
+
     // MARK: - Helpers
 
     private func rows(_ db: OpaquePointer?, _ sql: String) -> [String] {

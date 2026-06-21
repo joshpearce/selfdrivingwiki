@@ -18,8 +18,8 @@ import Foundation
 ///
 /// Resolution is injected as a closure (`isResolved`) rather than reaching for a
 /// store, so the function stays pure and the caller decides what "exists" means:
-///   * a target that resolves → `wiki://page?title=<encoded>` (a live link);
-///   * a target that does NOT  → `wiki://missing?title=<encoded>` (still a link
+///   * a target that resolves → `wiki://page?title=…` or `wiki://source?title=…`
+///   * a target that does NOT  → `wiki://missing?title=…` (still a link
 ///     so the view can style it dimmed, but the click handler no-ops on it).
 public enum WikiLinkMarkdown {
 
@@ -28,7 +28,7 @@ public enum WikiLinkMarkdown {
     public static let scheme = "wiki"
     /// Host for a link whose target resolves to a real page (navigates).
     public static let resolvedHost = "page"
-    /// Host for a link whose target has no page (rendered dimmed, inert).
+    /// Host for a link whose target has no page/source (rendered dimmed, inert).
     public static let unresolvedHost = "missing"
 
     // Same grammar as WikiLinkParser.pattern: [[ target (no ] or |) (| alias)? ]]
@@ -43,13 +43,13 @@ public enum WikiLinkMarkdown {
     ///
     /// - Parameters:
     ///   - body: the raw page Markdown (with literal `[[…]]`).
-    ///   - isResolved: returns `true` if a target title maps to an existing page.
-    ///                 Receives the whitespace-collapsed target (same form
-    ///                 `WikiLinkParser` and `resolveTitleToID` use).
+    ///   - isResolved: returns `true` if a (target, LinkType) pair maps to an
+    ///                 existing page/source. Receives the whitespace-collapsed,
+    ///                 prefix-stripped target.
     /// - Returns: Markdown safe to hand to `AttributedString(markdown:)`.
     public static func linkified(
         _ body: String,
-        isResolved: (String) -> Bool = { _ in true }
+        isResolved: (String, WikiLinkParser.ParsedLink.LinkType) -> Bool = { _, _ in true }
     ) -> String {
         let ns = body as NSString
         let codeRanges = protectedCodeRanges(in: body)
@@ -73,9 +73,22 @@ public enum WikiLinkMarkdown {
             }
             cursor = full.location + full.length
 
-            let target = collapseWhitespace(ns.substring(with: match.range(at: 1)))
-            guard !target.isEmpty else {
+            let rawTarget = collapseWhitespace(ns.substring(with: match.range(at: 1)))
+            guard !rawTarget.isEmpty else {
                 // Empty target (e.g. `[[ ]]`): leave the literal text in place.
+                out += ns.substring(with: full)
+                continue
+            }
+
+            let (kind, bareTarget) = WikiLinkParser.classify(rawTarget)
+            guard !bareTarget.isEmpty else {
+                // Empty bare target after prefix strip: literal text.
+                out += ns.substring(with: full)
+                continue
+            }
+            // `[[source:]]` / `[[page:]]` — reserved prefix with no meaningful
+            // remainder: emit literal text (consistent with the parser's skip).
+            if WikiLinkParser.isEmptyPrefix(rawTarget) {
                 out += ns.substring(with: full)
                 continue
             }
@@ -84,12 +97,13 @@ public enum WikiLinkMarkdown {
             let display: String
             if aliasRange.location != NSNotFound {
                 let alias = collapseWhitespace(ns.substring(with: aliasRange))
-                display = alias.isEmpty ? target : alias
+                display = alias.isEmpty ? bareTarget : alias
             } else {
-                display = target
+                display = bareTarget
             }
 
-            out += markdownLink(display: display, target: target, resolved: isResolved(target))
+            let resolved = isResolved(bareTarget, kind)
+            out += markdownLink(display: display, target: bareTarget, kind: kind, resolved: resolved)
         }
         // Tail after the last match.
         if cursor < ns.length {
@@ -99,11 +113,12 @@ public enum WikiLinkMarkdown {
     }
 
     /// The `wiki://…` URL for a given target title, or nil if `url` is not one of
-    /// ours. Used by the view's `OpenURLAction` to pull the title back out.
+    /// ours. Accepts hosts `"page"`, `"source"`, or `"missing"`. Used by the view's
+    /// `OpenURLAction` to pull the title back out.
     public static func target(from url: URL) -> String? {
         guard url.scheme == scheme,
               let host = url.host,
-              host == resolvedHost || host == unresolvedHost,
+              host == resolvedHost || host == "source" || host == unresolvedHost,
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let title = components.queryItems?.first(where: { $0.name == "title" })?.value,
               !title.isEmpty
@@ -111,16 +126,34 @@ public enum WikiLinkMarkdown {
         return title
     }
 
+    /// `.page` / `.source` for a resolved link; `nil` for unresolved (`missing`) or
+    /// non-wiki. Used by the view's `OpenURLAction` to route the click.
+    public static func resolvedKind(from url: URL) -> WikiLinkParser.ParsedLink.LinkType? {
+        guard url.scheme == scheme, let host = url.host else { return nil }
+        switch host {
+        case resolvedHost:   return .page     // "page"
+        case "source":       return .source
+        default:             return nil       // "missing" or anything else → inert
+        }
+    }
+
     /// True if `url` points at a page that resolved (i.e. should navigate). An
     /// unresolved (`missing`) link is one of ours but inert.
     public static func isResolvedURL(_ url: URL) -> Bool {
-        url.scheme == scheme && url.host == resolvedHost
+        resolvedKind(from: url) != nil
     }
 
     // MARK: - Helpers
 
-    private static func markdownLink(display: String, target: String, resolved: Bool) -> String {
-        let host = resolved ? resolvedHost : unresolvedHost
+    private static func markdownLink(display: String, target: String,
+                                     kind: WikiLinkParser.ParsedLink.LinkType,
+                                     resolved: Bool) -> String {
+        let host: String
+        if resolved {
+            host = kind == .source ? "source" : resolvedHost
+        } else {
+            host = unresolvedHost
+        }
         // Encode the title for the query value, and escape any `]`/`)` in the
         // display text so it can't break the Markdown `[text](url)` grammar.
         let encodedTitle = target.addingPercentEncoding(withAllowedCharacters: titleQueryAllowed)
@@ -132,10 +165,10 @@ public enum WikiLinkMarkdown {
         return "[\(safeDisplay)](\(scheme)://\(host)?title=\(encodedTitle))"
     }
 
-    /// Collapse whitespace runs to one space and trim — identical to
-    /// `WikiLinkParser` so a target linkifies to the same title it resolves to.
+    /// Collapse whitespace runs to one space and trim — delegates to the single
+    /// shared normalizer.
     private static func collapseWhitespace(_ s: String) -> String {
-        s.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        WikiText.normalized(s)
     }
 
     /// Allowed characters for the `title=` query value. Start from the URL query

@@ -57,8 +57,10 @@ struct MarkdownPreview: View {
                 }
                 return .systemAction
             }
-            if WikiLinkMarkdown.isResolvedURL(url) {
-                store.selectPage(byTitle: title)
+            switch WikiLinkMarkdown.resolvedKind(from: url) {
+            case .page:   store.selectPage(byTitle: title)
+            case .source: store.selectSource(byDisplayName: title)
+            case nil:     break // unresolved ("missing") → inert
             }
             return .handled
         })
@@ -76,7 +78,9 @@ struct MarkdownPreview: View {
     }
 
     private func linkified(_ body: String) -> String {
-        WikiLinkMarkdown.linkified(body) { store.pageExists(title: $0) }
+        WikiLinkMarkdown.linkified(body) { name, kind in
+            kind == .source ? store.sourceExists(displayName: name) : store.pageExists(title: name)
+        }
     }
 }
 

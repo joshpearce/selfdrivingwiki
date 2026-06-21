@@ -83,6 +83,30 @@ struct IndexGeneratorTests {
         #expect(first?["from"] as? String == "A")
         #expect(first?["to"] as? String == "B")
         #expect(first?["link_text"] as? String == "File Provider")
+        #expect(first?["type"] as? String == "page")
+    }
+
+    // MARK: - links.jsonl type field (Phase B)
+
+    @Test func linksJSONLIncludesTypeField() {
+        let links = [
+            IndexGenerators.LinkRow(from: "A", to: "B", linkText: "x", type: "page"),
+            IndexGenerators.LinkRow(from: "A", to: "S1", linkText: "src", type: "source"),
+        ]
+        let data = IndexGenerators.linksJSONL(links: links)
+        let lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
+        #expect(lines.count == 2)
+
+        let first = try! JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as? [String: Any]
+        #expect(first?["type"] as? String == "page")
+
+        let second = try! JSONSerialization.jsonObject(with: Data(lines[1].utf8)) as? [String: Any]
+        #expect(second?["type"] as? String == "source")
+    }
+
+    @Test func linksJSONLIsByteStable() {
+        let links = [IndexGenerators.LinkRow(from: "A", to: "B", linkText: "x", type: "page")]
+        #expect(IndexGenerators.linksJSONL(links: links) == IndexGenerators.linksJSONL(links: links))
     }
 
     // MARK: - sources.jsonl (Phase 5)

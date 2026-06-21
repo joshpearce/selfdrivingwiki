@@ -79,10 +79,10 @@ public enum ArgumentParser {
       index set --body-file <path|->         rewrite the curated index.md body
       search --query X [--limit N]           semantic search (cosine similarity);
                                              falls back to LIKE title match
-      file list [--json]                     list ingested files (TSV, or JSON lines)
-      file cat  (--id X | --name N)          write raw file bytes to stdout
-      file export (--id X | --name N) [--out <path>]
-                                             materialize a file to disk, print its path
+      source list [--json]                    list sources (TSV, or JSON lines)
+      source cat  (--id X | --name N)         write raw source bytes to stdout
+      source export (--id X | --name N) [--out <path>]
+                                              materialize a source to disk, print its path
     """
 
     /// Parse `arguments` (WITHOUT the executable name) plus an env lookup into an
@@ -272,7 +272,7 @@ public enum ArgumentParser {
             }
         }
 
-        /// A `--id Y` or `--name N` file selector (exactly one required).
+        /// A `--id Y` or `--name N` source selector (exactly one required).
         func requireSourceSelector() throws -> SourceCommand.Selector {
             switch (values["--id"], values["--name"]) {
             case (let id?, nil):

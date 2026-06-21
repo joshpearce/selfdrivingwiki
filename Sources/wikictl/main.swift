@@ -63,7 +63,7 @@ func run() -> Int32 {
 
 /// Execute a parsed `Command`, dispatching to `PageCommand` (the `page …` family),
 /// `LogIndexCommand` (the Phase-B `log append` / `index set`), or `SourceCommand`
-/// (the `file …` family for raw source reads). The deferred body read (`-` = stdin,
+/// (the `source …` family for raw source reads). The deferred body read (`-` = stdin,
 /// else a file path) happens here — the only I/O the parser left for `main`.
 func execute(_ command: ArgumentParser.Command, in store: SQLiteWikiStore) throws -> SourceCommand.Result {
     switch command {

@@ -373,9 +373,9 @@ struct OperationCommandTests {
     #expect(prompt.contains("Markdown footnotes"))
     #expect(prompt.contains("FOLLOW THEM"))
     // The Query prompt now routes raw-file reads through wikictl, not the mount.
-    #expect(prompt.contains("wikictl file list"))
-    #expect(prompt.contains("wikictl file cat --id"))
-    #expect(prompt.contains("wikictl file export --id"))
+    #expect(prompt.contains("wikictl source list"))
+    #expect(prompt.contains("wikictl source cat --id"))
+    #expect(prompt.contains("wikictl source export --id"))
     #expect(prompt.contains("Read"))
     #expect(prompt.contains("pdftotext"))
     #expect(prompt.contains("strings"))
