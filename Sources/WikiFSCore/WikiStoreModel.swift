@@ -643,7 +643,7 @@ public final class WikiStoreModel {
             }
             do {
                 let summary = try store.addSource(
-                    filename: filename, data: data, zoteroItemKey: nil, zoteroItemTitle: nil)
+                    filename: filename, data: data, zoteroItemKey: nil, zoteroItemTitle: nil, mimeType: nil)
                 lastSourceID = summary.id
             } catch {
                 print("WikiStoreModel.ingest store failed for \(filename): \(error)")
@@ -686,7 +686,7 @@ public final class WikiStoreModel {
         // actor (no @Sendable store closure crossing the actor boundary).
         let plan = URLIngestService.plan(for: response)
         let summary = try store.addSource(
-            filename: plan.filename, data: plan.data, zoteroItemKey: nil, zoteroItemTitle: nil)
+            filename: plan.filename, data: plan.data, zoteroItemKey: nil, zoteroItemTitle: nil, mimeType: nil)
         reloadSources()
         openTab(.source(summary.id))
         onPageDidChange?()
@@ -699,7 +699,7 @@ public final class WikiStoreModel {
     public func addSource(filename: String, data: Data) {
         do {
             _ = try store.addSource(
-                filename: filename, data: data, zoteroItemKey: nil, zoteroItemTitle: nil)
+                filename: filename, data: data, zoteroItemKey: nil, zoteroItemTitle: nil, mimeType: nil)
             reloadSources()
             onPageDidChange?()
         } catch {
@@ -732,7 +732,8 @@ public final class WikiStoreModel {
             do {
                 let summary = try store.addSource(
                     filename: path.lastPathComponent, data: data,
-                    zoteroItemKey: parentItem.key, zoteroItemTitle: parentItem.title)
+                    zoteroItemKey: parentItem.key, zoteroItemTitle: parentItem.title,
+                    mimeType: nil)
                 reloadSources()
                 openTab(.source(summary.id))
                 onPageDidChange?()
@@ -769,7 +770,7 @@ public final class WikiStoreModel {
         for file in result.files {
             do {
                 let summary = try store.addSource(
-                    filename: file.filename, data: file.data, zoteroItemKey: nil, zoteroItemTitle: nil)
+                    filename: file.filename, data: file.data, zoteroItemKey: nil, zoteroItemTitle: nil, mimeType: nil)
                 if firstSourceID == nil { firstSourceID = summary.id }
                 imported += 1
             } catch {

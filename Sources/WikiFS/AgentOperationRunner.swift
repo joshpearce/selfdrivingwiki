@@ -127,7 +127,7 @@ enum AgentOperationRunner {
                     launcher.extractionLog = "PDF extraction not ready — sending raw PDF to agent."
                 }
                 } // end else (no existing markdown → extract)
-            } // end if source.ext == "pdf"
+            } // end if source.mimeType == "application/pdf"
 
             sources.append(OperationRequest.StagedSource(
                 bytes: sourceBytes,

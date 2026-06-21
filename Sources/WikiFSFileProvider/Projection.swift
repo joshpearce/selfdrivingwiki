@@ -453,7 +453,8 @@ struct Projection {
             metadataVersion: Data(
                 "\(file.filename)|\(file.updatedAt.timeIntervalSince1970)|\(file.version)".utf8),
             created: file.createdAt, modified: file.updatedAt,
-            ingestedExt: file.ext
+            ingestedExt: file.ext,
+            mimeType: file.mimeType
         )
     }
 
@@ -632,6 +633,10 @@ struct ProjectedNode {
     /// UTType for ingested files WITHOUT touching the page/index branches. `nil`
     /// for every other node kind (pages, folders, generated indexes).
     let ingestedExt: String?
+    /// Set ONLY for ingested-file leaves: the content-derived MIME type stored in
+    /// the `sources` row. `WikiFSItem.contentType` prefers this over `ingestedExt`
+    /// when deriving the file's UTType. `nil` for every other node kind.
+    let mimeType: String?
 
     static func folder(id: NSFileProviderItemIdentifier,
                        parent: NSFileProviderItemIdentifier,
@@ -639,7 +644,7 @@ struct ProjectedNode {
         ProjectedNode(id: id, parent: parent, name: name, isFolder: true, size: 0,
                       contentVersion: Projection.staticVersion,
                       metadataVersion: Projection.staticVersion,
-                      created: nil, modified: nil, ingestedExt: nil)
+                      created: nil, modified: nil, ingestedExt: nil, mimeType: nil)
     }
 
     static func file(id: NSFileProviderItemIdentifier,
@@ -647,9 +652,11 @@ struct ProjectedNode {
                      name: String, size: Int,
                      version: Data, metadataVersion: Data,
                      created: Date?, modified: Date?,
-                     ingestedExt: String? = nil) -> ProjectedNode {
+                     ingestedExt: String? = nil,
+                     mimeType: String? = nil) -> ProjectedNode {
         ProjectedNode(id: id, parent: parent, name: name, isFolder: false, size: size,
                       contentVersion: version, metadataVersion: metadataVersion,
-                      created: created, modified: modified, ingestedExt: ingestedExt)
+                      created: created, modified: modified,
+                      ingestedExt: ingestedExt, mimeType: mimeType)
     }
 }

@@ -209,22 +209,11 @@ public struct URLIngestService {
     }
 
     /// Detect a known binary content type from leading magic-number bytes, else
-    /// `nil` (so the caller falls back to the declared type). Cheap prefix checks;
-    /// extend the table as needed.
+    /// `nil` (so the caller falls back to the declared type). Delegates to the
+    /// shared `ContentSniff` helper so the store and other ingest paths share
+    /// one implementation.
     static func sniffContentType(_ data: Data) -> String? {
-        // Examine a small prefix; `prefix` is a view, so this copies at most 8 bytes.
-        let head = Array(data.prefix(8))
-        func starts(with magic: [UInt8]) -> Bool {
-            guard head.count >= magic.count else { return false }
-            return Array(head.prefix(magic.count)) == magic
-        }
-
-        if starts(with: Array("%PDF".utf8)) { return "application/pdf" }
-        if starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "image/png" }  // \x89PNG
-        if starts(with: [0xFF, 0xD8, 0xFF]) { return "image/jpeg" }
-        if starts(with: Array("GIF8".utf8)) { return "image/gif" }
-        if starts(with: [0x50, 0x4B, 0x03, 0x04]) { return "application/zip" }  // PK\x03\x04
-        return nil
+        ContentSniff.mimeType(of: data)
     }
 
     // MARK: - Helpers (pure)

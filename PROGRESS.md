@@ -2,6 +2,67 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-21 — Content-type over extension (implemented)
+
+Implemented `plans/content-type-over-extension.md` — made `mime_type` content-authoritative
+rather than extension-derived. This closes the circularity bug where a PDF renamed `.txt`
+was mis-typed and skipped extraction.
+
+**Changes:**
+
+- **`ContentSniff` (new):** Extracted `URLIngestService.sniffContentType` into a pure
+  `WikiFSCore` helper (`mimeType(of:)`) shared by all ingest paths.
+- **`addSource` MIME-first:** Added `mimeType:` parameter to the protocol and
+  `SQLiteWikiStore`. Priority: explicit param → magic-byte sniff → ext fallback. A PDF
+  named `.txt` now stores `application/pdf`.
+- **`WikiFSItem.contentType` MIME-first:** Added `mimeType: String?` to `ProjectedNode`;
+  `sourceNode` carries `file.mimeType`; `WikiFSItem.contentType` prefers
+  `UTType(mimeType:)` over `UTType(filenameExtension:)`.
+- **Zotero `isIngestable`:** Prefers API `contentType` (`application/pdf`, `text/*`) over
+  filename extension; extension check remains as fallback.
+- **Stale comment fix:** `AgentOperationRunner:130` comment now matches the MIME-based
+  guard it annotates.
+- **Grep guard:** `ExtensionCheckGuardTests` fails if a new behavioral extension check
+  appears outside the allowlisted files.
+
+**Tests.** `swift test` — 653 tests, 53 suites, 0 failures.
+
+On branch `feature/content-type-over-extension`.
+
+## 2026-06-21 — Phase C review + content-type + Phase C plans
+
+Reviewed Phase C ("Source Markdown in the File Provider") of `plans/sources-redesign.md`
+against the post-Phase-B tree. Two load-bearing assumptions in the parent design are false
+in the code: (1) the change bridge can't see processed-markdown edits — `changeToken()`
+(`SQLiteWikiStore.swift:564`) folds `COUNT`/`SUM(version)` over `sources` but not
+`source_markdown_versions`, and `appendProcessedMarkdown`/`revertProcessedMarkdown` don't
+bump `sources.version`, so extraction/edit/revert don't move the sync anchor and the
+projected `.md` sibling never refreshes; (2) markdown sources *do* get chains today via the
+lazy-seed in `WikiStoreModel.processedMarkdownHead(for:)` (`:865-877`), which contradicts
+the intended model (only PDFs have chains) and would project a colliding `<id>.md` sibling.
+Design intent confirmed: the chain is a git-lite history of PDF→markdown conversions
+(revert shipped, compare future); only HEAD is projected; the agent sees the latest only.
+
+Also surfaced the root extension-check bug: `addSource` (`SQLiteWikiStore.swift:861`)
+derives `mime_type` from the filename extension, making every downstream "trust MIME" check
+circular (a PDF named `.txt` is mis-typed and skips extraction). `URLIngestService` already
+content-sniffs but the result is discarded and re-derived from ext.
+
+Wrote three plans (all indexed in `PLAN.md`):
+
+- **`plans/content-type-over-extension.md`** — cross-cutting fix making `mime_type`
+  content-authoritative: extract a `ContentSniff` helper, `addSource` sniffs bytes,
+  MIME-first `WikiFSItem.contentType`, Zotero filter, and a grep guard. Standalone; Phase C
+  depends on it.
+- **`plans/phase-c-source-markdown-projection.md`** — Phase C re-grounded. Folds
+  `source_markdown_versions` into `changeToken()` + versions the sibling off the HEAD row;
+  removes the markdown lazy-seed; projects the `.md` sibling in by-id and by-name with
+  proper identity prefixes; one-query HEAD read to avoid N+1; `wikictl source edit-markdown`
+  (appends a `user` version, requires an existing extraction baseline). Defers all
+  MIME-authority work to the content-type plan (no duplicated edits between the two).
+
+No code changed — planning only, on branch `feature/source-wikilinks`.
+
 ## 2026-06-21 — Phase B: `[[source:display-name]]` wikilinks
 
 Wiki pages can now link to sources with `[[source:display-name]]` syntax. Clicking a

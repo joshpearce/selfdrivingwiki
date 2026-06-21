@@ -64,7 +64,8 @@ public protocol WikiStore {
         filename: String,
         data: Data,
         zoteroItemKey: String?,
-        zoteroItemTitle: String?
+        zoteroItemTitle: String?,
+        mimeType: String?
     ) throws -> SourceSummary
 
     /// Source summaries (no content blob), most-recent-first.
