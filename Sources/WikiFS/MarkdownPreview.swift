@@ -23,6 +23,7 @@ struct MarkdownPreview: View {
     @Bindable var store: WikiStoreModel
     let markdown: String
     var contentInset: Bool = true
+    @AppStorage("reader.zoom") private var readerZoom: Double = 1.0
 
     var body: some View {
         let renderedBody = renderedMarkdown
@@ -37,6 +38,7 @@ struct MarkdownPreview: View {
                     StructuredText(markdown: renderedBody)
                         .id(renderedBody)
                         .textual.textSelection(.enabled)
+                        .textual.fontScale(CGFloat(readerZoom))
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }

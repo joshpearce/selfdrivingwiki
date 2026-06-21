@@ -27,6 +27,7 @@ struct IngestedFileDetailView: View {
     let launcher: AgentLauncher
     @Bindable var store: WikiStoreModel
 
+    @AppStorage("editor.zoom") private var editorZoom: Double = 1.0
     @State private var headVersion: FileMarkdownVersion?
     @State private var isEditing = false
     @State private var editBuffer = ""
@@ -324,7 +325,7 @@ struct IngestedFileDetailView: View {
     private var markdownContent: some View {
         if isEditing {
             TextEditor(text: $editBuffer)
-                .font(.system(.body, design: .monospaced))
+                .font(.system(size: 13 * editorZoom, design: .monospaced))
                 .scrollContentBackground(.hidden)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(PageEditorMetrics.contentInset)

@@ -11,6 +11,7 @@ struct PageDetailView: View {
     @Bindable var manager: WikiManager
     let fileProvider: FileProviderSpike
     @State private var isEditing = false
+    @AppStorage("editor.zoom") private var editorZoom: Double = 1.0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -69,7 +70,7 @@ struct PageDetailView: View {
             // Content — swaps between reader and editor, header stays put.
             if isEditing {
                 TextEditor(text: $store.draftBody)
-                    .font(.system(.body, design: .monospaced))
+                    .font(.system(size: 13 * editorZoom, design: .monospaced))
                     .scrollContentBackground(.hidden)
                     .padding(.horizontal, PageEditorMetrics.contentInset)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
