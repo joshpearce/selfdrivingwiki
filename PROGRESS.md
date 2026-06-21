@@ -260,6 +260,32 @@ self-seed v1 from verbatim bytes (origin `"source"`), PDFs seed from extraction.
 
 On branch `feature/phase-c-source-markdown-projection`.
 
+## 2026-06-21 — Reader and editor zoom (⌘+ / ⌘− / ⌘0)
+
+Implemented `plans/reader-editor-zoom.md`. Safari-style text zoom for the page reader
+and both monospace editors (page + source), keyboard-only, persisted globally.
+
+- **`ZoomScale` (WikiFSCore)** — pure value type: bounds `0.5...3.0`, ×/÷1.1 step,
+  default `1.0`, non-finite input coerced to default. 15 `ZoomScaleTests` covering
+  clamping at both bounds, round-trip symmetry, reset, and non-finite coercion.
+- **Reader scale** — `MarkdownPreview` reads `@AppStorage("reader.zoom")` and applies
+  `.textual.fontScale(readerZoom)` to `StructuredText`; headings and spacing scale
+  proportionally. Both the page reader and the source viewer scale from this
+  one edit.
+- **Editor scale** — `PageDetailView` and `SourceDetailView` read
+  `@AppStorage("editor.zoom")` and size the monospace `TextEditor` via
+  `.system(size: 13 * editorZoom, design: .monospaced)`. At `1.0` the size is
+  identical to the previous `.body` default at the standard text size (the fixed
+  13 pt no longer tracks Dynamic Type, a deliberate trade-off per the plan).
+- **`ZoomShortcuts` (WikiFS)** — `.zoomShortcuts(_:)` view modifier injects hidden,
+  zero-size `Button`s for ⌘+, ⌘=, ⌘−, and ⌘0. Wired per-mode in both detail views:
+  reader-mode buttons mutate `reader.zoom`, editor-mode buttons mutate `editor.zoom`.
+  No menu items added.
+- **`@AppStorage` keys** — `reader.zoom` and `editor.zoom` are the first `AppStorage`
+  keys in the app; both default `1.0`, shared across views, persisted across launches.
+
+**Tests.** `swift test` — 650 tests, 0 failures (+15 `ZoomScaleTests`).
+
 ## 2026-06-21 — Content-type over extension
 
 Implemented `plans/content-type-over-extension.md` — made `mime_type` content-authoritative
