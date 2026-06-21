@@ -4,17 +4,10 @@ Newest first. To get up to speed: read `PLAN.md` then this file.
 
 ## 2026-06-21 — Phase B: `[[source:display-name]]` wikilinks
 
-An adversarial multi-agent review of the parent design (`sources-redesign.md`) found
-23 issues: a self-contradictory render contract (`?id=` needs a ULID at render time
-but the closure is Bool), no shared normalizer, case-sensitive page resolution that
-diverged from the spec, and a claim that the rename would add a "general" link-rewrite
-scanner when none existed. A new grounded plan (`phase-b-source-wikilinks.md`) resolved
-all findings, then the implementation followed.
-
 Wiki pages can now link to sources with `[[source:display-name]]` syntax. Clicking a
 source link in the preview navigates to that source's detail view — the same seam
 page links use. Source links render as `wiki://source?title=<display-name>`
-(not `?id=<ulid>`), resolution happens at click time via
+(mirroring `wiki://page?title=…`), resolution happens at click time via
 `selectSource(byDisplayName:)`, and a single `(String, LinkType) -> Bool` closure
 serves both link kinds.
 
