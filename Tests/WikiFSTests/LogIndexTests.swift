@@ -230,7 +230,7 @@ struct LogIndexTests {
         #expect(prompt.body == "kept prompt")
         #expect(prompt.version == 7)
 
-        // user_version is now 6.
+        // user_version advances through every migration step to head (v9).
         var check: OpaquePointer?
         #expect(sqlite3_open(url.path, &check) == SQLITE_OK)
         defer { sqlite3_close(check) }
@@ -238,7 +238,7 @@ struct LogIndexTests {
         #expect(sqlite3_prepare_v2(check, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK)
         defer { sqlite3_finalize(stmt) }
         #expect(sqlite3_step(stmt) == SQLITE_ROW)
-        #expect(sqlite3_column_int(stmt, 0) == 7)
+        #expect(sqlite3_column_int(stmt, 0) == 9)
         _ = store
     }
 }

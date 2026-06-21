@@ -21,6 +21,14 @@ public struct IngestedFileSummary: Identifiable, Hashable, Sendable {
     public let updatedAt: Date
     public let version: Int
 
+    /// The Zotero library item this file was ingested from — set ONLY via the
+    /// Zotero ingest seam (`ingestFromZotero`). `nil` for drag-drop, URL, and
+    /// Markdown-folder imports (no Zotero provenance). `key` is the item key
+    /// needed to build a "View in Zotero" link; `title` is the item's display
+    /// title captured at ingest time (the item could be renamed/deleted later).
+    public let zoteroItemKey: String?
+    public let zoteroItemTitle: String?
+
     public init(
         id: PageID,
         filename: String,
@@ -29,7 +37,9 @@ public struct IngestedFileSummary: Identifiable, Hashable, Sendable {
         byteSize: Int,
         createdAt: Date,
         updatedAt: Date,
-        version: Int
+        version: Int,
+        zoteroItemKey: String? = nil,
+        zoteroItemTitle: String? = nil
     ) {
         self.id = id
         self.filename = filename
@@ -39,5 +49,7 @@ public struct IngestedFileSummary: Identifiable, Hashable, Sendable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.version = version
+        self.zoteroItemKey = zoteroItemKey
+        self.zoteroItemTitle = zoteroItemTitle
     }
 }

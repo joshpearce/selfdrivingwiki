@@ -50,8 +50,16 @@ public protocol WikiStore {
 
     /// Store a dropped file's verbatim bytes + metadata as a new ingested-file
     /// row, returning its summary. Throws if the data exceeds the soft size cap.
+    /// The optional `zoteroItemKey`/`zoteroItemTitle` capture provenance when the
+    /// file was ingested from a Zotero library item; they default to `nil` so
+    /// drag-drop / URL / folder-import callers are unchanged.
     @discardableResult
-    func ingestFile(filename: String, data: Data) throws -> IngestedFileSummary
+    func ingestFile(
+        filename: String,
+        data: Data,
+        zoteroItemKey: String?,
+        zoteroItemTitle: String?
+    ) throws -> IngestedFileSummary
 
     /// Ingested-file summaries (no content blob), most-recent-first.
     func listIngestedFiles() throws -> [IngestedFileSummary]
@@ -73,6 +81,29 @@ public protocol WikiStore {
     /// IDs of ingested files the agent has marked ingested — the deterministic
     /// source of truth for the "Ingested" badge (no fuzzy log-title matching).
     func markedIngestedFileIDs() throws -> Set<String>
+
+    // MARK: - Processed markdown versions (v8)
+
+    /// The latest (HEAD) version of the processed markdown for a file, or nil
+    /// when no version exists yet (not yet seeded/extracted).
+    func processedMarkdownHead(fileID: PageID) throws -> FileMarkdownVersion?
+
+    /// True when at least one processed-markdown version exists for this file.
+    func hasProcessedMarkdown(fileID: PageID) throws -> Bool
+
+    /// All versions for a file, newest first (HEAD → v1). Empty if none.
+    func processedMarkdownHistory(fileID: PageID) throws -> [FileMarkdownVersion]
+
+    /// Append a new full-text markdown version to the chain. Reads the current
+    /// head to set `parentID`. Returns the new version.
+    @discardableResult
+    func appendProcessedMarkdown(fileID: PageID, content: String,
+                                 origin: String, note: String?) throws -> FileMarkdownVersion
+
+    /// Revert to an older version by appending a NEW version whose content
+    /// copies the target. History is preserved; HEAD = the new revert version.
+    @discardableResult
+    func revertProcessedMarkdown(fileID: PageID, to versionID: PageID) throws -> FileMarkdownVersion
 
     // MARK: - System prompt (singleton document, v3)
 

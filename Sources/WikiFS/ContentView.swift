@@ -10,20 +10,22 @@ struct ContentView: View {
     @Bindable var manager: WikiManager
     let fileProvider: FileProviderSpike
     @Bindable var agentLauncher: AgentLauncher
-    @State private var showingPathPopover = false
-    @State private var showingMaintainSheet = false
     @State private var isTranscriptExpanded = false
     /// Driven by `.dropDestination`'s `isTargeted` callback to fade in a subtle
     /// accent border while a drag hovers the window (set via the closure param —
     /// no `Binding(get:set:)`).
     @State private var isDropTargeted = false
+    @State private var showingAddFromURL = false
+    @State private var showingImportMarkdown = false
+    @State private var showingAddFromZotero = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         NavigationSplitView {
             SidebarView(store: store, manager: manager, fileProvider: fileProvider,
                         onBatchIngest: batchIngest,
-                        ingestingFileIDs: agentLauncher.ingestingFileIDs)
+                        ingestingFileIDs: agentLauncher.ingestingFileIDs,
+                        extractingFileIDs: agentLauncher.extractingFileIDs)
         } detail: {
             VStack(spacing: 0) {
                 TabBarView(store: store)
@@ -34,11 +36,15 @@ struct ContentView: View {
                         launcher: agentLauncher,
                         manager: manager,
                         fileProvider: fileProvider,
-                        runIngest: runIngest
+                        runIngest: runIngest,
+                        showingAddFromURL: $showingAddFromURL,
+                        showingImportMarkdown: $showingImportMarkdown,
+                        showingAddFromZotero: $showingAddFromZotero,
+                        isZoteroConfigured: isZoteroConfigured
                     )
                     .frame(maxWidth: .infinity)
 
-                    if isTranscriptExpanded && !isQuerySelected {
+                    if isTranscriptExpanded {
                         Divider()
                         AgentTranscriptSidebar(launcher: agentLauncher)
                         .transition(.move(edge: .trailing).combined(with: .opacity))
@@ -82,104 +88,64 @@ struct ContentView: View {
                     .help("Go forward")
             }
 
-            ToolbarItem(placement: .primaryAction) {
-                Button("Toggle Transcript", systemImage: "sidebar.trailing") {
-                    toggleTranscript()
-                }
-                .disabled(!canShowTranscript)
-                // Light up (tint + pulse) while the agent is busy — including the
-                // PDF-conversion phase, before the agent process itself starts — so
-                // the user can tell something is running and open the transcript.
-                .foregroundStyle(agentBusy ? Color.orange : Color.primary)
-                .symbolEffect(.pulse, isActive: agentBusy)
-                .help(isTranscriptExpanded ? "Hide agent transcript" : "Show agent transcript")
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button("Maintain Wiki", systemImage: "sparkles") {
-                    showingMaintainSheet = true
-                }
-                .help("Query the wiki or lint it")
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button("Copy Unix Path", systemImage: "terminal") {
-                    showingPathPopover = true
-                }
-                .keyboardShortcut("u", modifiers: [.command, .shift])
-                .help("Copy the Terminal path of the read-only filesystem view")
-                .popover(isPresented: $showingPathPopover, arrowEdge: .bottom) {
-                    VerificationPopover(fileProvider: fileProvider)
-                }
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Menu {
-                    Button("New Page", systemImage: "doc.badge.plus") {
-                        store.newPageInNewTab()
-                    }
-                    .keyboardShortcut("n", modifiers: .command)
-                    Button("Query", systemImage: "bubble.left.and.text.bubble.right") {
-                        store.openTab(.query)
-                    }
-                    Button("Instructions", systemImage: "sparkles") {
-                        store.openTab(.systemPrompt)
-                    }
-                    Button("Activity", systemImage: "clock.arrow.circlepath") {
-                        store.openTab(.changeLog)
-                    }
-                } label: {
-                    Label("New Tab", systemImage: "plus.square.on.square")
-                }
-                .help("Open a new tab")
-            }
+            primaryToolbarItems()
         }
-        .sheet(isPresented: $showingMaintainSheet) {
-            OperationsView(
-                launcher: agentLauncher,
-                store: store,
-                manager: manager,
-                fileProvider: fileProvider
-            )
+        .sheet(isPresented: $showingAddFromURL) { AddFromURLSheet(store: store) }
+        .sheet(isPresented: $showingImportMarkdown) { ImportMarkdownSheet(store: store) }
+        .sheet(isPresented: $showingAddFromZotero) {
+            AddFromZoteroSheet(store: store, containerDirectory: zoteroContainerDirectory)
         }
         // List(selection:) writes store.selection directly; observe it here so
         // the model flushes the outgoing page and loads the incoming one
         // (§3.5). The view, not the binding, is the right place for this.
         .onChange(of: store.selection) { _, newValue in
             store.handleSelectionChange(to: newValue)
-            if newValue == .query {
-                isTranscriptExpanded = false
-            }
         }
         .onChange(of: agentLauncher.isRunning) { _, isRunning in
-            if isRunning && !isQuerySelected {
+            if isRunning {
                 isTranscriptExpanded = true
             }
         }
         // Auto-open the transcript the moment an ingest starts — even during the
         // PDF-conversion phase, before the agent process spawns — so the
-        // conversion box is visible.
+        // conversion box is visible. The extraction phase now lives in
+        // `extractingFileIDs` (distinct from the agent-phase `ingestingFileIDs`),
+        // so observe both: a pure extraction should also surface the transcript.
         .onChange(of: agentLauncher.ingestingFileIDs) { _, newValue in
-            if !newValue.isEmpty && !isQuerySelected {
-                isTranscriptExpanded = true
-            }
+            if !newValue.isEmpty { isTranscriptExpanded = true }
+        }
+        .onChange(of: agentLauncher.extractingFileIDs) { _, newValue in
+            if !newValue.isEmpty { isTranscriptExpanded = true }
         }
     }
 
-    /// The agent is doing work — running, or in the local PDF-conversion phase of
-    /// an ingest (which precedes the agent process). Drives the toolbar glow.
+    /// The agent is doing work — running, or in a local pdf2md extraction / an
+    /// agent-phase ingest (the extraction phase precedes the agent process).
+    /// Drives the toolbar glow. Both phase flags are included so the glow stays
+    /// on during a pure extraction; the cross-file Ingest greyout is NOT driven
+    /// here (that is `isAnyFileIngesting` = `!ingestingFileIDs.isEmpty` only).
     private var agentBusy: Bool {
-        agentLauncher.isRunning || !agentLauncher.ingestingFileIDs.isEmpty
+        agentLauncher.isRunning
+            || !agentLauncher.ingestingFileIDs.isEmpty
+            || !agentLauncher.extractingFileIDs.isEmpty
+    }
+
+    private var zoteroContainerDirectory: URL {
+        (try? DatabaseLocation.appGroupContainerDirectory()) ?? FileManager.default.temporaryDirectory
+    }
+
+    private var isZoteroConfigured: Bool {
+        ZoteroConfig.load(from: zoteroContainerDirectory).isConfigured
+            && KeychainZoteroCredentialStore().apiKey() != nil
     }
 
     private var canShowTranscript: Bool {
-        !isQuerySelected
-            && (agentLauncher.isRunning
-                || !agentLauncher.ingestingFileIDs.isEmpty
-                || !agentLauncher.events.isEmpty
-                || agentLauncher.preflightError != nil
-                || !agentLauncher.stderr.isEmpty)
-    }
-
-    private var isQuerySelected: Bool {
-        store.selection == .query
+        agentLauncher.isRunning
+            || !agentLauncher.ingestingFileIDs.isEmpty
+            || !agentLauncher.extractingFileIDs.isEmpty
+            || !agentLauncher.events.isEmpty
+            || agentLauncher.preflightError != nil
+            || !agentLauncher.stderr.isEmpty
     }
 
     private func toggleTranscript() {
@@ -245,6 +211,63 @@ struct ContentView: View {
             Button("") { store.selectTab(id: tab.id) }
                 .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: .command)
                 .opacity(0).allowsHitTesting(false)
+        }
+    }
+
+    // MARK: - Toolbar
+
+    @ToolbarContentBuilder
+    private func primaryToolbarItems() -> some ToolbarContent {
+        ingestToolbarItems()
+        navigationToolbarItems()
+        transcriptToolbarItem()
+    }
+
+    @ToolbarContentBuilder
+    private func ingestToolbarItems() -> some ToolbarContent {
+        if isZoteroConfigured {
+            ToolbarItem(placement: .primaryAction) {
+                Button("Add from Zotero…", systemImage: "books.vertical") {
+                    showingAddFromZotero = true
+                }.help("Browse your Zotero library and ingest a PDF or Markdown attachment")
+            }
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Button("Add from URL…", systemImage: "link.badge.plus") {
+                showingAddFromURL = true
+            }.help("Fetch a web page or PDF by URL and ingest it into this wiki")
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Button("Import Markdown Folder…", systemImage: "doc.badge.plus") {
+                showingImportMarkdown = true
+            }.help("Import all .md files from a folder as source material")
+        }
+    }
+
+    @ToolbarContentBuilder
+    private func navigationToolbarItems() -> some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            Button("New Page", systemImage: "plus") { store.newPageInNewTab() }
+                .keyboardShortcut("n", modifiers: .command)
+                .help("Create a new page")
+        }
+    }
+
+    @ToolbarContentBuilder
+    private func transcriptToolbarItem() -> some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            Button("Toggle Transcript", systemImage: "sidebar.trailing") {
+                toggleTranscript()
+            }
+            // The panel can ALWAYS be closed when it's open — `canShowTranscript`
+            // only gates OPENING it when closed. Without this, a panel that
+            // auto-expanded during a now-finished extract (no run, no events, no
+            // stderr left) leaves `canShowTranscript == false`, disabling the only
+            // close affordance and stranding the sidebar open.
+            .disabled(!isTranscriptExpanded && !canShowTranscript)
+            .foregroundStyle(agentBusy ? Color.orange : Color.primary)
+            .symbolEffect(.pulse, isActive: agentBusy)
+            .help(isTranscriptExpanded ? "Hide agent transcript" : "Show agent transcript")
         }
     }
 }

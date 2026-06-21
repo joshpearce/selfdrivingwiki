@@ -13,17 +13,15 @@ struct SidebarView: View {
     let fileProvider: FileProviderSpike
     /// Callback when the user clicks "Ingest N Files" in batch mode.
     var onBatchIngest: (([PageID]) -> Void)? = nil
-    /// Files currently being ingested — shows a spinner on those rows.
+    /// Files whose agent run is in flight (agent phase) — shows the
+    /// "Ingesting…" spinner on those rows.
     var ingestingFileIDs: Set<PageID> = []
+    /// Files whose pdf2md conversion is in flight (extraction phase) — shows the
+    /// "Extracting…" spinner on those rows. Independent of `ingestingFileIDs`.
+    var extractingFileIDs: Set<PageID> = []
 
     @State private var renameTarget: WikiPageSummary?
     @State private var renameText: String = ""
-    /// Drives the "Add from URL…" sheet (fetch a URL → ingested file).
-    @State private var showingAddFromURL = false
-    /// Drives the "Add from Zotero…" sheet (browse the library → ingested file).
-    @State private var showingAddFromZotero = false
-    /// Drives the "Import Markdown Folder…" sheet (recursively import .md files).
-    @State private var showingImportMarkdown = false
     /// Whether the "Pages" section is expanded. Pure UI state — not persisted.
     @State private var isPagesExpanded = true
     @State private var isToolsExpanded = true
@@ -52,12 +50,6 @@ struct SidebarView: View {
             }
             .navigationSplitViewColumnWidth(min: PageEditorMetrics.sidebarMinWidth,
                                              ideal: PageEditorMetrics.sidebarIdealWidth)
-            .toolbar { sidebarToolbar() }
-            .sheet(isPresented: $showingAddFromURL) { AddFromURLSheet(store: store) }
-            .sheet(isPresented: $showingAddFromZotero) {
-                AddFromZoteroSheet(store: store, containerDirectory: zoteroContainerDirectory)
-            }
-            .sheet(isPresented: $showingImportMarkdown) { ImportMarkdownSheet(store: store) }
             .alert("Rename Page", isPresented: renamePresented) {
                 TextField("Title", text: $renameText)
                 Button("Cancel", role: .cancel) { renameTarget = nil }
@@ -69,28 +61,16 @@ struct SidebarView: View {
         List(selection: $listSelection) {
             WikiSwitcher(manager: manager).listRowSeparator(.hidden)
             toolsSection()
-            systemSection()
             pagesSection()
             if !store.ingestedFiles.isEmpty {
                 FilesSectionView(store: store, fileProvider: fileProvider,
-                    ingestingFileIDs: ingestingFileIDs, onBatchIngest: onBatchIngest,
+                    ingestingFileIDs: ingestingFileIDs,
+                    extractingFileIDs: extractingFileIDs,
+                    onBatchIngest: onBatchIngest,
                     listSelection: $listSelection, activeSection: $activeSection)
             }
+            systemSection()
         }
-    }
-
-    /// The App Group container — same fallback `WikiFSApp.init()` uses, resolved
-    /// independently here rather than threaded through `ContentView`/`RootView`
-    /// (existing precedent: `WikiResolver` does the same in `WikiCtlCore`).
-    private var zoteroContainerDirectory: URL {
-        (try? DatabaseLocation.appGroupContainerDirectory()) ?? FileManager.default.temporaryDirectory
-    }
-
-    /// Whether Settings has a library ID AND an API key — both required before
-    /// the picker can do anything useful.
-    private var isZoteroConfigured: Bool {
-        ZoteroConfig.load(from: zoteroContainerDirectory).isConfigured
-            && KeychainZoteroCredentialStore().apiKey() != nil
     }
 
     /// The active wiki's display name for the window title (falls back to the app
@@ -114,6 +94,18 @@ struct SidebarView: View {
     private func systemSection() -> some View {
         Section {
             if isSystemExpanded {
+                SidebarModeRow(title: "Lint", subtitle: "Health-check the wiki",
+                    systemImage: "checkmark.shield")
+                    .tag(WikiSelection.lint)
+                    .help("Check the wiki for stale content, broken links, and inconsistencies")
+                Button {
+                    _ = store.recomputeMissingEmbeddings()
+                } label: {
+                    SidebarModeRow(title: "Reindex Search", subtitle: "Rebuild semantic embeddings",
+                        systemImage: "arrow.triangle.2.circlepath")
+                }
+                .buttonStyle(.plain)
+                .help("Recompute embeddings for all missing pages for semantic search")
                 SidebarModeRow(title: "Activity", subtitle: "Operation log",
                     systemImage: "clock.arrow.circlepath")
                     .tag(WikiSelection.changeLog)
@@ -218,35 +210,6 @@ struct SidebarView: View {
             listSelection = Set(store.ingestedFiles.map { WikiSelection.ingestedFile($0.id) })
         case .pages:
             listSelection = Set(store.summaries.map { WikiSelection.page($0.id) })
-        }
-    }
-
-    @ToolbarContentBuilder
-    private func sidebarToolbar() -> some ToolbarContent {
-        if isZoteroConfigured {
-            ToolbarItem {
-                Button("Add from Zotero…", systemImage: "books.vertical") {
-                    showingAddFromZotero = true
-                }.help("Browse your Zotero library and ingest a PDF or Markdown attachment")
-            }
-        }
-        ToolbarItem {
-            Button("Add from URL…", systemImage: "link.badge.plus") {
-                showingAddFromURL = true
-            }.help("Fetch a web page or PDF by URL and ingest it into this wiki")
-        }
-        ToolbarItem {
-            Button("Import Markdown Folder…", systemImage: "doc.badge.plus") {
-                showingImportMarkdown = true
-            }.help("Import all .md files from a folder as source material")
-        }
-        ToolbarItem {
-            Button("New Page", systemImage: "plus") { store.newPage() }
-        }
-        ToolbarItem {
-            Button("Reindex Search", systemImage: "arrow.triangle.2.circlepath") {
-                _ = store.recomputeMissingEmbeddings()
-            }.help("Recompute embeddings for all missing pages for semantic search")
         }
     }
 

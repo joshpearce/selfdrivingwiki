@@ -2,6 +2,253 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-20 — Standalone Extract Markdown fixes + Stop-button overhaul
+
+The standalone "Extract Markdown" button in `IngestedFileDetailView` had two bugs
+from its divergence with the ingest-path extraction in `AgentOperationRunner`:
+
+1. **Sidebar PDF Conversion box never appeared.** `runExtraction()` used its own local
+   `@State` variables (`isExtracting`, `extractionLog`), but
+   `AgentTranscriptSidebar.showsConversion` checked `launcher.isExtracting` and
+   `launcher.extractionLog` — which were never set by the standalone path. The sidebar
+   auto-expanded (because `extractingFileIDs` was inserted), but showed only an empty
+   Agent Activity section.
+2. **Stop button was a no-op.** The extraction `Task` was created inline
+   (`Task { await runExtraction() }`) and never stored. `AgentLauncher.stop()` cancelled
+   only `ingestTask` and `process`, both `nil` during standalone extraction.
+
+Additional improvements found during the fix pass:
+
+4. **Ingest button stayed active during extraction.** The "Ingest into Wiki" button was
+   not disabled while the same file was mid-extraction, risking a double operation.
+5. **Ingest-path always re-extracted PDFs.** `runMultiIngest` ran pdf2md for every PDF
+   even when markdown had already been extracted via the standalone button — wasting a
+   heavy conversion and taking the extraction slot unnecessarily.
+6. **Single Stop button conflated two independent operations.** The sidebar had one
+   shared Stop button that called `launcher.stop()` (kill everything). Two distinct
+   buttons now match the two independent locks: Stop Conversion (extraction slot only)
+   and Stop Agent (spawn slot only).
+
+**Changes:**
+
+- **`IngestedFileDetailView.runExtraction()`** now sets `launcher.isExtracting`,
+  `launcher.extractionPID`, and `launcher.extractionLog` (with `onProgress`/`onStart`
+  callbacks to `PdfExtractionService.convert`) so the sidebar's PDF Conversion box
+  renders with live progress. The local `@State extractionLog` is removed — all log
+  output goes to `launcher.extractionLog`; the detail view header keeps only a minimal
+  "Extracting…" spinner driven by `isThisFileExtracting`.
+- **`extractTask`** added to `AgentLauncher` (mirrors `ingestTask` for the standalone
+  path). Stored/cleared by the Extract button action; cancelled by `stopExtraction()`.
+  `PdfExtractionService.run()`'s `onCancel` handler terminates the pdf2md subprocess.
+- **Ingest button disabled during extraction** — `|| isThisFileExtracting` added to the
+  `.disabled()` guard in `IngestedFileDetailView`.
+- **`AgentOperationRunner.runMultiIngest`** now checks `store.processedMarkdownHead(for:
+  file)` before running pdf2md. If markdown was already extracted (via the standalone
+  button or a prior ingest), it reuses the existing content and skips extraction
+  entirely — no extraction slot taken, no subprocess spawned.
+- **`AgentLauncher` split into three stop methods:**
+  - `stopExtraction()` — cancels `extractTask` (or `ingestTask` during ingest-path
+    extraction phase), clears `isExtracting` / `extractionPID` / `extractingFileIDs` /
+    `extractionLog`. Never touches the agent process.
+  - `stopAgent()` — cancels `ingestTask`, terminates the claude process, calls
+    `finish()`. Never touches extraction flags.
+  - `stop()` — convenience that calls both (preserved for surfaces that still want a
+    kill-everything affordance).
+- **`AgentTranscriptSidebar`** header simplified to just the "Transcript" label. The
+  PDF Conversion box now has its own red Stop button (visible when
+  `launcher.isExtracting`). The Agent Activity section has its own red Stop button
+  (visible when `launcher.isRunning` or `!launcher.ingestingFileIDs.isEmpty`).
+
+**Tests.** `swift test` — 596 tests, 50 suites, 0 failures (+10 from the prior
+baseline of 586):
+- `AgentExtractionLockTests` (+7: `stopCancelsExtractTask`,
+  `stopWithNoExtractTaskIsNoOp`, `isExtractingFlagExposedByLauncher`,
+  `stopExtractionCancelsExtractTask`, `stopExtractionClearsExtractionFlags`,
+  `stopExtractionWithNoTaskIsSafe`, `stopAgentDoesNotClearExtractionFlags`)
+- `ProcessedMarkdownTests` (+3: `pdfHeadNilBeforeExtraction`,
+  `seedPdfMarkdownCreatesHead`, `seedPdfMarkdownDoubleSeedReturnsExisting`)
+
+## 2026-06-20 — Serialized claude spawn slot + separate extraction lock
+
+The shared `AgentLauncher` silently dropped a second run (`guard !isRunning`), and
+one `ingestingFileIDs` set fused the pdf2md extraction phase with the agent-
+ingestion phase — so a pure extraction mislabeled rows "Ingesting…" and greyed out
+other files' Ingest buttons even though the slot was free. Two independent locks now
+replace the single `isRunning` guard; the phase flags are split. See
+`plans/extraction-vs-ingestion-lock.md` (Option B).
+
+- **Spawn slot (`AgentLauncher`):** all `claude -p` spawns (ingest/query/lint)
+  serialize through a FIFO, cancellation-aware slot (`awaitSpawnSlot` /
+  `releaseSpawnSlot`); the silent-drop guard is gone, so a queued run waits and
+  runs after the current one. `run`/`startInteractiveQuery` are `async`; preflight
+  and staging run after the slot is acquired so every early-return releases it.
+- **Separate extraction lock:** pdf2md conversions serialize on a *distinct*
+  `awaitExtractionSlot`/`releaseExtractionSlot` (same shape, independent state) that
+  never touches the spawn slot or the edit lock — so a query runs during an
+  extraction and editing stays unlocked while a PDF converts. Both the ingest-path
+  conversion and the standalone `Extract Markdown` action take it.
+- **Phase-flag split:** `ingestingFileIDs` (set only at agent-spawn commit via a new
+  `run` param, cleared in `finish()`) is now distinct from `extractingFileIDs`
+  (pdf2md phase). `runMultiIngest` no longer pre-sets `ingestingFileIDs`. Rows show
+  "Extracting…" vs "Ingesting…" (pure `rowStatus` predicate); the cross-file Ingest
+  greyout (`isAnyFileIngesting = !ingestingFileIDs.isEmpty`) is now extraction-free.
+- **Query page:** mounts the orange `AgentRunBanner` and scopes its debug cluster to
+  active query runs only (`showsQueryDebugControls`); resets to the conversation
+  when idle. The toolbar glow / transcript auto-open now key off `extractingFileIDs`
+  so a pure extraction still surfaces the transcript.
+
+**Cancellation.** A file is marked ingested only by the agent's `wikictl log append
+--kind ingest`; an ingest interrupted before the agent spawns marks nothing
+(`hasBeenIngested` stays `false`), and extracted markdown seeded before the agent
+run survives a later cancel.
+
+**Verified.** `swift build` clean (no warnings). `swift test` — 586 tests, 50
+suites, 0 failures (+10 `AgentExtractionLockTests`, +6 `AgentSpawnSlotTests`).
+
+## 2026-06-20 — Grey out Ingest/Extract buttons during any file ingest
+
+The "Ingest into Wiki" and "Extract Markdown" buttons in
+`IngestedFileDetailView` were only disabled when the agent was running or
+the same file was being ingested. During the PDF-conversion phase (before
+agent launch), both buttons were still active — a second ingest could be
+started concurrently.
+
+- **`IngestedFileDetailView`:** added `isAnyFileIngesting` parameter
+  (true when any ingest is in flight, not just this file's). Both buttons
+  now include it in their `.disabled()` guards.
+- **`WikiDetailView`:** plumbed `isAnyFileIngesting` from
+  `!launcher.ingestingFileIDs.isEmpty`.
+
+**Verified.** `swift build` clean. PR #28.
+
+## 2026-06-20 — Fix transcript sidebar disappearing on tab switch
+
+The `AgentTranscriptSidebar` had Query-specific suppression that forced
+`isTranscriptExpanded = false` when entering the Query tab and guarded
+visibility/auto-open/toggle-enable with `!isQuerySelected`. This caused the
+sidebar to collapse on entry to Query and stay collapsed when switching back to
+other tabs — the state didn't recover.
+
+- **`ContentView`:** removed `!isQuerySelected` from the sidebar visibility
+  guard, the auto-open-on-agent-start guard, the auto-open-on-ingest guard,
+  and `canShowTranscript`. Removed the forced `isTranscriptExpanded = false`
+  in `onChange(of: store.selection)`. Removed the now-unused
+  `isQuerySelected` computed property. (-16/+8)
+
+The sidebar now persists across all tab switches and works consistently
+regardless of which detail view is active.
+
+**Verified.** `swift build` clean; `swift test` — 570 tests, 48 suites, 0
+failures. PR #27.
+
+## 2026-06-20 — Fix Zotero "View in Zotero" link + PageDetailView markdown alignment
+
+Fixed two bugs found in live use after the Zotero source-link feature landed:
+
+**"View in Zotero" link 404s.** The detail view constructed
+`https://www.zotero.org/users/<numericLibraryID>/items/<itemKey>/`, but
+Zotero's web library uses username slugs in URLs, not numeric IDs — the
+numeric ID only works on the API host (`api.zotero.org`). Confirmed this is
+the same root cause as [Zutilo #268](https://github.com/wshanks/Zutilo/issues/268).
+Switched to the `zotero://select/library/items/<key>` URI scheme, which
+opens items directly in the Zotero desktop app and needs no library ID at all.
+
+- **`IngestedFileDetailView`:** removed the `zoteroLibraryID` parameter
+  (no longer needed); `zoteroItemURL` now builds
+  `zotero://select/library/items/<key>` instead of the broken web URL.
+- **`WikiDetailView` / `ContentView`:** removed the `zoteroLibraryID`
+  plumbing — the property was only threaded for this one link.
+
+**Markdown preview appears centered.** `MarkdownPreview`'s VStack inside its
+`ScrollView` was centered by default (SwiftUI `ScrollView` centers its
+content). Added `.frame(maxWidth: .infinity, alignment: .leading)` after
+the VStack's padding so content left-aligns within the scroll area.
+
+**Page editor inset mismatch.** The `PageDetailView` editor used
+`contentInset - 5` (7pt) while the header used 12pt; the markdown preview
+was passed `contentInset: false` (0pt). Changed both to 12pt so the text
+lines up with the header title and Edit button.
+
+**Verified.** `swift build` clean; `swift test` — 570 tests, 48 suites, 0
+failures.
+
+## 2026-06-20 — Zotero source link on ingested files
+
+Implemented `plans/zotero-source-link.md`. Files ingested from Zotero now carry
+their parent library item's key + title as provenance, so the **Ingested File
+Detail View** shows a "Zotero" tag with the item title and a "View in Zotero"
+link back to the web library (`zotero.org/users/<id>/items/<key>/`).
+
+- **Schema v8→v9:** two nullable TEXT columns (`zotero_item_key`,
+  `zotero_item_title`) on `ingested_files`. NULL for drag-drop / URL /
+  folder-import (no provenance).
+- **`IngestedFileSummary`** grew `zoteroItemKey` / `zoteroItemTitle` (defaulted
+  `nil` so existing callers compile).
+- **Write seam:** `WikiStore.ingestFile` gained defaulted
+  `zoteroItemKey`/`zoteroItemTitle` params; only `ingestFromZotero` passes
+  non-nil. `WikiStoreModel.ingestFromZotero(_:parentItem:zoteroDir:)` now takes
+  the parent `ZoteroItem`; `AddFromZoteroSheet.addSelected()` passes
+  `selectedItem`.
+- **Read path:** `listIngestedFiles`, `getIngestedFile`, and the
+  `ingestedSummary` decoder extended for the two new columns (NULL→nil). The
+  `listAllIngestedFilesOrderedByID` projection (files.jsonl / File Provider
+  mount) is intentionally left unchanged for v1 — provenance is UI-only.
+- **Detail view:** a small `zoteroOriginRow` in `headerSection` (Zotero tag +
+  title + borderless "View in Zotero" button via `NSWorkspace.shared.open`).
+  Library ID plumbed `ContentView → WikiDetailView → IngestedFileDetailView`
+  from `ZoteroConfig`. Non-Zotero files show nothing (clean header).
+
+Open questions resolved with the plan's recommended defaults: **web URL** link
+target (universal, no Zotero install needed), **no** neutral "Imported" tag
+for non-Zotero files, **UI-only** for v1 (no files.jsonl change).
+
+3 new tests (NULL round-trip, Zotero-seam write, Zotero-seam threads key+title)
++ updated the 4 `ingestFromZotero` call sites in
+`WikiStoreModelZoteroIngestTests`; bumped the 5 `user_version`-to-head
+assertions across the suite to 9. Full `swift test` — 570 tests, 48 suites, 0
+failures. `make check` compiles.
+
+## 2026-06-20 — PR2: File browsing/editing + git-lite versioned processed markdown
+
+Implemented `plans/file-versioned-editing.md`. Added a `file_markdown_versions`
+append-only version chain (v7→v8 migration) so ingested files have editable processed
+markdown while source bytes stay immutable. The version store (`FileMarkdownVersion`
+model, 5 `WikiStore` methods, lazy seeding for native md/txt) is testable against a
+temp DB with table-absent fallbacks for pre-v8 read connections.
+
+Reworked `IngestedFileDetailView` to render markdown (MarkdownPreview) and PDFs
+(PDFKit NSViewRepresentable) inline, with a tabbed Markdown⇄PDF view when extraction
+output exists. Inline Save/Cancel buttons in the view (not toolbar) for all three
+editor surfaces: ingested files, pages, and system prompt. Removed the toolbar Edit
+buttons from `PageDetailView` and `SystemPromptDetailView` in favor of inline ones.
+`PageReaderView` now shows the last-updated date and a Copy Path button (only when
+the File Provider mount is available).
+
+Moved all sidebar toolbar buttons (ingest, Zotero, New Page, Reindex Search) to the
+main toolbar. Removed `OperationsView`; Query and Lint are now sidebar items (added
+`.lint` to `WikiSelection` with a new `LintView`). Moved the System section below
+Files. The empty-state view now shows Add-from-URL/Import/Zotero buttons
+horizontally.
+
+`AgentOperationRunner` now persists `PdfExtractionService` output as v1 (double-seed
+guard); standalone "Extract Markdown" action in the detail view.
+
+15 new `ProcessedMarkdownTests` (migration, version chain, revert, cascade, source
+immutability, seeding, fallback). Full `swift test` — 567 tests, 48 suites, 0
+failures.
+
+## 2026-06-20 — `wikictl file` command family
+
+Implemented `plans/wikictl-file-reads.md`. Added `wikictl file list|cat|export` so the
+agent reads raw ingested files from SQLite instead of the File Provider mount during
+Query. `cat` writes raw bytes via `FileHandle` (binary-safe); `--json` list output is
+byte-identical to `indexes/files.jsonl`. Name resolution rejects ambiguity by listing
+the matching ids. The Query and QueryConversation prompts now route raw-file reads
+through `wikictl file` instead of `$WIKI_ROOT/files/...`.
+
+19 new parser + execution tests in `WikiCtlCommandTests`; updated
+`OperationCommandTests` prompt assertions. Full `swift test` — 552 tests, 0 failures.
+
 ## 2026-06-19 — Tab system rebuild: ID-based active tab + right-click context menu
 
 Rebuilt the multi-tab system from scratch (plan:

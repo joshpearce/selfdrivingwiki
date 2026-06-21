@@ -1,17 +1,21 @@
 # Self Driving Wiki
 
-**What this is.** A native macOS SwiftUI wiki backed by SQLite, mirrored
-read-only onto the filesystem by a **File Provider extension** so the same
-content can be browsed by Unix tools and agents (`find`, `cat`, `grep`) under
-`~/Library/CloudStorage/Self Driving Wiki-<wiki name>`. You edit in the app; the
-mount reflects every change. It also ingests dropped files (verbatim bytes under
-`files/`) and projects a singleton agent system prompt as `CLAUDE.md` +
-`AGENTS.md` at the root. Runs locally only — free, local dev signing; no Developer
-ID / notarization.
+**What this is.** A native macOS SwiftUI wiki backed by SQLite. An optional
+**File Provider extension** mirrors content read-only onto the filesystem under
+`~/Library/CloudStorage/Self Driving Wiki-<wiki name>` so Unix tools and agents
+can browse it (`find`, `cat`, `grep`). When the extension is not available (e.g.
+unsigned dev builds outside `/Applications`), the app reads everything from
+SQLite directly. You edit in the app; the mount reflects every change when
+enabled. It ingests dropped files, stores them as verbatim BLOBs, and projects a
+singleton agent system prompt as `CLAUDE.md` + `AGENTS.md` at the root. Runs
+locally only — free, local dev signing; no Developer ID / notarization.
 
-**Core goal (non-negotiable).** This is a proof-of-concept of the macOS **File
-Provider API**. The extension is essential, not optional — do **not** replace it
-with a plain-folder export, even though that would dodge the signing requirement.
+**The File Provider extension is now optional.** The in-app experience —
+displaying pages, browsing ingested files, and running agent operations — reads
+from SQLite via `wikictl` (pages, raw files) and staged scratch directories
+(sources, wiki-state). The extension remains in the tree as an opt-in mount for
+Terminal and Finder browsing when signing is available, but it is no longer
+load-bearing for the app to function.
 
 **Where to find things.**
 
@@ -41,9 +45,12 @@ with a plain-folder export, even though that would dodge the signing requirement
 | [`plans/file-provider.md`](plans/file-provider.md) | File Provider extension build + the 5 hard-won gotchas (entry-point recursion, entitlements⊆profile, user-enable toggle, /Applications, keychain). Proven by the 2026-06-15 spike. Read before Phase 2. |
 | [`plans/signing.md`](plans/signing.md) | The Apple cert / App Group / File Provider provisioning checklist (manual portal). Do this before Phase 2. Source of truth for *the Apple incantations*. |
 | [`plans/zotero-integration.md`](plans/zotero-integration.md) | browse a Zotero library from inside the app, ingest PDF/Markdown attachments through the existing ingest pipeline. |
+| [`plans/zotero-source-link.md`](plans/zotero-source-link.md) | Stamp Zotero item key+title on ingested files (v8→v9 migration) and show a "View in Zotero" link in the ingested-file detail view. |
 | [`plans/pdf-extraction.md`](plans/pdf-extraction.md) | Add docling + granite-docling pipeline. A `pdf2md` CLI converts PDFs to markdown at ingest time; extracted markdown stored as a sibling `ingested_files` row, projected on the mount. Agent prefers `.md` siblings, falls back to `Read` on the original. |
 | [`plans/semantic-search.md`](plans/semantic-search.md) | Semantic (meaning-based) search over pages using sqlite-vec + Apple NLEmbedding. Embedding at save time, cosine-similarity ranking inside SQLite, search bar in the sidebar, `wikictl search` for the agent. v7 migration. |
 | [`plans/markdown-folder-import.md`](plans/markdown-folder-import.md) | Import an entire folder of Markdown files (Obsidian vault, LogSeq graph, or any `.md` directory) as source material. Recursive walk, .md filter, filename dedup; lands files in `ingested_files` for the agent to curate via Ingest. |
+| [`plans/extraction-vs-ingestion-lock.md`](plans/extraction-vs-ingestion-lock.md) | **Current direction:** treat markdown *extraction* (pdf2md) and agent *ingestion* (the `claude -p` run) as two phases. Extraction must never lock queries, edits, or another file's ingest. Split the overloaded `ingestingFileIDs` into `extractingFileIDs` (pdf2md phase) + `ingestingFileIDs` (agent-spawn phase), plus an optional separate extraction lock to serialize pdf2md without touching the spawn slot. |
+| [`plans/wikictl-file-reads.md`](plans/wikictl-file-reads.md) | A `wikictl file` command family (`list` / `cat` / `export`) so the agent reads raw ingested files from SQLite instead of the File Provider mount during Query. First concrete step of the provider-decouple effort; rewrites the Query prompt off `$WIKI_ROOT/files/...`. |
 | [`plans/tab-context-menu-rebuild.md`](plans/tab-context-menu-rebuild.md) | Multi-tab editor space — design of record. `activeTabID: UUID?` source of truth (no index arithmetic), one-intent-per-method tab ops, tab reuse, native SwiftUI `.contextMenu` (Close / Close Others / Close Tabs After / Close All), opacity-fade close button, responsive shrink-to-fit strip with overflow menu. 43 `EditorTabTests` + 7 `TabBarLayoutTests`. |
 | [`SWIFTUI-RULES.md`](SWIFTUI-RULES.md) | Hard-won SwiftUI/macOS rules. Apply when writing or reviewing any view. |
 | [`CLAUDE.md`](CLAUDE.md) | Working agreement (docs, skills to use, PR rules). |
@@ -96,6 +103,16 @@ handoff). 341 tests green; clean signed bundle (app + appex + `wikictl`).**
   `pdf2md` as a subprocess with continuous pipe draining; `PdfExtractionView` shows
   readiness, download progress, and live conversion log during ingest. 22 Swift tests
   + 67 Python tests. (PR #11.)
+- **Serialized claude spawn slot** — the single shared `AgentLauncher` now serializes
+  all `claude -p` spawns (ingest / query / lint) through a FIFO, cancellation-aware
+  spawn slot (`awaitSpawnSlot` / `releaseSpawnSlot`). Two claude runs never overlap;
+  a `pdf2md` extraction may overlap a claude query run (it does NOT take the slot).
+  The old silent-drop `guard !isRunning` is gone — a query started during an ingest's
+  extraction now runs, and the ingest agent waits for the slot and runs afterward. The
+  edit lock (`store.isAgentRunning`) is unchanged in meaning: locked only while a
+  claude process runs, unlocked during extraction. The Query page mounts the orange
+  `AgentRunBanner` and scopes its debug cluster to active query runs only. 6 new
+  `AgentSpawnSlotTests`.
 
 **Phase summary (newest first; see `PROGRESS.md` for each gate's evidence):**
 - **Phase D — the schema** ✅ real maintainer `CLAUDE.md` schema (layout,
