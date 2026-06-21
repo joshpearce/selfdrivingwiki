@@ -841,16 +841,18 @@ public final class SQLiteWikiStore: WikiStore {
 
     /// Add a source's verbatim bytes + metadata as a NEW `sources` row.
     /// `ext` is the lowercased extension (no dot, `""` if none); `mime_type` is
-    /// the best-effort UTI→MIME for that extension. `byte_size` mirrors
-    /// `length(content)`. The id is a fresh ULID (sortable == ingest order).
-    /// Throws if `data` exceeds `ingestByteCap`. The optional Zotero provenance
-    /// is written to `zotero_item_key`/`zotero_item_title` (NULL when nil).
+    /// content-authoritative: explicit `mimeType` param → magic-byte sniff → ext
+    /// fallback. `byte_size` mirrors `length(content)`. The id is a fresh ULID
+    /// (sortable == ingest order). Throws if `data` exceeds `ingestByteCap`.
+    /// The optional Zotero provenance is written to `zotero_item_key`/
+    /// `zotero_item_title` (NULL when nil).
     @discardableResult
     public func addSource(
         filename: String,
         data: Data,
         zoteroItemKey: String? = nil,
-        zoteroItemTitle: String? = nil
+        zoteroItemTitle: String? = nil,
+        mimeType: String? = nil
     ) throws -> SourceSummary {
         guard data.count <= Self.ingestByteCap else {
             throw WikiStoreError.unexpected(
@@ -858,7 +860,9 @@ public final class SQLiteWikiStore: WikiStore {
         }
         let id = PageID(rawValue: ULID.generate())
         let ext = (filename as NSString).pathExtension.lowercased()
-        let mime = ext.isEmpty ? nil : UTType(filenameExtension: ext)?.preferredMIMEType
+        let mime = mimeType
+            ?? ContentSniff.mimeType(of: data)
+            ?? (ext.isEmpty ? nil : UTType(filenameExtension: ext)?.preferredMIMEType)
         let now = Date()
 
         let stmt = try statement("""

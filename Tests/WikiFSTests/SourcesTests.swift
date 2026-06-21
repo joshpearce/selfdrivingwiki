@@ -47,6 +47,45 @@ struct SourcesTests {
         #expect(noExt.mimeType == nil)
     }
 
+    // MARK: - MIME from content sniff (content-type-over-extension plan)
+
+    @Test func mimeFromContentSniffPDFBytesWithTextExtension() throws {
+        // PDF bytes with a .txt filename → mime_type is "application/pdf" from the
+        // magic-byte sniff, not "text/plain" from the extension.
+        let store = try tempStore()
+        let source = try store.addSource(filename: "renamed.txt", data: Data("%PDF-1.4\n%binary".utf8))
+        #expect(source.mimeType == "application/pdf")
+    }
+
+    @Test func mimeFromContentSniffPNGBytesNoExtension() throws {
+        // Real PNG magic bytes with no extension → sniffed as image/png.
+        let store = try tempStore()
+        let pngMagic = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        let source = try store.addSource(filename: "noext", data: pngMagic)
+        #expect(source.ext == "")
+        #expect(source.mimeType == "image/png")
+    }
+
+    @Test func mimeExplicitParamOverridesSniff() throws {
+        // Explicit mimeType parameter wins over both byte sniff and ext fallback.
+        let store = try tempStore()
+        let source = try store.addSource(
+            filename: "data.pdf", data: Data("%PDF-1.4\ncontent".utf8),
+            zoteroItemKey: nil, zoteroItemTitle: nil,
+            mimeType: "application/custom")
+        #expect(source.mimeType == "application/custom")
+    }
+
+    @Test func mimeFallsBackToExtWhenSniffInconclusive() throws {
+        // Bytes that don't match any magic number fall back to ext-derived MIME.
+        let store = try tempStore()
+        let source = try store.addSource(filename: "notes.md", data: Data("# Hello".utf8))
+        // UTType(filenameExtension: "md")?.preferredMIMEType returns a markdown
+        // variant; accept either.
+        #expect(source.mimeType?.hasPrefix("text/") == true)
+        #expect(source.mimeType?.contains("markdown") == true)
+    }
+
     // MARK: - Zotero provenance (v8 → v9)
 
     /// A drag-drop / URL ingest passes no Zotero provenance, so the two new

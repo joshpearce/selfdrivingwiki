@@ -275,11 +275,17 @@ public struct ZoteroAttachment: Identifiable, Hashable, Sendable {
     /// elsewhere or nowhere on disk.
     public var hasLocalCopy: Bool { linkMode == "imported_file" || linkMode == "imported_url" }
 
-    /// Whether this attachment's filename ends in `.pdf` or `.md`
-    /// (case-insensitive) — the two attachment types Self Driving Wiki can
-    /// ingest. Extracted as a pure value-type property so the picker UI stays
-    /// thin and the decision is trivially unit-testable.
+    /// Whether this attachment can be ingested by Self Driving Wiki. Prefers the
+    /// Zotero API `contentType` (e.g. `application/pdf`) when present; falls back
+    /// to the filename extension. Extracted as a pure value-type property so the
+    /// picker UI stays thin and the decision is trivially unit-testable.
     public var isIngestable: Bool {
+        // Prefer the API-declared content type when available.
+        if let ct = contentType?.lowercased() {
+            if ct == "application/pdf" { return true }
+            if ct.hasPrefix("text/") { return true }  // text/markdown, text/plain, etc.
+        }
+        // Filename-based heuristic as fallback.
         guard let filename = filename?.lowercased() else { return false }
         return filename.hasSuffix(".pdf") || filename.hasSuffix(".md")
     }

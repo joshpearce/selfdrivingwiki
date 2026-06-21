@@ -308,29 +308,44 @@ struct ZoteroClientTests {
             filename: "Notes.MD", contentType: "text/markdown", title: nil).isIngestable)
     }
 
-    @Test func isIngestableRejectsOtherExtensions() {
+    @Test func isIngestableRejectsUnsupportedContentType() {
+        // image/png and application/zip are not ingestable (not PDF, not text/*).
         #expect(!ZoteroAttachment(
             key: "K1", parentItem: nil, linkMode: "imported_file",
-            filename: "data.txt", contentType: "text/plain", title: nil).isIngestable)
-        #expect(!ZoteroAttachment(
-            key: "K2", parentItem: nil, linkMode: "imported_file",
             filename: "image.png", contentType: "image/png", title: nil).isIngestable)
         #expect(!ZoteroAttachment(
-            key: "K3", parentItem: nil, linkMode: "imported_file",
+            key: "K2", parentItem: nil, linkMode: "imported_file",
             filename: "archive.zip", contentType: "application/zip", title: nil).isIngestable)
     }
 
-    @Test func isIngestableRejectsNilFilename() {
-        #expect(!ZoteroAttachment(
+    @Test func isIngestableAcceptsTextContentType() {
+        // text/plain is ingestable via the contentType-first path (plan:
+        // content-type-over-extension).
+        #expect(ZoteroAttachment(
             key: "K1", parentItem: nil, linkMode: "imported_file",
-            filename: nil, contentType: "application/pdf", title: nil).isIngestable)
+            filename: "data.txt", contentType: "text/plain", title: nil).isIngestable)
     }
 
-    @Test func isIngestableChecksExtensionNotContentType() {
-        // A file with a .txt extension is not ingestable even if its
-        // contentType says application/pdf.
+    @Test func isIngestableRejectsNilFilenameWithNoContentType() {
+        // nil filename with no contentType → not ingestable.
         #expect(!ZoteroAttachment(
             key: "K1", parentItem: nil, linkMode: "imported_file",
+            filename: nil, contentType: nil, title: nil).isIngestable)
+    }
+
+    @Test func isIngestablePrefersContentTypeOverExtension() {
+        // contentType=application/pdf wins over .txt extension (MIME-first
+        // per content-type-over-extension plan).
+        #expect(ZoteroAttachment(
+            key: "K1", parentItem: nil, linkMode: "imported_file",
             filename: "readme.txt", contentType: "application/pdf", title: nil).isIngestable)
+    }
+
+    @Test func isIngestableContentTypePDFWithNilFilename() {
+        // contentType=application/pdf is ingestable even with nil filename
+        // (MIME-first path doesn't need the filename).
+        #expect(ZoteroAttachment(
+            key: "K1", parentItem: nil, linkMode: "imported_file",
+            filename: nil, contentType: "application/pdf", title: nil).isIngestable)
     }
 }
