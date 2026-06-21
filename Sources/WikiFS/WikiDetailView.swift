@@ -68,6 +68,7 @@ struct WikiDetailView: View {
                     hasBeenIngested: store.hasIngestedFile(file),
                     isIngesting: launcher.ingestingFileIDs.contains(file.id),
                     isRunning: launcher.isRunning,
+                    isAnyFileIngesting: !launcher.ingestingFileIDs.isEmpty,
                     runIngest: runIngest,
                     store: store
                 )

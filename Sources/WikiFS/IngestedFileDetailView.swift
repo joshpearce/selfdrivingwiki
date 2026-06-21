@@ -10,6 +10,10 @@ struct IngestedFileDetailView: View {
     let hasBeenIngested: Bool
     let isIngesting: Bool
     let isRunning: Bool
+    /// `true` when any file (not necessarily this one) is mid-ingest — covers the
+    /// PDF-conversion phase before the agent process starts, when `isRunning` is
+    /// still `false`.
+    let isAnyFileIngesting: Bool
     let runIngest: (PageID) -> Void
     @Bindable var store: WikiStoreModel
 
@@ -143,13 +147,13 @@ struct IngestedFileDetailView: View {
                         runIngest(file.id)
                     }
                         .keyboardShortcut(.return, modifiers: .command)
-                        .disabled(isRunning || isIngesting)
+                        .disabled(isRunning || isIngesting || isAnyFileIngesting)
                     if isPDF, !hasMarkdown {
                         Button(isExtracting ? "Extracting…" : "Extract Markdown",
                                systemImage: "doc.plaintext") {
                             Task { await runExtraction() }
                         }
-                        .disabled(isExtracting || isRunning)
+                        .disabled(isExtracting || isRunning || isAnyFileIngesting)
                     }
                     if isMarkdownEditable {
                         Button("Edit", systemImage: "pencil") {
