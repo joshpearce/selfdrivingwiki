@@ -601,7 +601,7 @@ public final class WikiStoreModel {
     /// doesn't abort the batch. `onPageDidChange?()` fires ONCE at the end so the
     /// daemon re-enumerates the `files/` tree exactly once for the whole batch.
     public func ingest(fileURLs: [URL]) async {
-        var didIngestAny = false
+        var lastIngestedFileID: PageID?
         for url in fileURLs {
             // Skip directories — only flat files are ingested.
             let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
@@ -621,15 +621,18 @@ public final class WikiStoreModel {
                 continue
             }
             do {
-                _ = try store.ingestFile(
+                let summary = try store.ingestFile(
                     filename: filename, data: data, zoteroItemKey: nil, zoteroItemTitle: nil)
-                didIngestAny = true
+                lastIngestedFileID = summary.id
             } catch {
                 print("WikiStoreModel.ingest store failed for \(filename): \(error)")
             }
         }
         reloadIngestedFiles()
-        if didIngestAny { onPageDidChange?() }
+        if let fileID = lastIngestedFileID {
+            openTab(.ingestedFile(fileID))
+            onPageDidChange?()
+        }
     }
 
     /// Ingest a resource by URL: fetch it, convert HTML→Markdown (or store a PDF /
@@ -661,9 +664,10 @@ public final class WikiStoreModel {
         // Pure dispatch decides the filename + bytes; we store directly on the main
         // actor (no @Sendable store closure crossing the actor boundary).
         let plan = URLIngestService.plan(for: response)
-        _ = try store.ingestFile(
+        let summary = try store.ingestFile(
             filename: plan.filename, data: plan.data, zoteroItemKey: nil, zoteroItemTitle: nil)
         reloadIngestedFiles()
+        openTab(.ingestedFile(summary.id))
         onPageDidChange?()
         return URLIngestService.IngestOutcome(
             filename: plan.filename, byteSize: plan.data.count, kind: plan.kind)
@@ -705,10 +709,11 @@ public final class WikiStoreModel {
                 try Data(contentsOf: path)
             }.value
             do {
-                _ = try store.ingestFile(
+                let summary = try store.ingestFile(
                     filename: path.lastPathComponent, data: data,
                     zoteroItemKey: parentItem.key, zoteroItemTitle: parentItem.title)
                 reloadIngestedFiles()
+                openTab(.ingestedFile(summary.id))
                 onPageDidChange?()
             } catch {
                 print("WikiStoreModel.ingestFromZotero failed: \(error)")
@@ -739,10 +744,12 @@ public final class WikiStoreModel {
         var imported = 0
         var errorMessages: [String] = []
 
+        var firstIngestedFileID: PageID?
         for file in result.files {
             do {
-                _ = try store.ingestFile(
+                let summary = try store.ingestFile(
                     filename: file.filename, data: file.data, zoteroItemKey: nil, zoteroItemTitle: nil)
+                if firstIngestedFileID == nil { firstIngestedFileID = summary.id }
                 imported += 1
             } catch {
                 errorMessages.append("\(file.filename): \(error.localizedDescription)")
@@ -754,6 +761,9 @@ public final class WikiStoreModel {
         }
 
         reloadIngestedFiles()
+        if let fileID = firstIngestedFileID {
+            openTab(.ingestedFile(fileID))
+        }
         onPageDidChange?()
         return (imported: imported, errors: errorMessages)
     }
