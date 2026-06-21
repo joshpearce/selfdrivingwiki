@@ -471,6 +471,34 @@ struct WikiCtlCommandTests {
 
     // MARK: - edit-markdown dispatch
 
+    @Test func editMarkdownAppendsUserVersion() throws {
+        let store = try tempStore()
+        let ingested = try store.addSource(filename: "doc.md", data: Data("hello".utf8))
+        // Append first version (extraction).
+        _ = try store.appendProcessedMarkdown(
+            sourceID: ingested.id, content: "original", origin: "extraction", note: nil)
+        // Small delay ensures the next ULID is strictly later.
+        usleep(2000)
+        // Run edit-markdown which appends a "user" version.
+        let result = try SourceCommand.run(
+            .editMarkdown(.id(ingested.id), content: "edited"), in: store, cwd: "/tmp")
+        #expect(result.didCommit)
+
+        // Verify the chain has 2 versions.
+        let history = try store.processedMarkdownHistory(sourceID: ingested.id)
+        #expect(history.count == 2)
+
+        // Head (first, newest) is the user-edited version.
+        #expect(history[0].content == "edited")
+        #expect(history[0].origin == "user")
+        #expect(history[0].parentID == history[1].id)
+
+        // Second is the extraction baseline.
+        #expect(history[1].content == "original")
+        #expect(history[1].origin == "extraction")
+        #expect(history[1].parentID == nil)
+    }
+
     @Test func editMarkdownCommitsAndAppends() throws {
         let store = try tempStore()
         let ingested = try store.addSource(filename: "doc.md", data: Data("hello".utf8))
@@ -486,12 +514,17 @@ struct WikiCtlCommandTests {
         #expect(head?.origin == "user")
     }
 
-    @Test func editMarkdownFailsWhenNoMarkdownExists() throws {
+    @Test func editMarkdownFailsWhenNoChainExists() throws {
         let store = try tempStore()
         let ingested = try store.addSource(filename: "doc.pdf", data: Data("%PDF".utf8))
-        #expect(throws: SourceCommand.Failure.self) {
+        do {
             try SourceCommand.run(
                 .editMarkdown(.id(ingested.id), content: "edited"), in: store, cwd: "/tmp")
+            Issue.record("expected SourceCommand.Failure")
+        } catch let error as SourceCommand.Failure {
+            #expect(error.description == "no processed markdown for this source")
+        } catch {
+            Issue.record("unexpected error: \(error)")
         }
     }
 
