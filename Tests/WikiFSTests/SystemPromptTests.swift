@@ -58,8 +58,8 @@ struct SystemPromptTests {
         let body = SystemPrompt.defaultBody
         #expect(body.contains("pages/by-title/"))
         #expect(body.contains("pages/by-id/"))
-        #expect(body.contains("files/by-name/"))
-        #expect(body.contains("files/by-id/"))
+        #expect(body.contains("sources/by-name/"))
+        #expect(body.contains("sources/by-id/"))
         #expect(body.contains("index.md"))
         #expect(body.contains("log.md"))
         #expect(body.contains("WIKI-STRUCTURE.md"))

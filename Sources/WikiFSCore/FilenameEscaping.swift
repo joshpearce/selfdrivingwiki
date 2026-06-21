@@ -63,7 +63,7 @@ public enum FilenameEscaping {
 
     // MARK: - Ingested files (Phase 5)
 
-    /// The canonical `files/by-id` filename: `<full-ulid>.<ext>`, preserving the
+    /// The canonical `sources/by-id` filename: `<full-ulid>.<ext>`, preserving the
     /// dropped file's original extension. The dot is omitted when `ext` is empty
     /// (extension-less drops): `01ABC…` → `01ABC…` (no trailing dot).
     public static func byIDSourceFilename(sourceID: String, ext: String) -> String {

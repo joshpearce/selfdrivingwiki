@@ -267,8 +267,8 @@ enum AgentOperationRunner {
         )
     }
 
-    private static func ingestSourcePath(for file: SourceSummary) -> String {
-        let leaf = FilenameEscaping.byIDSourceFilename(sourceID: file.id.rawValue, ext: file.ext)
-        return "files/by-id/\(leaf)"
+    private static func ingestSourcePath(for source: SourceSummary) -> String {
+        let leaf = FilenameEscaping.byIDSourceFilename(sourceID: source.id.rawValue, ext: source.ext)
+        return "sources/by-id/\(leaf)"
     }
 }

@@ -153,7 +153,7 @@ public final class SQLiteWikiStore: WikiStore {
         // Step 1 → 2 (Phase 5): the `ingested_files` table holds verbatim dropped
         // files — raw bytes + metadata, a NEW object kind, NOT tied to a page
         // (so it does NOT reuse `attachments`, which has a `page_id` FK). Stored
-        // and served byte-for-byte; surfaced read-only under the `files/` tree.
+        // and served byte-for-byte; surfaced read-only under the `sources/` tree.
         if version < 2 {
             try exec("""
             CREATE TABLE ingested_files (

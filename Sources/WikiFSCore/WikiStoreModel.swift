@@ -599,7 +599,7 @@ public final class WikiStoreModel {
     /// (big files shouldn't stall the UI), then hop back to the main actor to
     /// store + reload. Per-file failures are logged and skipped so one bad drop
     /// doesn't abort the batch. `onPageDidChange?()` fires ONCE at the end so the
-    /// daemon re-enumerates the `files/` tree exactly once for the whole batch.
+    /// daemon re-enumerates the `sources/` tree exactly once for the whole batch.
     public func ingest(fileURLs: [URL]) async {
         var lastSourceID: PageID?
         for url in fileURLs {
@@ -639,7 +639,7 @@ public final class WikiStoreModel {
     /// text / binary verbatim), and land it as an ingested file — exactly like a
     /// drag-dropped file, so the existing "Ingest into wiki" `claude -p` operation
     /// can summarize it afterward. Lands through the SAME `store.ingestFile` path as
-    /// drag-ingest, so it appears under Files + `files/by-{id,name}` immediately and
+    /// drag-ingest, so it appears under Sources + `sources/by-{id,name}` immediately and
     /// is pickable in Operations → Ingest. Returns the outcome on success; throws a
     /// user-readable `URLIngestService.IngestError` on a bad URL, non-2xx, empty
     /// body, or store failure (the caller surfaces it in the sheet). The store write
@@ -769,7 +769,7 @@ public final class WikiStoreModel {
     }
 
     /// Remove an ingested file from the list and the store, then signal so the
-    /// `files/` tree drops it.
+    /// `sources/` tree drops it.
     public func deleteSource(_ id: PageID) {
         do {
             try store.deleteSource(id: id)

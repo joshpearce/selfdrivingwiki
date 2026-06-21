@@ -1,17 +1,17 @@
 import Foundation
 import WikiFSCore
 
-/// The `wikictl file …` subcommands, executed against an already-opened
+/// The `wikictl source …` subcommands, executed against an already-opened
 /// `WikiStore`. Split from process concerns (arg parsing, stdin, the Darwin
 /// post, opening the DB) so the whole command surface is unit-testable against
 /// a temp DB.
 ///
-/// Unlike `PageCommand` whose output is always a `String`, `FileCommand` can
-/// emit raw bytes (`file cat` for binary/PDF sources). Its `Result` carries a
+/// Unlike `PageCommand` whose output is always a `String`, `SourceCommand` can
+/// emit raw bytes (`source cat` for binary/PDF sources). Its `Result` carries a
 /// `Payload` enum: `.text(String)` (for `list`, `export`'s printed path) or
 /// `.bytes(Data)` (for `cat`). `main` writes `.text` via `print` and `.bytes`
 /// via `FileHandle.standardOutput.write`.
-public enum FileCommand {
+public enum SourceCommand {
 
     /// What a command produced. Reads never commit; `didCommit` is always false.
     public struct Result: Equatable {
