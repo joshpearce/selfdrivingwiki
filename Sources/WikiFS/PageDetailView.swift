@@ -11,8 +11,8 @@ struct PageDetailView: View {
     @Bindable var manager: WikiManager
     let fileProvider: FileProviderSpike
     @State private var isEditing = false
-    @AppStorage("editor.zoom") private var editorZoom: Double = 1.0
-    @AppStorage("reader.zoom") private var readerZoom: Double = 1.0
+    @AppStorage("editor.zoom") private var editorZoom = Double(ZoomScale.defaultScale)
+    @AppStorage("reader.zoom") private var readerZoom = Double(ZoomScale.defaultScale)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {

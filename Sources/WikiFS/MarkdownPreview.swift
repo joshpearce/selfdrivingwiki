@@ -23,7 +23,7 @@ struct MarkdownPreview: View {
     @Bindable var store: WikiStoreModel
     let markdown: String
     var contentInset: Bool = true
-    @AppStorage("reader.zoom") private var readerZoom: Double = 1.0
+    @AppStorage("reader.zoom") private var readerZoom = Double(ZoomScale.defaultScale)
 
     var body: some View {
         let renderedBody = renderedMarkdown

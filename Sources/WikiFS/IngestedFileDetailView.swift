@@ -27,8 +27,8 @@ struct IngestedFileDetailView: View {
     let launcher: AgentLauncher
     @Bindable var store: WikiStoreModel
 
-    @AppStorage("editor.zoom") private var editorZoom: Double = 1.0
-    @AppStorage("reader.zoom") private var readerZoom: Double = 1.0
+    @AppStorage("editor.zoom") private var editorZoom = Double(ZoomScale.defaultScale)
+    @AppStorage("reader.zoom") private var readerZoom = Double(ZoomScale.defaultScale)
     @State private var headVersion: FileMarkdownVersion?
     @State private var isEditing = false
     @State private var editBuffer = ""

@@ -17,7 +17,8 @@ and both monospace editors (page + ingested-file), keyboard-only, persisted glob
 - **Editor scale** — `PageDetailView` and `IngestedFileDetailView` read
   `@AppStorage("editor.zoom")` and size the monospace `TextEditor` via
   `.system(size: 13 * editorZoom, design: .monospaced)`. At `1.0` the size is
-  byte-identical to the previous `.body` default.
+  identical to the previous `.body` default at the standard text size (the fixed
+  13 pt no longer tracks Dynamic Type, a deliberate trade-off per the plan).
 - **`ZoomShortcuts` (WikiFS)** — `.zoomShortcuts(_:)` view modifier injects hidden,
   zero-size `Button`s for ⌘+, ⌘=, ⌘−, and ⌘0. Wired per-mode in both detail views:
   reader-mode buttons mutate `reader.zoom`, editor-mode buttons mutate `editor.zoom`.

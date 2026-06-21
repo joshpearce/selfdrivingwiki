@@ -21,6 +21,15 @@ struct ZoomScaleTests {
         #expect(ZoomScale.defaultScale == 1.0)
     }
 
+    /// The plan locks these values as decisions; pin the literals so a silent
+    /// regression (e.g. maximum → 5.0) fails here rather than passing every
+    /// other test that references the constants symbolically.
+    @Test func specConstantsMatchLockedValues() {
+        #expect(ZoomScale.minimum == 0.5)
+        #expect(ZoomScale.maximum == 3.0)
+        #expect(ZoomScale.stepFactor == 1.1)
+    }
+
     // MARK: - Clamping
 
     @Test func clampedBelowMinimumReturnsMinimum() {
