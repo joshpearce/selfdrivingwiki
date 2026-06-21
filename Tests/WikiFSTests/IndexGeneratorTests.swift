@@ -131,12 +131,33 @@ struct IndexGeneratorTests {
         #expect(first?["path"] as? String == "sources/by-id/F1.pdf")
         #expect(first?["size"] as? Int == 1024)
         #expect(first?["mime"] as? String == "application/pdf")
+        #expect(first?["has_markdown"] as? Bool == false)
 
         // Extension-less + nil mime: path omits the dot; mime is JSON null.
         let second = try JSONSerialization.jsonObject(with: Data(lines[1].utf8)) as? [String: Any]
         #expect(second?["path"] as? String == "sources/by-id/F2")
         #expect(second?["size"] as? Int == 0)
         #expect(second?["mime"] is NSNull)
+        #expect(second?["has_markdown"] as? Bool == false)
+    }
+
+    @Test func sourcesJSONLIncludesHasMarkdown() throws {
+        let files = [
+            IndexGenerators.SourceIndexRow(id: "F1", filename: "a.pdf", ext: "pdf",
+                                    mime: "application/pdf", byteSize: 100,
+                                    hasMarkdown: true),
+            IndexGenerators.SourceIndexRow(id: "F2", filename: "b.txt", ext: "txt",
+                                    mime: "text/plain", byteSize: 50,
+                                    hasMarkdown: false),
+        ]
+        let data = IndexGenerators.sourcesJSONL(sources: files)
+        let lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
+
+        let first = try JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as? [String: Any]
+        #expect(first?["has_markdown"] as? Bool == true)
+
+        let second = try JSONSerialization.jsonObject(with: Data(lines[1].utf8)) as? [String: Any]
+        #expect(second?["has_markdown"] as? Bool == false)
     }
 
     @Test func sourcesJSONLIsByteStable() {

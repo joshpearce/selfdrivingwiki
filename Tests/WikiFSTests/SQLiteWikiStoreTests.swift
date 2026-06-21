@@ -152,48 +152,49 @@ struct SQLiteWikiStoreTests {
         // v5 format:
         //   "<pCount>:<pSum>:<fCount>:<fSum>:<spVersion>:<logCount>:<idxVersion>".
         // A fresh DB seeds the system_prompt AND wiki_index singletons at version
-        // 1 and has no log rows → trailing ":1:0:1".
-        #expect(try store.changeToken() == "0:0:0:0:1:0:1")
+        // 1, has no log rows, and no source_markdown_versions →
+        // trailing ":1:0:1:0".
+        #expect(try store.changeToken() == "0:0:0:0:1:0:1:0")
 
         // Create bumps page COUNT and SUM (version starts at 1).
         let a = try store.createPage(title: "Alpha")
-        #expect(try store.changeToken() == "1:1:0:0:1:0:1")
+        #expect(try store.changeToken() == "1:1:0:0:1:0:1:0")
 
         // Update bumps that row's version by 1 → SUM increments.
         try store.updatePage(id: a.id, title: "Alpha", body: "edited")
-        #expect(try store.changeToken() == "1:2:0:0:1:0:1")
+        #expect(try store.changeToken() == "1:2:0:0:1:0:1:0")
 
         // A SECOND page that is NOT the global-max version must STILL advance the
         // token — the MAX-vs-SUM correctness lock. b starts at version 1, yet
         // count:sum changes (2 pages, sum 2+1=3).
         let b = try store.createPage(title: "Beta")
-        #expect(try store.changeToken() == "2:3:0:0:1:0:1")
+        #expect(try store.changeToken() == "2:3:0:0:1:0:1:0")
 
         try store.updatePage(id: b.id, title: "Beta", body: "beta edit")
-        #expect(try store.changeToken() == "2:4:0:0:1:0:1")
+        #expect(try store.changeToken() == "2:4:0:0:1:0:1:0")
 
         // Delete changes page COUNT and SUM.
         try store.deletePage(id: b.id)
-        #expect(try store.changeToken() == "1:2:0:0:1:0:1")
+        #expect(try store.changeToken() == "1:2:0:0:1:0:1:0")
     }
 
     /// The token MUST advance on ingest AND on delete (else the `files/` tree
     /// would never refresh — the orchestrator-critical fold-in).
     @Test func changeTokenAdvancesOnIngestAndDelete() throws {
         let store = try SQLiteWikiStore(databaseURL: tempDatabaseURL())
-        #expect(try store.changeToken() == "0:0:0:0:1:0:1")
+        #expect(try store.changeToken() == "0:0:0:0:1:0:1:0")
 
         // Ingest bumps the file COUNT and SUM (version 1).
         let f = try store.addSource(filename: "a.txt", data: Data("hi".utf8))
-        #expect(try store.changeToken() == "0:0:1:1:1:0:1")
+        #expect(try store.changeToken() == "0:0:1:1:1:0:1:0")
 
         // A second file.
         _ = try store.addSource(filename: "b.txt", data: Data("yo".utf8))
-        #expect(try store.changeToken() == "0:0:2:2:1:0:1")
+        #expect(try store.changeToken() == "0:0:2:2:1:0:1:0")
 
         // Delete the first → file COUNT and SUM drop.
         try store.deleteSource(id: f.id)
-        #expect(try store.changeToken() == "0:0:1:1:1:0:1")
+        #expect(try store.changeToken() == "0:0:1:1:1:0:1:0")
     }
 
     // MARK: - ULID ordering

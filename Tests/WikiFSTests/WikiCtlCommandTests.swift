@@ -332,6 +332,7 @@ struct WikiCtlCommandTests {
             #expect(obj?["size"] != nil)
             // mime key always present (null for unknown types)
             #expect(obj?.keys.contains("mime") ?? false)
+            #expect(obj?.keys.contains("has_markdown") ?? false)
         }
     }
 
