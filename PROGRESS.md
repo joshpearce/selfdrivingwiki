@@ -2,7 +2,53 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
-## 2026-06-21 — Content-type over extension (implemented)
+## 2026-06-21 — Phase C: source markdown in the File Provider
+
+Implemented `plans/phase-c-source-markdown-projection.md`. Sources with a processed-markdown
+chain (PDFs that have been extracted) now project a `.md` sibling alongside the verbatim
+file in both `sources/by-id/` and `sources/by-name/`. The change bridge now sees chain
+edits, so extraction / edit / revert refresh the mount without a relaunch.
+
+**Changes:**
+
+- **Change bridge (`SQLiteWikiStore`):** `sourceMarkdownVersionCount()` helper added
+  (resilient `COUNT(*)` over `source_markdown_versions`, mirrors `logRowCount`).
+  `changeToken()` gains an 8th component (`smvCount`), so any append to the versions
+  table advances the File Provider sync anchor. Previously `appendProcessedMarkdown`
+  and `revertProcessedMarkdown` left the token unchanged.
+
+- **Projection (`Projection`):** `sourceMarkdownByID` / `sourceMarkdownByName` identity
+  prefixes with constructors and a `sourceMarkdownULID` parser (parity with verbatim
+  source identity). `sourceMarkdownNode(for:source:head:)` versions the sibling off the
+  HEAD row (`contentVersion = Data(head.id.rawValue.utf8)`), naturally distinct from
+  the verbatim node's version. `sourceNodes(byName:)` fetches all HEADs in one query
+  (`processedMarkdownHeadsBySource()`) and emits a sibling for every source with a
+  chain — no N+1. `contents(for:)` serves the HEAD content for markdown-sibling ids.
+
+- **One-query HEAD read (`SQLiteWikiStore`):** `processedMarkdownHeadsBySource()` joins
+  `source_markdown_versions` against `MAX(id) GROUP BY file_id` in a single query.
+  Returns `[String: SourceMarkdownVersion]` keyed by source id; empty dict on failure.
+
+- **Lazy-seed removal (`WikiStoreModel`):** `processedMarkdownHead(for:)` no longer
+  seeds a v1 chain from a markdown source's verbatim bytes. Only PDFs get chains now
+  (seeded by extraction via `seedPdfMarkdown`). This removes the collision risk where a
+  markdown source had both a verbatim `<id>.md` and a seeded sibling with the same name.
+
+- **CLI (`wikictl source edit-markdown`):** New subcommand appends a `"user"` version
+  to an existing chain. Accepts `--content` or `--file`. Refuses with a clear error
+  when no extraction baseline exists (exit 1). `signalChange()` so the mount refreshes.
+
+- **Index (`IndexGenerators`):** `SourceIndexRow` gains `has_markdown: Bool`.
+  `sourcesJSONL` emits it in fixed key order (`id, name, path, size, mime, has_markdown`).
+  True only for sources with at least one row in `source_markdown_versions`.
+
+- **Agent prompt (`SystemPrompt`):** One line documenting the `.md` sibling convention.
+
+**Tests.** `swift test` — 683 tests, 54 suites, 0 failures.
+
+On branch `feature/phase-c-source-markdown-projection`.
+
+## 2026-06-21 — Content-type over extension
 
 Implemented `plans/content-type-over-extension.md` — made `mime_type` content-authoritative
 rather than extension-derived. This closes the circularity bug where a PDF renamed `.txt`
@@ -28,40 +74,6 @@ was mis-typed and skipped extraction.
 **Tests.** `swift test` — 653 tests, 53 suites, 0 failures.
 
 On branch `feature/content-type-over-extension`.
-
-## 2026-06-21 — Phase C review + content-type + Phase C plans
-
-Reviewed Phase C ("Source Markdown in the File Provider") of `plans/sources-redesign.md`
-against the post-Phase-B tree. Two load-bearing assumptions in the parent design are false
-in the code: (1) the change bridge can't see processed-markdown edits — `changeToken()`
-(`SQLiteWikiStore.swift:564`) folds `COUNT`/`SUM(version)` over `sources` but not
-`source_markdown_versions`, and `appendProcessedMarkdown`/`revertProcessedMarkdown` don't
-bump `sources.version`, so extraction/edit/revert don't move the sync anchor and the
-projected `.md` sibling never refreshes; (2) markdown sources *do* get chains today via the
-lazy-seed in `WikiStoreModel.processedMarkdownHead(for:)` (`:865-877`), which contradicts
-the intended model (only PDFs have chains) and would project a colliding `<id>.md` sibling.
-Design intent confirmed: the chain is a git-lite history of PDF→markdown conversions
-(revert shipped, compare future); only HEAD is projected; the agent sees the latest only.
-
-Also surfaced the root extension-check bug: `addSource` (`SQLiteWikiStore.swift:861`)
-derives `mime_type` from the filename extension, making every downstream "trust MIME" check
-circular (a PDF named `.txt` is mis-typed and skips extraction). `URLIngestService` already
-content-sniffs but the result is discarded and re-derived from ext.
-
-Wrote three plans (all indexed in `PLAN.md`):
-
-- **`plans/content-type-over-extension.md`** — cross-cutting fix making `mime_type`
-  content-authoritative: extract a `ContentSniff` helper, `addSource` sniffs bytes,
-  MIME-first `WikiFSItem.contentType`, Zotero filter, and a grep guard. Standalone; Phase C
-  depends on it.
-- **`plans/phase-c-source-markdown-projection.md`** — Phase C re-grounded. Folds
-  `source_markdown_versions` into `changeToken()` + versions the sibling off the HEAD row;
-  removes the markdown lazy-seed; projects the `.md` sibling in by-id and by-name with
-  proper identity prefixes; one-query HEAD read to avoid N+1; `wikictl source edit-markdown`
-  (appends a `user` version, requires an existing extraction baseline). Defers all
-  MIME-authority work to the content-type plan (no duplicated edits between the two).
-
-No code changed — planning only, on branch `feature/source-wikilinks`.
 
 ## 2026-06-21 — Phase B: `[[source:display-name]]` wikilinks
 
