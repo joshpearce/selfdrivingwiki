@@ -4,10 +4,11 @@ Newest first. To get up to speed: read `PLAN.md` then this file.
 
 ## 2026-06-21 — Phase C: source markdown in the File Provider
 
-Implemented `plans/phase-c-source-markdown-projection.md`. Sources with a processed-markdown
-chain (PDFs that have been extracted) now project a `.md` sibling alongside the verbatim
-file in both `sources/by-id/` and `sources/by-name/`. The change bridge now sees chain
-edits, so extraction / edit / revert refresh the mount without a relaunch.
+Implemented `plans/phase-c-source-markdown-projection.md`. PDFs with extraction output now
+project a `.md` sibling alongside the verbatim file in both `sources/by-id/` and
+`sources/by-name/`. The change bridge now sees chain edits, so extraction / edit / revert
+refresh the mount without a relaunch. Every source gets a chain: markdown-native sources
+self-seed v1 from verbatim bytes (origin `"source"`), PDFs seed from extraction.
 
 **Changes:**
 
@@ -22,17 +23,19 @@ edits, so extraction / edit / revert refresh the mount without a relaunch.
   source identity). `sourceMarkdownNode(for:source:head:)` versions the sibling off the
   HEAD row (`contentVersion = Data(head.id.rawValue.utf8)`), naturally distinct from
   the verbatim node's version. `sourceNodes(byName:)` fetches all HEADs in one query
-  (`processedMarkdownHeadsBySource()`) and emits a sibling for every source with a
-  chain — no N+1. `contents(for:)` serves the HEAD content for markdown-sibling ids.
+  (`processedMarkdownHeadsBySource()`) and emits a sibling only for non-markdown-native
+  sources with a chain — markdown-native sources don't need a sibling (the verbatim
+  `<id>.md` is the content). `contents(for:)` serves HEAD content for sibling ids.
 
 - **One-query HEAD read (`SQLiteWikiStore`):** `processedMarkdownHeadsBySource()` joins
   `source_markdown_versions` against `MAX(id) GROUP BY file_id` in a single query.
   Returns `[String: SourceMarkdownVersion]` keyed by source id; empty dict on failure.
 
-- **Lazy-seed removal (`WikiStoreModel`):** `processedMarkdownHead(for:)` no longer
-  seeds a v1 chain from a markdown source's verbatim bytes. Only PDFs get chains now
-  (seeded by extraction via `seedPdfMarkdown`). This removes the collision risk where a
-  markdown source had both a verbatim `<id>.md` and a seeded sibling with the same name.
+- **Self-seed, MIME-keyed (`WikiStoreModel`):** `processedMarkdownHead(for:)` self-seeds
+  v1 from verbatim bytes for markdown-native sources (`mimeType.hasPrefix("text/")`,
+  not `file.ext`). Origin `"source"` (distinct from `"extraction"` and `"user"`).
+  Double-seed guard prevents duplicates. `headVersion` is never nil — every source has
+  a chain, and the original content is always available as the baseline.
 
 - **CLI (`wikictl source edit-markdown`):** New subcommand appends a `"user"` version
   to an existing chain. Accepts `--content` or `--file`. Refuses with a clear error
@@ -40,11 +43,12 @@ edits, so extraction / edit / revert refresh the mount without a relaunch.
 
 - **Index (`IndexGenerators`):** `SourceIndexRow` gains `has_markdown: Bool`.
   `sourcesJSONL` emits it in fixed key order (`id, name, path, size, mime, has_markdown`).
-  True only for sources with at least one row in `source_markdown_versions`.
+  True for every source (all have chains after self-seed). The agent uses `mime` to
+  distinguish PDFs (have a `.md` sibling) from markdown-native sources (verbatim is content).
 
 - **Agent prompt (`SystemPrompt`):** One line documenting the `.md` sibling convention.
 
-**Tests.** `swift test` — 683 tests, 54 suites, 0 failures.
+**Tests.** `swift test` — 684 tests, 54 suites, 0 failures.
 
 On branch `feature/phase-c-source-markdown-projection`.
 
