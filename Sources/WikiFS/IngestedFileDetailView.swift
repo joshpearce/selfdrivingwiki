@@ -28,6 +28,7 @@ struct IngestedFileDetailView: View {
     @Bindable var store: WikiStoreModel
 
     @AppStorage("editor.zoom") private var editorZoom: Double = 1.0
+    @AppStorage("reader.zoom") private var readerZoom: Double = 1.0
     @State private var headVersion: FileMarkdownVersion?
     @State private var isEditing = false
     @State private var editBuffer = ""
@@ -329,8 +330,10 @@ struct IngestedFileDetailView: View {
                 .scrollContentBackground(.hidden)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(PageEditorMetrics.contentInset)
+                .zoomShortcuts($editorZoom)
         } else if let head = headVersion {
             MarkdownPreview(store: store, markdown: head.content)
+                .zoomShortcuts($readerZoom)
         } else {
             ContentUnavailableView {
                 Label("No Processed Markdown", systemImage: "doc.plaintext")

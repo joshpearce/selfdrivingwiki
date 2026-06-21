@@ -12,6 +12,7 @@ struct PageDetailView: View {
     let fileProvider: FileProviderSpike
     @State private var isEditing = false
     @AppStorage("editor.zoom") private var editorZoom: Double = 1.0
+    @AppStorage("reader.zoom") private var readerZoom: Double = 1.0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -76,10 +77,12 @@ struct PageDetailView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .frame(minHeight: PageEditorMetrics.editorMinHeight)
                     .onChange(of: store.draftBody) { store.bodyChanged() }
+                    .zoomShortcuts($editorZoom)
             } else {
                 MarkdownPreview(store: store, markdown: readerMarkdown)
                     .frame(maxWidth: .infinity)
                     .frame(minHeight: PageEditorMetrics.previewMinHeight)
+                    .zoomShortcuts($readerZoom)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
