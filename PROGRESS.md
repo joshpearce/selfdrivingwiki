@@ -2,6 +2,31 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-21 — Reader and editor zoom (⌘+ / ⌘− / ⌘0)
+
+Implemented `plans/reader-editor-zoom.md`. Safari-style text zoom for the page reader
+and both monospace editors (page + ingested-file), keyboard-only, persisted globally.
+
+- **`ZoomScale` (WikiFSCore)** — pure value type: bounds `0.5...3.0`, ×/÷1.1 step,
+  default `1.0`, non-finite input coerced to default. 14 `ZoomScaleTests` covering
+  clamping at both bounds, round-trip symmetry, reset, and non-finite coercion.
+- **Reader scale** — `MarkdownPreview` reads `@AppStorage("reader.zoom")` and applies
+  `.textual.fontScale(readerZoom)` to `StructuredText`; headings and spacing scale
+  proportionally. Both the page reader and the ingested-file viewer scale from this
+  one edit.
+- **Editor scale** — `PageDetailView` and `IngestedFileDetailView` read
+  `@AppStorage("editor.zoom")` and size the monospace `TextEditor` via
+  `.system(size: 13 * editorZoom, design: .monospaced)`. At `1.0` the size is
+  byte-identical to the previous `.body` default.
+- **`ZoomShortcuts` (WikiFS)** — `.zoomShortcuts(_:)` view modifier injects hidden,
+  zero-size `Button`s for ⌘+, ⌘=, ⌘−, and ⌘0. Wired per-mode in both detail views:
+  reader-mode buttons mutate `reader.zoom`, editor-mode buttons mutate `editor.zoom`.
+  No menu items added.
+- **`@AppStorage` keys** — `reader.zoom` and `editor.zoom` are the first `AppStorage`
+  keys in the app; both default `1.0`, shared across views, persisted across launches.
+
+**Tests.** `swift test` — 610 tests, 0 failures (+14 `ZoomScaleTests`).
+
 ## 2026-06-20 — Standalone Extract Markdown fixes + Stop-button overhaul
 
 The standalone "Extract Markdown" button in `IngestedFileDetailView` had two bugs
