@@ -119,4 +119,102 @@ struct WikiLinkParserTests {
         #expect(kind == .page)
         #expect(target == "source:")
     }
+
+    // MARK: - splitFragment
+
+    @Test func splitFragmentNoHashReturnsNilFragment() {
+        let (base, fragment) = WikiLinkParser.splitFragment("Plain Title")
+        #expect(base == "Plain Title")
+        #expect(fragment == nil)
+    }
+
+    @Test func splitFragmentSingleHashSplitsCorrectly() {
+        let (base, fragment) = WikiLinkParser.splitFragment("Page#Section")
+        #expect(base == "Page")
+        #expect(fragment == "Section")
+    }
+
+    @Test func splitFragmentEmptyBaseIsSamePage() {
+        let (base, fragment) = WikiLinkParser.splitFragment("#Section")
+        #expect(base == "")
+        #expect(fragment == "Section")
+    }
+
+    @Test func splitFragmentPreservesInnerHash() {
+        // "C# is a language" stays intact — only the FIRST # splits.
+        let (base, fragment) = WikiLinkParser.splitFragment("source:X#C# is a language")
+        #expect(base == "source:X")
+        #expect(fragment == "C# is a language")
+    }
+
+    @Test func splitFragmentEmptyFragmentAfterHashReturnsNil() {
+        let (base, fragment) = WikiLinkParser.splitFragment("Page#")
+        #expect(base == "Page")
+        #expect(fragment == nil)
+    }
+
+    @Test func splitFragmentOnlyHashReturnsEmptyBaseAndNilFragment() {
+        let (base, fragment) = WikiLinkParser.splitFragment("#")
+        #expect(base == "")
+        #expect(fragment == nil)
+    }
+
+    // MARK: - parse with #fragment
+
+    @Test func parsesPageLinkWithHeadingFragment() {
+        let links = WikiLinkParser.parse("[[Overview#Methodology]]")
+        #expect(links.count == 1)
+        #expect(links[0].linkType == .page)
+        #expect(links[0].target == "Overview")
+        #expect(links[0].fragment == "Methodology")
+    }
+
+    @Test func parsesSourceLinkWithQuoteFragment() {
+        let links = WikiLinkParser.parse("[[source:Paper#the results show]]")
+        #expect(links.count == 1)
+        #expect(links[0].linkType == .source)
+        #expect(links[0].target == "Paper")
+        #expect(links[0].fragment == "the results show")
+    }
+
+    @Test func parsesSourceLinkWithQuotedFragmentPreservesQuotes() {
+        // Quotes are stripped at resolution time, not parse time.
+        let links = WikiLinkParser.parse("[[source:Smith#\"exact passage\"]]")
+        #expect(links[0].fragment == "\"exact passage\"")
+    }
+
+    @Test func parsesLinkWithAliasAndFragment() {
+        let links = WikiLinkParser.parse("[[Page#Section|my label]]")
+        #expect(links.count == 1)
+        #expect(links[0].target == "Page")
+        #expect(links[0].fragment == "Section")
+        #expect(links[0].linkText == "my label")
+    }
+
+    @Test func samePageAnchorIsSkippedInParse() {
+        // [[#Section]] has empty base — not a page/source link, skip in graph.
+        let links = WikiLinkParser.parse("[[#Section]]")
+        #expect(links.isEmpty)
+    }
+
+    @Test func samePageQuotedAnchorIsSkippedInParse() {
+        let links = WikiLinkParser.parse("[[#\"a quote\"]]")
+        #expect(links.isEmpty)
+    }
+
+    @Test func fragmentDoesNotAffectDedup() {
+        // [[Page#A]] and [[Page#B]] dedup to one entry (first alias wins).
+        let links = WikiLinkParser.parse("[[Page#A|first]] and [[Page#B|second]]")
+        #expect(links.count == 1)
+        #expect(links[0].linkText == "first")
+        #expect(links[0].fragment == "A")
+    }
+
+    @Test func sourcePrefixFragmentPreservesInnerHash() {
+        let links = WikiLinkParser.parse("[[source:Paper#C# is sharp]]")
+        #expect(links.count == 1)
+        #expect(links[0].linkType == .source)
+        #expect(links[0].target == "Paper")
+        #expect(links[0].fragment == "C# is sharp")
+    }
 }

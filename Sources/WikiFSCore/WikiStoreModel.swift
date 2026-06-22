@@ -202,10 +202,17 @@ public final class WikiStoreModel {
     /// before loading the target (§3.5). Returns whether navigation happened, so
     /// the click handler can report `.handled`. A no-op (`false`) if the title has
     /// no page.
+    ///
+    /// - Parameter anchor: optional `#fragment` from a `[[Page#Section]]` link;
+    ///   the destination `MarkdownPreview` scrolls to it after load.
     @discardableResult
-    public func selectPage(byTitle title: String) -> Bool {
+    public func selectPage(byTitle title: String, anchor: String? = nil) -> Bool {
         guard let id = (try? store.resolveTitleToID(title)) ?? nil else { return false }
         let target = WikiSelection.page(id)
+        // Stash the anchor so the destination MarkdownPreview can scroll to it
+        // after render. Tagged with the target selection so a stale anchor can't
+        // misfire on the wrong page.
+        pendingScrollAnchor = anchor.map { (selection: target, fragment: $0) }
         // Record history while `loadedSelection` still points at the outgoing
         // page (openTab/setActiveTab don't record history themselves).
         recordHistoryTransition(from: loadedSelection, to: target)
@@ -225,13 +232,33 @@ public final class WikiStoreModel {
     /// `[[source:display-name]]` link in the preview. Resolves display name → id
     /// (most-recently-updated on collision), records navigation history, and opens
     /// the source's tab. Returns whether navigation happened.
+    ///
+    /// - Parameter anchor: optional `#fragment` from a `[[source:Name#"quote"]]`
+    ///   link; the destination `MarkdownPreview` scrolls to it after load.
     @discardableResult
-    public func selectSource(byDisplayName displayName: String) -> Bool {
+    public func selectSource(byDisplayName displayName: String, anchor: String? = nil) -> Bool {
         guard let id = (try? store.resolveSourceByName(displayName)) ?? nil else { return false }
         let target = WikiSelection.source(id)
+        pendingScrollAnchor = anchor.map { (selection: target, fragment: $0) }
         recordHistoryTransition(from: loadedSelection, to: target)
         openTab(target)
         return true
+    }
+
+    /// Pending scroll anchor set by `selectPage`/`selectSource` and consumed by
+    /// `MarkdownPreview` after render. Tagged with the target `WikiSelection` so
+    /// a stale anchor can't misfire on the wrong page.
+    public private(set) var pendingScrollAnchor: (selection: WikiSelection, fragment: String)?
+
+    /// Atomically consume the pending scroll anchor if `selection` matches.
+    /// Returns the fragment to resolve and clears the anchor. Returns nil if the
+    /// selection doesn't match or there is no pending anchor.
+    public func consumePendingScrollAnchor(for selection: WikiSelection?) -> String? {
+        guard let pending = pendingScrollAnchor,
+              let sel = selection,
+              pending.selection == sel else { return nil }
+        pendingScrollAnchor = nil
+        return pending.fragment
     }
 
     // MARK: - Tab operations

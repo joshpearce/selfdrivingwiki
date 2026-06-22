@@ -30,14 +30,17 @@ public enum WikiLinkParser {
         public enum LinkType: String, Equatable, Sendable { case page, source }
 
         public let linkType: LinkType
-        public let target: String       // prefix-stripped, whitespace-collapsed
+        public let target: String       // prefix-stripped, whitespace-collapsed (BASE only)
+        public let fragment: String?    // everything after the first "#", verbatim; nil if none
         public let linkText: String     // alias verbatim (never prefix-stripped)
 
         /// `linkType` defaults to `.page` so every existing `ParsedLink(target:linkText:)`
         /// call site compiles unchanged and equality holds (both sides default to `.page`).
-        public init(linkType: LinkType = .page, target: String, linkText: String) {
+        public init(linkType: LinkType = .page, target: String,
+                    fragment: String? = nil, linkText: String) {
             self.linkType = linkType
             self.target = target
+            self.fragment = fragment
             self.linkText = linkText
         }
     }
@@ -70,6 +73,24 @@ public enum WikiLinkParser {
         return false
     }
 
+    /// Split a raw target on the **first** `#` only. Everything before → `base`
+    /// (may be empty for `[[#Section]]`), everything after → `fragment` (kept
+    /// verbatim; inner `#` characters — e.g. `"C# is a language"` — are preserved
+    /// for substring matching). Returns `(base: "", fragment: "Section")` for a
+    /// same-page anchor `[[#Section]]`. Returns `(base: rawTarget, nil)` when there
+    /// is no `#`.
+    public static func splitFragment(_ rawTarget: String) -> (base: String, fragment: String?) {
+        guard let hashIndex = rawTarget.firstIndex(of: "#") else {
+            return (rawTarget, nil)
+        }
+        let base = String(rawTarget[..<hashIndex])
+        let frag = String(rawTarget[rawTarget.index(after: hashIndex)...])
+        // Never normalize the fragment — it's kept verbatim so inner `#` and
+        // whitespace survive for quote matching. The caller trims surrounding `"`
+        // at resolution time (§4).
+        return (base, frag.isEmpty ? nil : frag)
+    }
+
     private static func peel(prefix: String, off s: String) -> String? {
         guard s.hasPrefix(prefix) else { return nil }
         let rest = String(s.dropFirst(prefix.count))
@@ -79,7 +100,9 @@ public enum WikiLinkParser {
     // MARK: - Parse
 
     /// Parse all wiki links from `body`, in document order, de-duplicated by
-    /// `(kind, target)` (first alias wins).
+    /// `(kind, target)` (first alias wins). Same-page anchors (`[[#…]]`, empty
+    /// base) are skipped — they don't name a page or source, so they don't belong
+    /// in the link graph.
     public static func parse(_ body: String) -> [ParsedLink] {
         let ns = body as NSString
         let matches = regex.matches(in: body, range: NSRange(location: 0, length: ns.length))
@@ -89,12 +112,18 @@ public enum WikiLinkParser {
 
         for match in matches {
             let rawTarget = ns.substring(with: match.range(at: 1))
-            let target = collapseWhitespace(rawTarget)
-            guard !target.isEmpty else { continue }
+            let collapsed = collapseWhitespace(rawTarget)
+            guard !collapsed.isEmpty else { continue }
 
-            let (kind, bareTarget) = classify(target)
+            // Split on first "#" BEFORE classifying — so `[[#Section]]` yields
+            // empty base (same-page, skipped here; handled in linkified) and
+            // `[[source:X#"quote"]]` yields base:"source:X" + fragment:""quote"".
+            let (base, fragment) = splitFragment(collapsed)
+            guard !base.isEmpty else { continue } // same-page anchor → skip
+
+            let (kind, bareTarget) = classify(base)
             guard !bareTarget.isEmpty else { continue } // empty target → skip
-            if isEmptyPrefix(target) { continue } // `[[source:]]` → literal
+            if isEmptyPrefix(base) { continue } // `[[source:]]` → literal
 
             let dedupKey = "\(kind.rawValue):\(bareTarget)"
             guard seen.insert(dedupKey).inserted else { continue }
@@ -107,7 +136,8 @@ public enum WikiLinkParser {
             } else {
                 linkText = bareTarget
             }
-            out.append(ParsedLink(linkType: kind, target: bareTarget, linkText: linkText))
+            out.append(ParsedLink(linkType: kind, target: bareTarget,
+                                  fragment: fragment, linkText: linkText))
         }
         return out
     }

@@ -330,7 +330,8 @@ struct SourceDetailView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(PageEditorMetrics.contentInset)
         } else if let head = headVersion {
-            MarkdownPreview(store: store, markdown: head.content)
+            MarkdownPreview(store: store, markdown: head.content,
+                            currentSelection: store.selection)
         } else {
             ContentUnavailableView {
                 Label("No Processed Markdown", systemImage: "doc.plaintext")

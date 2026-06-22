@@ -72,7 +72,30 @@ public struct SystemPrompt: Equatable, Sendable {
     - **Concept pages** explain one idea or process: a definition, how it works,
       and links to the entities and concepts it touches.
     - **Cite sources** by their `sources/…` path so a claim can be traced back to the
-      bytes it came from.
+      bytes it came from. Prefer passage-level citations with `[[source:Name#"…"]]`
+      (see Footnotes & Citations below).
+    - **Link to source passages by distinctive quote** —
+      `[[source:Smith2023#"the effect vanishes above 40°C"]]`. Pick a snippet unique
+      to that passage; it survives re-extraction and needs no heading. The quote is
+      whitespace-normalized and case-sensitive.
+    - **Link to page sections by heading** — `[[Overview#Methodology]]`. The heading
+      text becomes a URL-style slug (lowercase, spaces→`-`, punctuation dropped,
+      `-1/-2` suffix on duplicates). Same-page scroll: `[[#Methodology]]`.
+    - **Footnotes** cite evidence at the passage level. Use `[^id]` inline (any label;
+      auto-numbered 1,2,3… in output) and `[^id]: definition` on its own line after
+      the paragraph that references it. Definitions accept full markdown including
+      `[[links]]` and may span indented continuation lines. Example:
+
+      ```
+      The Calvin cycle has three phases.[^calvin]
+
+      [^calvin]: See [[source:Bassham1950#"the dark reactions of photosynthesis"]]
+      for the original discovery, and [[Calvin Cycle#Regulation]] for regulatory
+      mechanisms.
+      ```
+    - **`[[source:Name]]`** (without a passage) navigates to the source and opens its
+      extracted/text content — use for general references; add `#"…"` for specific
+      passages.
 
     ## Tooling — write via `wikictl`, never the filesystem
 

@@ -41,10 +41,14 @@ struct WikiLinkMarkdownTests {
     }
 
     @Test func queryMetacharactersInTitleAreEncoded() {
-        // &, =, ?, #, + must not leak into the query as separators.
+        // The first `#` splits fragment from base (markdown-anchors §1).
+        // "A&B=C?D#E+F" → base:"A&B=C?D", fragment:"E+F".
         let out = WikiLinkMarkdown.linkified("[[A&B=C?D#E+F]]")
-        let title = WikiLinkMarkdown.target(from: URL(string: extractURL(out))!)
-        #expect(title == "A&B=C?D#E+F")
+        let url = URL(string: extractURL(out))!
+        let title = WikiLinkMarkdown.target(from: url)
+        let frag = WikiLinkMarkdown.fragment(from: url)
+        #expect(title == "A&B=C?D")
+        #expect(frag == "E+F")
     }
 
     @Test func whitespaceInTargetIsCollapsedLikeTheParser() {
@@ -197,6 +201,67 @@ struct WikiLinkMarkdownTests {
         let out = WikiLinkMarkdown.linkified("before [[source:]] after") { _, _ in true }
         #expect(out.contains("[[source:]]"))
         #expect(!out.contains("wiki://"))
+    }
+
+    // MARK: - Fragment / anchor rendering (markdown-anchors)
+
+    @Test func pageLinkWithHeadingFragmentRendersFragmentInURL() {
+        let out = WikiLinkMarkdown.linkified("[[Overview#Methodology]]") { _, _ in true }
+        #expect(out == "[Overview](wiki://page?title=Overview#Methodology)")
+    }
+
+    @Test func sourceLinkWithQuoteFragmentRendersFragmentInURL() {
+        let out = WikiLinkMarkdown.linkified("[[source:Paper#the results]]") { _, _ in true }
+        #expect(out == "[Paper](wiki://source?title=Paper#the%20results)")
+    }
+
+    @Test func fragmentRoundTripsThroughURL() {
+        let out = WikiLinkMarkdown.linkified("[[source:Smith#\"exact passage\"]]") { _, _ in true }
+        let url = URL(string: extractURL(out))!
+        let frag = WikiLinkMarkdown.fragment(from: url)
+        #expect(frag == "\"exact passage\"")
+    }
+
+    @Test func samePageAnchorRendersAsWikiAnchorHost() {
+        let out = WikiLinkMarkdown.linkified("[[#Section]]") { _, _ in true }
+        #expect(out == "[Section](wiki://anchor#Section)")
+    }
+
+    @Test func samePageAnchorWithAliasPreservesDisplay() {
+        let out = WikiLinkMarkdown.linkified("[[#Section|click here]]") { _, _ in true }
+        #expect(out == "[click here](wiki://anchor#Section)")
+    }
+
+    @Test func samePageQuotedAnchorEncodesSpacesAndQuotes() {
+        let out = WikiLinkMarkdown.linkified("[[#\"a quote\"]]") { _, _ in true }
+        #expect(out.contains("wiki://anchor#"))
+        let url = URL(string: extractURL(out))!
+        #expect(WikiLinkMarkdown.isSamePageAnchor(url))
+    }
+
+    @Test func isSamePageAnchorTrueForAnchorHost() {
+        #expect(WikiLinkMarkdown.isSamePageAnchor(URL(string: "wiki://anchor#Section")!))
+    }
+
+    @Test func isSamePageAnchorFalseForPageHost() {
+        #expect(!WikiLinkMarkdown.isSamePageAnchor(URL(string: "wiki://page?title=X#Section")!))
+    }
+
+    @Test func fragmentFromReturnsNilForNonWikiURL() {
+        #expect(WikiLinkMarkdown.fragment(from: URL(string: "https://x.com#frag")!) == nil)
+    }
+
+    @Test func unresolvedLinkStillCarriesFragment() {
+        let out = WikiLinkMarkdown.linkified("[[Ghost#Section]]") { _, _ in false }
+        #expect(out == "[Ghost](wiki://missing?title=Ghost#Section)")
+    }
+
+    @Test func fragmentWithInnerHashIsEncoded() {
+        // "C# is sharp" → inner # is percent-encoded in the URL.
+        let out = WikiLinkMarkdown.linkified("[[source:Note#C# is sharp]]") { _, _ in true }
+        let url = URL(string: extractURL(out))!
+        let frag = WikiLinkMarkdown.fragment(from: url)
+        #expect(frag == "C# is sharp")
     }
 
     // MARK: - Code-span protection for source links
