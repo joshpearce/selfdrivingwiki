@@ -260,6 +260,32 @@ self-seed v1 from verbatim bytes (origin `"source"`), PDFs seed from extraction.
 
 On branch `feature/phase-c-source-markdown-projection`.
 
+## 2026-06-21 — Reader and editor zoom (⌘+ / ⌘− / ⌘0)
+
+Implemented `plans/reader-editor-zoom.md`. Safari-style text zoom for the page reader
+and both monospace editors (page + source), keyboard-only, persisted globally.
+
+- **`ZoomScale` (WikiFSCore)** — pure value type: bounds `0.5...3.0`, ×/÷1.1 step,
+  default `1.0`, non-finite input coerced to default. 15 `ZoomScaleTests` covering
+  clamping at both bounds, round-trip symmetry, reset, and non-finite coercion.
+- **Reader scale** — `MarkdownPreview` reads `@AppStorage("reader.zoom")` and applies
+  `.textual.fontScale(readerZoom)` to `StructuredText`; headings and spacing scale
+  proportionally. Both the page reader and the source viewer scale from this
+  one edit.
+- **Editor scale** — `PageDetailView` and `SourceDetailView` read
+  `@AppStorage("editor.zoom")` and size the monospace `TextEditor` via
+  `.system(size: 13 * editorZoom, design: .monospaced)`. At `1.0` the size is
+  identical to the previous `.body` default at the standard text size (the fixed
+  13 pt no longer tracks Dynamic Type, a deliberate trade-off per the plan).
+- **`ZoomShortcuts` (WikiFS)** — `.zoomShortcuts(_:)` view modifier injects hidden,
+  zero-size `Button`s for ⌘+, ⌘=, ⌘−, and ⌘0. Wired per-mode in both detail views:
+  reader-mode buttons mutate `reader.zoom`, editor-mode buttons mutate `editor.zoom`.
+  No menu items added.
+- **`@AppStorage` keys** — `reader.zoom` and `editor.zoom` are the first `AppStorage`
+  keys in the app; both default `1.0`, shared across views, persisted across launches.
+
+**Tests.** `swift test` — 650 tests, 0 failures (+15 `ZoomScaleTests`).
+
 ## 2026-06-21 — Content-type over extension
 
 Implemented `plans/content-type-over-extension.md` — made `mime_type` content-authoritative
@@ -287,6 +313,75 @@ was mis-typed and skipped extraction.
 
 On branch `feature/content-type-over-extension`.
 
+## 2026-06-21 — Phase C review + content-type + Phase C plans
+
+Reviewed Phase C ("Source Markdown in the File Provider") of `plans/sources-redesign.md`
+against the post-Phase-B tree. Two load-bearing assumptions in the parent design are false
+in the code: (1) the change bridge can't see processed-markdown edits — `changeToken()`
+(`SQLiteWikiStore.swift:564`) folds `COUNT`/`SUM(version)` over `sources` but not
+`source_markdown_versions`, and `appendProcessedMarkdown`/`revertProcessedMarkdown` don't
+bump `sources.version`, so extraction/edit/revert don't move the sync anchor and the
+projected `.md` sibling never refreshes; (2) markdown sources *do* get chains today via the
+lazy-seed in `WikiStoreModel.processedMarkdownHead(for:)` (`:865-877`), which contradicts
+the intended model (only PDFs have chains) and would project a colliding `<id>.md` sibling.
+Design intent confirmed: the chain is a git-lite history of PDF→markdown conversions
+(revert shipped, compare future); only HEAD is projected; the agent sees the latest only.
+
+Also surfaced the root extension-check bug: `addSource` (`SQLiteWikiStore.swift:861`)
+derives `mime_type` from the filename extension, making every downstream "trust MIME" check
+circular (a PDF named `.txt` is mis-typed and skips extraction). `URLIngestService` already
+content-sniffs but the result is discarded and re-derived from ext.
+
+Wrote three plans (all indexed in `PLAN.md`):
+
+- **`plans/content-type-over-extension.md`** — cross-cutting fix making `mime_type`
+  content-authoritative: extract a `ContentSniff` helper, `addSource` sniffs bytes,
+  MIME-first `WikiFSItem.contentType`, Zotero filter, and a grep guard. Standalone; Phase C
+  depends on it.
+- **`plans/phase-c-source-markdown-projection.md`** — Phase C re-grounded. Folds
+  `source_markdown_versions` into `changeToken()` + versions the sibling off the HEAD row;
+  removes the markdown lazy-seed; projects the `.md` sibling in by-id and by-name with
+  proper identity prefixes; one-query HEAD read to avoid N+1; `wikictl source edit-markdown`
+  (appends a `user` version, requires an existing extraction baseline). Defers all
+  MIME-authority work to the content-type plan (no duplicated edits between the two).
+
+No code changed — planning only, on branch `feature/source-wikilinks`.
+
+## 2026-06-21 — Reader and editor zoom (⌘+ / ⌘− / ⌘0)
+
+Implemented `plans/reader-editor-zoom.md`. Safari-style text zoom for the page reader
+and both monospace editors (page + source) via keyboard (⌘+/⌘=/⌘−/⌘0) and ⌘+scroll,
+persisted globally.
+
+- **`ZoomScale` (WikiFSCore)** — pure value type: bounds `0.5...3.0`, ×/÷1.1 step,
+  default `1.0`, non-finite input coerced to default. Plus `scrollSteps(accumulated:
+  threshold:)`, which converts an accumulated ⌘+scroll delta into whole zoom steps
+  and a carry remainder. 21 `ZoomScaleTests` covering clamping at both bounds,
+  round-trip symmetry, reset, non-finite coercion, and scroll-step accumulation.
+- **Reader scale** — `MarkdownPreview` reads `@AppStorage("reader.zoom")` and applies
+  `.textual.fontScale(readerZoom)` to `StructuredText`; headings and spacing scale
+  proportionally. Both the page reader and the source viewer scale from this
+  one edit.
+- **Editor scale** — `PageDetailView` and `SourceDetailView` read
+  `@AppStorage("editor.zoom")` and size the monospace `TextEditor` via
+  `.system(size: 13 * editorZoom, design: .monospaced)`. At `1.0` the size is
+  identical to the previous `.body` default at the standard text size (the fixed
+  13 pt no longer tracks Dynamic Type, a deliberate trade-off per the plan).
+- **`ZoomShortcuts` (WikiFS)** — `.zoomShortcuts(_:)` view modifier injects
+  invisible, zero-size `Button`s for ⌘+, ⌘=, ⌘−, and ⌘0. Wired per-mode in both
+  detail views: reader-mode buttons mutate `reader.zoom`, editor-mode buttons mutate
+  `editor.zoom`. No menu items added. The buttons use `.opacity(0)`, **not**
+  `.hidden()`: a hidden view leaves the responder chain, which silently stops its
+  `.keyboardShortcut` from firing (PR #35 review finding).
+- **`ZoomScroll` (WikiFS)** — `.zoomScroll(_:)` view modifier adds ⌘+scroll zoom,
+  scoped to the hovered subtree (reader vs. editor) the same way the chords are. A
+  local `.scrollWheel` `NSEvent` monitor accumulates ⌘+scroll deltas, steps via
+  `ZoomScale.scrollSteps`, and swallows handled events so the page doesn't also
+  scroll. Scroll up zooms in, down zooms out.
+- **`@AppStorage` keys** — `reader.zoom` and `editor.zoom` are the first `AppStorage`
+  keys in the app; both default `1.0`, shared across views, persisted across launches.
+
+**Tests.** `swift test` — 674 tests, 0 failures (+21 `ZoomScaleTests`).
 ## 2026-06-21 — Phase B: `[[source:display-name]]` wikilinks
 
 Wiki pages can now link to sources with `[[source:display-name]]` syntax. Clicking a

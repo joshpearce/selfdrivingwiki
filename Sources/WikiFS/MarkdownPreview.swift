@@ -22,6 +22,7 @@ struct MarkdownPreview: View {
     @Bindable var store: WikiStoreModel
     let markdown: String
     var contentInset: Bool = true
+    @AppStorage("reader.zoom") private var readerZoom = Double(ZoomScale.defaultScale)
     /// The current selection this preview is rendering (page id or source id).
     /// Used to match against `store.pendingScrollAnchor`.
     var currentSelection: WikiSelection? = nil
@@ -49,6 +50,7 @@ struct MarkdownPreview: View {
                             .id(rendered)
                             .textual.paragraphStyle(NumberedParagraphStyle())
                             .textual.textSelection(.enabled)
+                            .textual.fontScale(CGFloat(readerZoom))
                             // Right-click a link: select the whole link and show
                             // a link-specific context menu (Suggest / Find
                             // Similar / Copy as Wiki Link / Open in Browser …).
