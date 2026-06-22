@@ -228,6 +228,14 @@ public final class WikiStoreModel {
         (try? store.resolveSourceByName(displayName)) != nil
     }
 
+    /// Semantic search for pages matching `query` (sqlite-vec + NLEmbedding, with
+    /// a `LIKE` fallback). Powers the right-click link context menu's "Suggest…"
+    /// (missing links) and "Find Similar…" (any wiki link). Best-effort: returns
+    /// `[]` on any error so the menu never throws.
+    public func searchSimilar(query: String, limit: Int = 8) -> [WikiPageSummary] {
+        (try? store.searchSimilar(query: query, limit: limit)) ?? []
+    }
+
     /// Navigate to the source with `displayName` from a clicked
     /// `[[source:display-name]]` link in the preview. Resolves display name → id
     /// (most-recently-updated on collision), records navigation history, and opens

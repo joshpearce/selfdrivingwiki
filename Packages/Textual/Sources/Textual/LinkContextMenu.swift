@@ -45,7 +45,7 @@ public struct LinkMenuItem: Sendable {
     _ title: String,
     isEnabled: Bool = true,
     submenu: [LinkMenuItem]? = nil,
-    action: @escaping @MainActor () -> Void
+    action: @escaping @MainActor () -> Void = {}
   ) -> LinkMenuItem {
     var item = LinkMenuItem()
     item.title = title
