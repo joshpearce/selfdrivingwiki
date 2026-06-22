@@ -80,7 +80,28 @@ public enum WikiLinkMarkdown {
                 continue
             }
 
-            let (kind, bareTarget) = WikiLinkParser.classify(rawTarget)
+            // Split on first "#" BEFORE classifying — shared with WikiLinkParser.
+            let (base, fragment) = WikiLinkParser.splitFragment(rawTarget)
+
+            // Same-page anchor: empty base → wiki://anchor#fragment.
+            if base.isEmpty {
+                guard let frag = fragment else {
+                    out += ns.substring(with: full)
+                    continue
+                }
+                let aliasRange = match.range(at: 2)
+                let display: String
+                if aliasRange.location != NSNotFound {
+                    let alias = collapseWhitespace(ns.substring(with: aliasRange))
+                    display = alias.isEmpty ? frag : alias
+                } else {
+                    display = frag
+                }
+                out += markdownAnchorLink(display: display, fragment: frag)
+                continue
+            }
+
+            let (kind, bareTarget) = WikiLinkParser.classify(base)
             guard !bareTarget.isEmpty else {
                 // Empty bare target after prefix strip: literal text.
                 out += ns.substring(with: full)
@@ -88,7 +109,7 @@ public enum WikiLinkMarkdown {
             }
             // `[[source:]]` / `[[page:]]` — reserved prefix with no meaningful
             // remainder: emit literal text (consistent with the parser's skip).
-            if WikiLinkParser.isEmptyPrefix(rawTarget) {
+            if WikiLinkParser.isEmptyPrefix(base) {
                 out += ns.substring(with: full)
                 continue
             }
@@ -103,7 +124,8 @@ public enum WikiLinkMarkdown {
             }
 
             let resolved = isResolved(bareTarget, kind)
-            out += markdownLink(display: display, target: bareTarget, kind: kind, resolved: resolved)
+            out += markdownLink(display: display, target: bareTarget, kind: kind,
+                                resolved: resolved, fragment: fragment)
         }
         // Tail after the last match.
         if cursor < ns.length {
@@ -126,14 +148,25 @@ public enum WikiLinkMarkdown {
         return title
     }
 
-    /// `.page` / `.source` for a resolved link; `nil` for unresolved (`missing`) or
-    /// non-wiki. Used by the view's `OpenURLAction` to route the click.
+    /// Return the URL-decoded fragment from a `wiki://` URL, or nil. Used by the
+    /// view's `OpenURLAction` to extract the anchor for scroll-to.
+    public static func fragment(from url: URL) -> String? {
+        guard url.scheme == scheme, let host = url.host,
+              host == resolvedHost || host == "source" || host == unresolvedHost || host == "anchor"
+        else { return nil }
+        return url.fragment?.removingPercentEncoding
+    }
+
+    /// `.page` / `.source` for a resolved link; `nil` for unresolved (`missing` or
+    /// `anchor`) or non-wiki. Used by the view's `OpenURLAction` to route the click.
+    /// Host `"anchor"` is same-page scroll — not a navigation, so returns nil here
+    /// (the OpenURLAction handles it separately).
     public static func resolvedKind(from url: URL) -> WikiLinkParser.ParsedLink.LinkType? {
         guard url.scheme == scheme, let host = url.host else { return nil }
         switch host {
         case resolvedHost:   return .page     // "page"
         case "source":       return .source
-        default:             return nil       // "missing" or anything else → inert
+        default:             return nil       // "missing", "anchor", or anything else → inert
         }
     }
 
@@ -143,11 +176,17 @@ public enum WikiLinkMarkdown {
         resolvedKind(from: url) != nil
     }
 
+    /// True if `url` is a same-page anchor (`wiki://anchor#…`).
+    public static func isSamePageAnchor(_ url: URL) -> Bool {
+        url.scheme == scheme && url.host == "anchor"
+    }
+
     // MARK: - Helpers
 
     private static func markdownLink(display: String, target: String,
                                      kind: WikiLinkParser.ParsedLink.LinkType,
-                                     resolved: Bool) -> String {
+                                     resolved: Bool,
+                                     fragment: String? = nil) -> String {
         let host: String
         if resolved {
             host = kind == .source ? "source" : resolvedHost
@@ -162,7 +201,13 @@ public enum WikiLinkMarkdown {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "[", with: "\\[")
             .replacingOccurrences(of: "]", with: "\\]")
-        return "[\(safeDisplay)](\(scheme)://\(host)?title=\(encodedTitle))"
+        var url = "\(scheme)://\(host)?title=\(encodedTitle)"
+        if let frag = fragment, !frag.isEmpty {
+            let encodedFrag = frag.addingPercentEncoding(withAllowedCharacters: fragmentAllowed)
+                ?? frag
+            url += "#\(encodedFrag)"
+        }
+        return "[\(safeDisplay)](\(url))"
     }
 
     /// Collapse whitespace runs to one space and trim — delegates to the single
@@ -171,12 +216,34 @@ public enum WikiLinkMarkdown {
         WikiText.normalized(s)
     }
 
+    /// Build a same-page anchor link: `[display](wiki://anchor#encodedFragment)`.
+    /// No `?title=` query — the host `"anchor"` tells the OpenURLAction to scroll
+    /// within the current preview rather than navigate.
+    private static func markdownAnchorLink(display: String, fragment: String) -> String {
+        let encodedFrag = fragment.addingPercentEncoding(withAllowedCharacters: fragmentAllowed)
+            ?? fragment
+        let safeDisplay = display
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "[", with: "\\[")
+            .replacingOccurrences(of: "]", with: "\\]")
+        return "[\(safeDisplay)](\(scheme)://anchor#\(encodedFrag))"
+    }
+
     /// Allowed characters for the `title=` query value. Start from the URL query
     /// set and remove the sub-delimiters that have query meaning, so a `&`, `=`,
     /// `?`, `#`, `+`, or space in a title is percent-escaped rather than parsed.
     private static let titleQueryAllowed: CharacterSet = {
         var set = CharacterSet.urlQueryAllowed
         set.remove(charactersIn: "&=?#+ ")
+        return set
+    }()
+
+    /// Allowed characters for the URL fragment (everything after `#`). Keeps
+    /// alphanumeric + common punctuation; `#`, `"`, space, and `%` are encoded so
+    /// they don't terminate the fragment or confuse URL parsing.
+    private static let fragmentAllowed: CharacterSet = {
+        var set = CharacterSet.urlFragmentAllowed
+        set.remove(charactersIn: "#\" %")
         return set
     }()
 

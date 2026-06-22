@@ -62,7 +62,8 @@ struct SystemPromptDetailView: View {
 
     /// Default mode: the prompt rendered as formatted, read-only markdown.
     private var reader: some View {
-        MarkdownPreview(store: store, markdown: store.draftSystemPrompt)
+        MarkdownPreview(store: store, markdown: store.draftSystemPrompt,
+                        currentSelection: store.selection)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .frame(minHeight: PageEditorMetrics.previewMinHeight)
     }

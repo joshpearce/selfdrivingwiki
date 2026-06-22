@@ -32,7 +32,8 @@ struct ChangeLogDetailView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                MarkdownPreview(store: store, markdown: logMarkdown)
+                MarkdownPreview(store: store, markdown: logMarkdown,
+                                currentSelection: store.selection)
                     .frame(maxWidth: .infinity)
                     .frame(minHeight: PageEditorMetrics.previewMinHeight)
             }

@@ -2,6 +2,56 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-21 — Markdown Anchors: section/passage links + footnote citations
+
+Implemented `plans/markdown-anchors.md`. Wiki links can now point at a *place inside*
+a document:
+
+- `[[Page#Section]]` — navigate to page, scroll to heading
+- `[[source:Paper#"quote"]]` — navigate to source, scroll to quoted passage
+- `[[#"quote"]]` / `[[#Section]]` — scroll within current page
+- All of the above work inside **footnotes** (`[^id]` + `[^id]: definition`)
+
+**Architecture.** Pages cite by heading slug (Textual already applies `.id(slug)` to
+headings); sources cite by quoted passage (render-time ids, nothing stored — extraction-safe).
+`AnchorBlock.parse()` walks rendered markdown and builds an ordered block list;
+`resolveAnchor()` resolves fragments slug-first then quote-first. `ScrollViewReader`
++ `proxy.scrollTo(id)` drives the scroll; `NumberedParagraphStyle` assigns sequential
+`p1/p2/…` ids to paragraphs for quote-level precision. Navigation stashes a
+`pendingScrollAnchor` tagged with target selection so a stale anchor can't misfire.
+
+**Changes:**
+- **`WikiLinkParser`:** `ParsedLink` gains `fragment: String?`. `splitFragment(_:)` splits
+  raw target on first `#` before classification. Same-page anchors (empty base) are
+  skipped in `parse()` but rendered in `linkified`.
+- **`WikiLinkMarkdown`:** `markdownLink` gains `fragment:` param; `markdownAnchorLink`
+  builds `wiki://anchor#…` for same-page. `fragment(from:)` decodes fragments from URLs.
+  `isSamePageAnchor(_:)` identifies anchor-host URLs. `fragmentAllowed` character set
+  encodes `#`, `"`, space, `%` in fragment. `resolvedKind(from:)` recognizes `"anchor"`
+  host (returns nil — same-page is not a navigation).
+- **`AnchorBlock`** (new): Struct with `Kind` (heading/paragraph), `id`, `text`.
+  `parse(_:)` walks rendered markdown in document order, skipping lists/code/tables/
+  blockquotes. `makeSlug(_:counts:)` does GFM-style slug generation with `-1/-2` dedup.
+  `resolveAnchor(_:in:)` — pure function: slug-match first, then quote substring match.
+- **`NumberedParagraphStyle`** (new): Custom Textual `ParagraphStyle` that applies
+  `.id("p\(n)")` sequentially. Counter resets before each render.
+- **`MarkdownPreview`:** Wrapped in `ScrollViewReader`; `NumberedParagraphStyle` applied
+  to `StructuredText`; block list built after render; `OpenURLAction` dispatches
+  same-page anchors locally and passes fragment through to `selectPage`/`selectSource`;
+  `.task` consumes `pendingScrollAnchor` with 50ms layout-delay scroll.
+- **`WikiStoreModel`:** `selectPage(byTitle:anchor:)` / `selectSource(byDisplayName:anchor:)`
+  stash a `pendingScrollAnchor` tagged with target `WikiSelection`.
+  `consumePendingScrollAnchor(for:)` atomically reads and clears it.
+- **`SystemPrompt`:** Documented footnote grammar, cite-by-quote, page-section anchors,
+  slug rules, same-page anchors, and a worked footnote example.
+- All `MarkdownPreview` call sites (`PageDetailView`, `SourceDetailView`,
+  `ChangeLogDetailView`, `SystemPromptDetailView`) pass `currentSelection: store.selection`.
+
+**Tests.** 725 tests, 55 suites, 0 failures (41 new: 14 parser #-split, 11 linkified
+fragment, 16 AnchorBlock).
+
+On branch `feature/markdown-anchors`.
+
 ## 2026-06-21 — Deferred MarkdownPreview rendering
 
 `MarkdownPreview` now shows a `ProgressView` spinner immediately and defers regex
