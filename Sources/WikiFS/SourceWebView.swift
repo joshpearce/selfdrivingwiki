@@ -81,27 +81,67 @@ struct SourceWebView: View {
     }
 
     /// Full HTML document string built around `body` (the converted markdown).
-    /// Pure / callable off the main actor.
+    /// Pure / callable off the main actor. The theme mirrors the native reader's
+    /// geometry (760pt column, 12pt inset from `PageEditorMetrics`) and uses CSS
+    /// variables + `color-scheme` so light/dark match the app appearance.
     nonisolated static func documentHTML(_ body: String) -> String {
-        """
+        let width = Int(PageEditorMetrics.readableContentWidth)
+        let inset = Int(PageEditorMetrics.contentInset)
+        return """
         <!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
         <meta name="color-scheme" content="light dark">
         <style>
+          :root {
+            --text: #1c1c1e;
+            --muted: rgba(60, 60, 67, 0.6);
+            --code-bg: rgba(0, 0, 0, 0.06);
+            --border: rgba(0, 0, 0, 0.12);
+          }
+          @media (prefers-color-scheme: dark) {
+            :root {
+              --text: #e6e6e6;
+              --muted: rgba(235, 235, 245, 0.6);
+              --code-bg: rgba(255, 255, 255, 0.08);
+              --border: rgba(255, 255, 255, 0.16);
+            }
+          }
+          /* color-scheme above drives the page canvas (light/dark background). */
           body {
-            font: -apple-system-body; font-size: 15px; line-height: 1.55;
-            max-width: 720px; margin: 24px auto 64px; padding: 0 24px;
+            font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+            font-size: 15px; line-height: 1.55;
+            color: var(--text);
+            max-width: \(width)px; margin: 24px auto 72px; padding: 0 \(inset)px;
             -webkit-text-size-adjust: 100%;
+            -webkit-font-smoothing: antialiased;
+          }
+          h1, h2, h3, h4, h5, h6 { line-height: 1.25; font-weight: 600; margin: 1.4em 0 0.5em; }
+          h1 { font-size: 1.7em; } h2 { font-size: 1.4em; } h3 { font-size: 1.15em; } h4 { font-size: 1em; }
+          p { margin: 0 0 1em; }
+          strong { font-weight: 600; }
+          a { color: -webkit-link; }
+          ul, ol { padding-left: 1.6em; margin: 0 0 1em; }
+          li { margin: 0.15em 0; }
+          blockquote {
+            margin: 0 0 1em; padding: 0.1em 0 0.1em 1em;
+            border-left: 3px solid var(--border); color: var(--muted);
+          }
+          code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.9em; background: var(--code-bg);
+            padding: 0.1em 0.35em; border-radius: 4px;
           }
           pre {
-            background: rgba(128,128,128,0.14); padding: 12px 14px;
-            border-radius: 8px; overflow: auto; font-size: 13px;
+            margin: 0 0 1em; padding: 12px 14px;
+            background: var(--code-bg); border-radius: 8px; overflow: auto;
+            font-size: 13px; line-height: 1.45;
           }
-          code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-          a { color: -webkit-link; }
-          h1, h2, h3, h4, h5, h6 { line-height: 1.25; margin: 1.4em 0 0.5em; }
-          h1 { font-size: 1.7em; } h2 { font-size: 1.4em; } h3 { font-size: 1.15em; }
-          ul, ol { padding-left: 1.6em; }
-          mark.sdwhl { background: rgba(255, 213, 79, 0.75); border-radius: 2px; }
+          pre code { background: none; padding: 0; font-size: inherit; }
+          hr { border: none; border-top: 1px solid var(--border); margin: 1.5em 0; }
+          table { border-collapse: collapse; margin: 0 0 1em; }
+          th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+          th { font-weight: 600; }
+          img { max-width: 100%; height: auto; }
+          mark.sdwhl { background: rgba(255, 213, 79, 0.8); border-radius: 2px; }
         </style></head>
         <body><article>\(body)</article></body></html>
         """
