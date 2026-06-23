@@ -167,6 +167,6 @@ struct ZoteroSettingsView: View {
     }
 
     private enum Metrics {
-        static let width: CGFloat = 420
+        static let width: CGFloat = 460
     }
 }
