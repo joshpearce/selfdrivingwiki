@@ -145,15 +145,12 @@ struct MarkdownPreview: View {
 
     @MainActor
     private func renderMarkdown(_ raw: String) -> String {
-        let renderedFootnotes = WikiFootnoteMarkdown.rendered(raw)
-        let body = WikiLinkMarkdown.linkified(renderedFootnotes.bodyMarkdown) { [weak store] name, kind in
+        // Shared footnote-expand + wiki-link-linkify pre-pass (see
+        // ReaderMarkdown); the native reader passes the store's existence
+        // checks so missing links are styled as ghosts.
+        ReaderMarkdown.prepared(raw) { [weak store] name, kind in
             kind == .source ? store?.sourceExists(displayName: name) ?? false : store?.pageExists(title: name) ?? false
         }
-        guard !renderedFootnotes.footnotes.isEmpty else { return body }
-        let footnotes = renderedFootnotes.footnotes
-            .map { "\($0.number). \(WikiLinkMarkdown.linkified($0.markdown) { [weak store] n, k in k == .source ? store?.sourceExists(displayName: n) ?? false : store?.pageExists(title: n) ?? false })" }
-            .joined(separator: "\n")
-        return "\(body)\n\n---\n\n\(footnotes)"
     }
 }
 

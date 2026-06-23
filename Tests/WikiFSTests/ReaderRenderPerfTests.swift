@@ -77,13 +77,13 @@ struct ReaderRenderPerfTests {
         parseSamples.sort()
         let parseMs = parseSamples[parseSamples.count / 2]
 
-        // Web-view converter cost: this is the synchronous work the web-view
-        // path does on the main thread today (Sources/WikiFS/SourceWebView.swift).
-        // If large, it's the blocker async loading must move off-main.
+        // Web-view renderer cost: the swift-markdown → HTML render the web-view
+        // path runs off-main (Sources/WikiFS/MarkdownHTMLRenderer.swift). Timed
+        // on the raw markdown; the pre-pass cost is the `preprocess` number above.
         var convertSamples: [Double] = []
         for _ in 0..<5 {
             let start = DispatchTime.now().uptimeNanoseconds
-            _ = MarkdownToHTML.convert(raw)
+            _ = MarkdownHTMLRenderer.render(raw)
             let elapsedNs = DispatchTime.now().uptimeNanoseconds - start
             convertSamples.append(Double(elapsedNs) / 1_000_000)
         }
@@ -101,7 +101,7 @@ struct ReaderRenderPerfTests {
         source size : \(bytes) bytes (\(String(format: "%.0f", kb)) KB)
         preprocess  : \(String(format: "%.1f", preprocessMs)) ms  (footnote expand + wiki-link linkify, full string)
         parse       : \(String(format: "%.1f", parseMs)) ms  (Textual Markdown → AttributedString)
-        web convert : \(String(format: "%.1f", convertMs)) ms  (MarkdownToHTML → HTML string, web-view path)
+        web render : \(String(format: "%.1f", convertMs)) ms  (swift-markdown → HTML, web-view path)
         ──────────────────────────────────────────────────────────
         """)
     }

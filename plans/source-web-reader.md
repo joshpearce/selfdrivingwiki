@@ -63,12 +63,11 @@ the process is already warm. **Phase 0 measures first-vs-subsequent open; if
 cold-start is negligible, skip the prewarm.**
 
 ### Markdown → HTML
-Replace the prototype's minimal converter with a real one. **Decision needed**
-(see Open Decisions); recommend **Apple `swift-markdown`** (`import Markdown`) —
-pure Swift, no C dependency, Apple-maintained, parses full GFM (tables,
-footnotes, task lists) to a DOM we walk with a `MarkupVisitor` to emit HTML
-(~200 lines, full control). Alternative: **cmark-gfm** via a SwiftPM package
-(C, faster, native HTML incl. tables/footnotes, but adds a C dependency).
+Replace the prototype's minimal converter with a real one: **Apple
+`swift-markdown`** (`import Markdown`) — pure Swift, no C dependency,
+Apple-maintained, parses full GFM (tables, footnotes, task lists) to a DOM we
+walk with a `MarkupVisitor` to emit HTML (~200 lines, full control). (Rejected:
+`cmark-gfm` — faster, native HTML, but adds a C SwiftPM dependency.)
 
 Wiki-link + footnote semantics are applied as a **shared pre-pass on the
 markdown string** — reuse `WikiFootnoteMarkdown` + `WikiLinkMarkdown`
@@ -144,10 +143,7 @@ scope for v1** (the native reader doesn't have it either) — noted as a follow-
 
 ## Open Decisions
 
-1. **Markdown converter: `swift-markdown` (recommended) vs `cmark-gfm` vs
-   extend-the-minimal.** `swift-markdown` = pure Swift, no C dep, full GFM AST,
-   we write the HTML visitor. `cmark-gfm` = C, faster, native HTML, adds a C
-   SwiftPM dependency. *(Needs your call.)*
+1. ~~Markdown converter~~ — **decided: `swift-markdown`.**
 2. **Size threshold value.** Picked in Phase 0 from measurement; provisional
    default ~96 KB.
 3. **Prewarm.** Include iff Phase 0 shows a meaningful first-open cold-start.
