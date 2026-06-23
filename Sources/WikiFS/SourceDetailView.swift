@@ -40,6 +40,11 @@ struct SourceDetailView: View {
     /// Quote to highlight in the PDF view, set when a `[[source:Name#"…"]]` link
     /// targets an un-extracted PDF. Consumed from `store.pendingScrollAnchor`.
     @State private var pdfQuote: String?
+    /// Prototype A/B toggle: render the source's markdown in a WKWebView
+    /// (`SourceWebView`) instead of the native `MarkdownPreview`, to test whether
+    /// browser-windowed layout removes the large-source render freeze. Off by
+    /// default — the native reader is the production path.
+    @AppStorage("debug.webReader") private var useWebReader = false
 
     private enum FileContentTab: String, CaseIterable {
         case markdown = "Markdown"
@@ -208,6 +213,12 @@ struct SourceDetailView: View {
                         .keyboardShortcut("e", modifiers: .command)
                         .disabled(isRunning)
                     }
+                    // Prototype A/B: web-view reader vs native reader.
+                    if hasMarkdown {
+                        Toggle("Web", isOn: $useWebReader)
+                            .toggleStyle(.checkbox)
+                            .help("Prototype: render markdown in a WKWebView instead of the native reader")
+                    }
                 }
             }
 
@@ -350,10 +361,16 @@ struct SourceDetailView: View {
                 .zoomShortcuts($editorZoom)
                 .zoomScroll($editorZoom)
         } else if let head = headVersion {
-            MarkdownPreview(store: store, markdown: head.content,
-                            currentSelection: store.selection)
-                .zoomShortcuts($readerZoom)
-                .zoomScroll($readerZoom)
+            if useWebReader {
+                // EXPERIMENTAL: web-view reader. Compare against the native
+                // MarkdownPreview on the same large source (open speed + scroll).
+                SourceWebView(markdown: head.content, store: store)
+            } else {
+                MarkdownPreview(store: store, markdown: head.content,
+                                currentSelection: store.selection)
+                    .zoomShortcuts($readerZoom)
+                    .zoomScroll($readerZoom)
+            }
         } else {
             ContentUnavailableView {
                 Label("No Processed Markdown", systemImage: "doc.plaintext")

@@ -32,7 +32,11 @@ let package = Package(
                 "WikiFSCore",
                 .product(name: "Textual", package: "textual"),
             ],
-            path: "Sources/WikiFS"
+            path: "Sources/WikiFS",
+            // WKWebView for the experimental web-view reader path
+            // (Sources/WikiFS/SourceWebView.swift) — see plans for the large-doc
+            // render-freeze fix.
+            linkerSettings: [.linkedFramework("WebKit")]
         ),
         // wikictl's logic (arg parsing, command dispatch, wiki resolution, the
         // Darwin post) lives in a LIBRARY target so it's unit-testable — the same
