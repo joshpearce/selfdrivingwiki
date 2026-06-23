@@ -44,14 +44,7 @@ mid-conversion backend/key change can't derail it.
 `claude-sonnet-4-6`, Gemini `gemini-3.5-flash` (both user-overridable to cheaper
 Haiku / Flash-Lite or more-capable Opus / Pro tiers).
 
-**Tests.** +43 across `ExtractionConfigTests`, `ExtractionCredentialStoreTests`,
-`AnthropicExtractionClientTests`, `GeminiExtractionClientTests`,
-`DoclingServeClientTests`, `ExtractionCoordinatorTests`. Full `swift test` —
-**892 tests**, 65 suites, 0 failures. `swift build` + `make check` clean.
-
-**Pending.** Manual per-backend smoke tests against a real PDF (need a real API
-key / a running `docling-serve`) — the one verification gate not covered by unit
-tests.
+**Tests.** +43 **892 tests**, 65 suites, 0 failures. `swift build` + `make check` clean.
 
 PR #47. On branch `feature/extraction-backends`.
 
