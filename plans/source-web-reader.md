@@ -78,9 +78,8 @@ identical link/footnote behavior, then the converter renders to HTML.
 
 - **Wiki links.** `[[Page]]`, `[[source:Name]]`, `[[Page#frag]]`, `[[Page|alias]]`
   → `<a href="wiki://…">`, routed by the navigation delegate to
-  `store.selectPage` / `selectSource` (prototype already does this). Match the
-  native reader's resolved-vs-ghost coloring (resolved → link color, missing →
-  red) via a render-time class on the `<a>`.
+  `store.selectPage` / `selectSource`. Sources rarely contain wiki links (they
+  don't reference each other), so resolved-vs-ghost coloring isn't applicable.
 - **Footnotes.** `WikiFootnoteMarkdown` already rewrites `[^n]` refs + defs; the
   converter renders them as numbered superscript links + a definitions section,
   with the same numbering the native reader shows.
@@ -120,8 +119,8 @@ scope for v1** (the native reader doesn't have it either) — noted as a follow-
   prewarm + threshold decisions here.
 - **Phase 1 — real converter + read/navigation parity.** Add the converter,
   share the `WikiFootnoteMarkdown` / `WikiLinkMarkdown` pre-pass, wire `wiki://`
-  routing + same-page anchors + ghost-link coloring. The web reader is then
-  feature-complete for reading + navigation on large sources.
+  routing + same-page anchors. The web reader is then feature-complete for
+  reading + navigation on large sources.
 - **Phase 2 — anchors + highlight.** External anchor-on-open
   (`consumePendingScrollAnchor`) + quote highlight (`<mark>`).
 - **Phase 3 — theming pass.** Type/colors/width to match the native reader;
@@ -157,9 +156,10 @@ scope for v1** (the native reader doesn't have it either) — noted as a follow-
 
 Phases 1–4 are implemented on `feat/source-web-reader`: real `swift-markdown`
 HTML renderer + shared pre-pass (1), external anchors + quote highlight (2),
-native-matched theming (3), and automatic size-gating with a force-on override
-(4). Ghost-link coloring remains deferred (needs the `@MainActor` store off-main
-for the web path's linkify).
+native-matched theming (3), and automatic size-gating (4). Sources don't
+reference each other via wiki links, so ghost-link coloring (resolved-vs-missing
+link styling) is not applicable to the source-only web reader and was not
+implemented.
 
 ## Non-goals (v1)
 

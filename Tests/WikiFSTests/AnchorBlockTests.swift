@@ -205,7 +205,7 @@ struct AnchorBlockTests {
     }
 
     @Test func appendedFootnoteSectionDoesNotAddBlocks() {
-        // `MarkdownPreview.renderMarkdown` appends "\n\n---\n\n1. note\n2. note".
+        // `MarkdownPreview.renderMarkdown` appends "\n\n---\n\n1. first note\n2. second note".
         // `---` is a thematic break (skipped); "1. x" is an ordered list (skipped).
         // Confirm that tail neither creates paragraph blocks nor shifts ids, so
         // parsing the raw (footnote-less) string matches the rendered count.

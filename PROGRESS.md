@@ -2,6 +2,38 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-23 — Source web reader (fixes large-source render freeze)
+
+Implemented `plans/source-web-reader.md`. Large sources (500 KB+) beachballed
+the native Textual reader (~10 s) because it lays out the whole document
+synchronously with no virtualization. Added a `WKWebView` reader
+(`SourceWebView`) used **automatically above a size threshold** (default 96 KB,
+`@AppStorage reader.webThresholdKB`); small docs/pages keep the native reader.
+
+**Rendering.** `MarkdownHTMLRenderer` walks a swift-markdown `Document`
+(`MarkupVisitor` → HTML) — headings with GFM-slug ids, tables, footnotes, code,
+lists, blockquotes; ~24 ms on 513 KB. The footnote-expand + wiki-link-linkify
+pre-pass is extracted into `ReaderMarkdown`, shared with `MarkdownPreview` so
+both readers behave identically. The convert runs off the main actor; the page
+chrome appears immediately with a spinner, then `loadHTMLString` fires on main.
+
+**Anchors + highlight (Phase 2).** `SourceWebView` consumes the store's pending
+anchor — `[[source:Name#Section]]` scrolls to the heading slug id; `[[source:Name#"quote"]]`
+runs `window.find` + `<mark>` + scroll (with a whitespace-tolerant TreeWalker
+fallback). Resolution is a pure `nonisolated` `resolveScrollTarget`, unit-tested.
+
+**Theme + gate (Phases 3–4).** CSS mirrors the native reader (760pt column +
+12pt inset via `PageEditorMetrics`, system font, light/dark via CSS variables,
+left-aligned). `SourceDetailView.markdownContent` gates on
+`head.content.utf8.count > webThresholdKB * 1024`. Sources don't reference each
+other via wiki links, so ghost-link coloring is N/A.
+
+**Measured.** `appear-to-painted` ~130–280 ms on a 480 KB source vs ~10 s native.
+A headless benchmark (`ReaderRenderPerfTests`) confirmed the freeze is layout,
+not parsing (preprocess + parse ≈ 260 ms on 513 KB). 934 tests pass
+(15 `MarkdownHTMLRendererTests`, 5 `SourceWebAnchorTests`, 2 `AnchorBlockTests`
+parity).
+
 ## 2026-06-22 — Quote Highlight + Scroll-to-Quote for Source Links
 
 Implemented `plans/quote-highlight-and-scroll.md`. When a
@@ -12,11 +44,11 @@ for both markdown and PDF.
 **Markdown.** `WikiLinkStylingParser` gets a `highlightQuote` parameter; the
 pure `quoteRange(_:in:)` does whitespace-tolerant (collapsed, trimmed) first-match
 substring search against the `AttributedString` and sets `.backgroundColor` to
-`NSColor.findHighlightColor`. `MarkdownPreview` holds `@State highlightQuote`,
-keys its `.task` on `RenderKey(markdown, pendingScrollAnchorVersion)`, and
-consumes the pending anchor to set the quote + scroll with kind-aware anchors
-(`.center` for paragraphs, `.top` for headings). `.onChange(of: markdown)`
-clears the highlight on document change.
+a dynamic highlight color that adapts to light/dark mode. `MarkdownPreview` holds
+`@State highlightQuote`, keys its `.task` on `RenderKey(markdown, pendingScrollAnchorVersion)`,
+and scrolls first (while the view hierarchy is stable) before setting highlight
+state. Trailing newlines keyed to `highlightVersion` trigger `StructuredText`
+re-parse without changing view identity, keeping `ScrollViewProxy` valid.
 
 **Re-click reactivity.** `WikiStoreModel.pendingScrollAnchorVersion` is
 incremented in `selectPage`/`selectSource` whenever `pendingScrollAnchor` is
@@ -35,6 +67,13 @@ in `AnchorBlockTests`. 911 total tests pass.
 
 **Builds on:** markdown-anchors (render-time block ids, `selectSource(anchor:)`,
 `pendingScrollAnchor`), phase-b-source-wikilinks (`wiki://source` scheme).
+
+## 2026-06-22 — Zotero settings auto-save
+
+Removed the explicit "Save" button from `ZoteroSettingsView`. API key, library ID,
+and directory override now persist immediately via `.onChange(of:)` on each field
+— no data can be lost on window close (`⌘W` / red button). Also removed the
+redundant save calls from `testConnection()`.
 
 ## 2026-06-22 — Pluggable PDF→Markdown extraction backends (Claude, Gemini, Docling Serve)
 
