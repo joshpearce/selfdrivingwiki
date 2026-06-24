@@ -110,7 +110,7 @@ struct SourceWebView: View {
             font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
             font-size: 15px; line-height: 1.55;
             color: var(--text);
-            max-width: \(width)px; margin: 24px auto 72px; padding: 0 \(inset)px;
+            max-width: \(width)px; margin: 24px 0 72px; padding: 0 \(inset)px;
             -webkit-text-size-adjust: 100%;
             -webkit-font-smoothing: antialiased;
           }
