@@ -15,6 +15,10 @@ let package = Package(
         // tiny (NSTextInteractionView + AppKitTextInteractionOverlay + the
         // linkRange/link-menu additions).
         .package(path: "Packages/Textual"),
+        // swift-markdown powers the source web reader's markdown→HTML renderer
+        // (plans/source-web-reader.md). Pure-Swift GFM AST (tables, footnotes,
+        // task lists); we walk it with a MarkupVisitor to emit HTML.
+        .package(url: "https://github.com/apple/swift-markdown", from: "0.8.0"),
     ],
     targets: [
         // Non-UI core: page model, ULID, the WikiStore protocol + SQLite
@@ -31,8 +35,13 @@ let package = Package(
             dependencies: [
                 "WikiFSCore",
                 .product(name: "Textual", package: "textual"),
+                .product(name: "Markdown", package: "swift-markdown"),
             ],
-            path: "Sources/WikiFS"
+            path: "Sources/WikiFS",
+            // WKWebView for the experimental web-view reader path
+            // (Sources/WikiFS/SourceWebView.swift) — see plans for the large-doc
+            // render-freeze fix.
+            linkerSettings: [.linkedFramework("WebKit")]
         ),
         // wikictl's logic (arg parsing, command dispatch, wiki resolution, the
         // Darwin post) lives in a LIBRARY target so it's unit-testable — the same

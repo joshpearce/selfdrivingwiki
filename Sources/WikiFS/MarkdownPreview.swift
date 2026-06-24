@@ -57,7 +57,9 @@ struct MarkdownPreview: View {
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     } else {
-                        let rendered = renderNumbered(markdown)
+                        let rendered = ReaderTiming.measure("reader.preprocess") {
+                            renderNumbered(markdown)
+                        }
                         // Append trailing newlines keyed to highlightVersion so
                         // StructuredText sees a markup change and re-parses with
                         // the current parser, without changing view identity.
@@ -103,7 +105,14 @@ struct MarkdownPreview: View {
                 return .handled
             })
             .task(id: RenderKey(markdown: markdown, anchorVersion: store.pendingScrollAnchorVersion)) {
-                blocks = AnchorBlock.parse(renderMarkdown(markdown))
+                // Parse the RAW markdown, not renderMarkdown(markdown): anchors
+                // only walk heading/paragraph structure, which footnote expansion
+                // and linkification don't change. Re-running both preprocessing
+                // passes here duplicated the body's work over the full document —
+                // a real cost on 500KB+ sources. Footnote definitions (`[^n]:`)
+                // and the appended footnote section are skipped by AnchorBlock,
+                // so block count/order is identical to the rendered path.
+                blocks = AnchorBlock.parse(markdown)
                 if let frag = store.consumePendingScrollAnchor(for: currentSelection),
                    let id = resolveAnchor(frag, in: blocks) {
                     let quote = frag.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
@@ -136,15 +145,12 @@ struct MarkdownPreview: View {
 
     @MainActor
     private func renderMarkdown(_ raw: String) -> String {
-        let renderedFootnotes = WikiFootnoteMarkdown.rendered(raw)
-        let body = WikiLinkMarkdown.linkified(renderedFootnotes.bodyMarkdown) { [weak store] name, kind in
+        // Shared footnote-expand + wiki-link-linkify pre-pass (see
+        // ReaderMarkdown); the native reader passes the store's existence
+        // checks so missing links are styled as ghosts.
+        ReaderMarkdown.prepared(raw) { [weak store] name, kind in
             kind == .source ? store?.sourceExists(displayName: name) ?? false : store?.pageExists(title: name) ?? false
         }
-        guard !renderedFootnotes.footnotes.isEmpty else { return body }
-        let footnotes = renderedFootnotes.footnotes
-            .map { "\($0.number). \(WikiLinkMarkdown.linkified($0.markdown) { [weak store] n, k in k == .source ? store?.sourceExists(displayName: n) ?? false : store?.pageExists(title: n) ?? false })" }
-            .joined(separator: "\n")
-        return "\(body)\n\n---\n\n\(footnotes)"
     }
 }
 

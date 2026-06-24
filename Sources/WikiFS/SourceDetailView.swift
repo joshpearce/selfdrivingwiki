@@ -40,6 +40,12 @@ struct SourceDetailView: View {
     /// Quote to highlight in the PDF view, set when a `[[source:Name#"…"]]` link
     /// targets an un-extracted PDF. Consumed from `store.pendingScrollAnchor`.
     @State private var pdfQuote: String?
+    /// Sources larger than this (KB) render in the web reader automatically —
+    /// its windowed layout avoids the native reader's whole-document layout
+    /// freeze on large docs; smaller sources use the native reader (better
+    /// selection / links / anchors for the common case). Tunable via
+    /// `defaults write` (set very high to effectively disable).
+    @AppStorage("reader.webThresholdKB") private var webThresholdKB: Int = 96
 
     private enum FileContentTab: String, CaseIterable {
         case markdown = "Markdown"
@@ -350,10 +356,19 @@ struct SourceDetailView: View {
                 .zoomShortcuts($editorZoom)
                 .zoomScroll($editorZoom)
         } else if let head = headVersion {
-            MarkdownPreview(store: store, markdown: head.content,
-                            currentSelection: store.selection)
-                .zoomShortcuts($readerZoom)
-                .zoomScroll($readerZoom)
+            // Web reader when forced on, or automatically for large sources
+            // (its windowed layout avoids the native reader's layout freeze).
+            let useWeb = head.content.utf8.count > webThresholdKB * 1024
+            if useWeb {
+                SourceWebView(markdown: head.content,
+                              currentSelection: store.selection,
+                              store: store)
+            } else {
+                MarkdownPreview(store: store, markdown: head.content,
+                                currentSelection: store.selection)
+                    .zoomShortcuts($readerZoom)
+                    .zoomScroll($readerZoom)
+            }
         } else {
             ContentUnavailableView {
                 Label("No Processed Markdown", systemImage: "doc.plaintext")
