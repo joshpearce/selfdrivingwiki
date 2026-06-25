@@ -40,11 +40,12 @@ done, and the trailing panel behaves like the leading sidebar.
   placeholder, waiting text, sidebar tooltip, send-error). The Anthropic PDF-
   extraction backend and the Claude CLI / prompt-help references stay "Claude"
   (they name the actual product).
-- **Status consolidation.** `AgentRunBanner` moved to the top of the activity
-  sidebar (display-only, turn-aware via `isAgentActive = isGenerating`); the Stop
-  button lives in the Agent Activity section, gated on `isRunning` so an idle
-  interactive session can still be ended. Per-page banners above each detail
-  surface were removed. (A toolbar status-button experiment was tried and reverted.)
+- **Status consolidation.** `AgentRunBanner` moved into the activity sidebar's
+  Agent Activity section (under its label, display-only and turn-aware via
+  `isAgentActive = isGenerating`); the Stop button lives in that section, gated on
+  `isRunning` so an idle interactive session can still be ended. Per-page banners
+  above each detail surface were removed. (A toolbar status-button experiment was
+  tried and reverted.)
 - **Edit-button reason.** The disabled Edit button on the page / system-prompt
   surfaces now reads "Agent updating wiki…" while a run holds the edit lock, so
   it's clear why editing is paused (was a bare disabled "Edit").

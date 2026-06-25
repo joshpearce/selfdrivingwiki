@@ -16,7 +16,6 @@ struct AgentTranscriptSidebar: View {
         HStack(alignment: .top, spacing: 0) {
             widthResizeHandle
             VStack(alignment: .leading, spacing: 0) {
-                AgentRunBanner(isVisible: isAgentActive, kind: launcher.runningKind)
                 header
                 Divider().opacity(PageEditorMetrics.dividerOpacity)
                 if showsConversion {
@@ -207,6 +206,7 @@ struct AgentTranscriptSidebar: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            AgentRunBanner(isVisible: isAgentActive, kind: launcher.runningKind)
             AgentActivityView(launcher: launcher, showsInternals: showsInternals)
         }
     }
