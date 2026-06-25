@@ -176,6 +176,39 @@ struct AnchorBlockTests {
         #expect(id == "p1")
     }
 
+    // MARK: - resolveAnchor(occurrence:) — find-bar next/prev navigation
+
+    @Test func resolveAnchorOccurrenceFirstMatchesFirstBlock() {
+        let blocks = AnchorBlock.parse("# Intro\n\nThe cat sat. The cat napped.")
+        let id = resolveAnchor("cat", occurrence: 1, in: blocks)
+        #expect(id == "p1")
+    }
+
+    @Test func resolveAnchorOccurrenceStaysInSameBlock() {
+        // Both "cat" occurrences are in the same paragraph, so occurrence 2
+        // still resolves to p1.
+        let blocks = AnchorBlock.parse("# Intro\n\nThe cat sat. The cat napped.")
+        #expect(resolveAnchor("cat", occurrence: 2, in: blocks) == "p1")
+    }
+
+    @Test func resolveAnchorOccurrenceStepsToNextBlock() {
+        let blocks = AnchorBlock.parse("# Intro\n\nThe cat sat.\n\nThe cat napped.")
+        #expect(resolveAnchor("cat", occurrence: 1, in: blocks) == "p1")
+        #expect(resolveAnchor("cat", occurrence: 2, in: blocks) == "p2")
+    }
+
+    @Test func resolveAnchorOccurrenceZeroReturnsNil() {
+        let blocks = AnchorBlock.parse("# Intro\n\nThe cat sat.")
+        #expect(resolveAnchor("cat", occurrence: 0, in: blocks) == nil)
+    }
+
+    @Test func resolveAnchorOccurrenceBeyondCountFallsBack() {
+        // Only one "cat" total; occurrence 5 falls back to the only matching
+        // block (p1) rather than nil, so the view still lands somewhere useful.
+        let blocks = AnchorBlock.parse("# Intro\n\nThe cat sat.")
+        #expect(resolveAnchor("cat", occurrence: 5, in: blocks) == "p1")
+    }
+
     // MARK: - Regression: anchors parse the RAW markdown (#1 dedupe)
     // MarkdownPreview's consume task now parses the RAW markdown instead of the
     // fully preprocessed (footnote-expanded + linkified) string, to avoid

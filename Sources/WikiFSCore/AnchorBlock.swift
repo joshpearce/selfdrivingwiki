@@ -169,6 +169,62 @@ public func resolveAnchor(_ fragment: String, in blocks: [AnchorBlock]) -> Strin
     return nil
 }
 
+// MARK: - Find-bar match resolution (occurrence-aware)
+
+/// Resolve a find-bar match to its anchor block, accounting for match order.
+/// `occurrence` is 1-based — which match, in document order, to scroll to.
+///
+/// Unlike the single-match `resolveAnchor`, this walks blocks counting
+/// non-overlapping matches so next/previous navigation steps through distinct
+/// blocks instead of always landing on the first one that contains the text.
+public func resolveAnchor(
+    _ fragment: String,
+    occurrence: Int,
+    in blocks: [AnchorBlock]
+) -> String? {
+    guard occurrence > 0 else { return nil }
+    let needle = fragment.wikiNormalized.lowercased()
+    guard !needle.isEmpty else { return nil }
+
+    // A heading slug is unique, so it can only ever be the first match.
+    if occurrence == 1 {
+        let slug = fragment.wikiNormalized
+        if let h = blocks.first(where: { $0.kind == .heading && $0.id == slug }) {
+            return h.id
+        }
+    }
+
+    // Walk blocks in document order, accumulating non-overlapping
+    // case-insensitive occurrences until we reach the target one.
+    var seen = 0
+    var firstMatching: String?
+    for block in blocks {
+        let c = countOccurrences(of: needle, in: block.text.wikiNormalized.lowercased())
+        if c > 0, firstMatching == nil { firstMatching = block.id }
+        seen += c
+        if seen >= occurrence {
+            return block.id
+        }
+    }
+    // Occurrence overshoots the block-level count (match straddles a block
+    // boundary, or rendered-text normalization differs from the raw content the
+    // find bar searched) — fall back to the first block that held any match.
+    return firstMatching
+}
+
+/// Count non-overlapping, case-sensitive occurrences of `needle` in `haystack`.
+private func countOccurrences(of needle: String, in haystack: String) -> Int {
+    guard !needle.isEmpty else { return 0 }
+    var count = 0
+    var searchStart = haystack.startIndex
+    while searchStart < haystack.endIndex,
+          let range = haystack.range(of: needle, range: searchStart..<haystack.endIndex) {
+        count += 1
+        searchStart = range.upperBound
+    }
+    return count
+}
+
 // MARK: - wikiNormalized (shared with WikiText)
 
 extension String {

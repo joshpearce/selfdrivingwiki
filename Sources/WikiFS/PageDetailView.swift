@@ -14,6 +14,10 @@ struct PageDetailView: View {
     @AppStorage("editor.zoom") private var editorZoom = Double(ZoomScale.defaultScale)
     @AppStorage("reader.zoom") private var readerZoom = Double(ZoomScale.defaultScale)
 
+    // Find bar state.
+    @State private var findModel = FindModel()
+    @State private var findVersion = 0
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             AgentRunBanner(isVisible: store.isAgentRunning)
@@ -82,7 +86,8 @@ struct PageDetailView: View {
             } else {
                 MarkdownPreview(store: store, markdown: readerMarkdown,
                                 currentSelection: store.selection,
-                                fileProvider: fileProvider)
+                                fileProvider: fileProvider,
+                                findText: findText, findVersion: findVersion, findOccurrence: findOccurrence)
                     .frame(maxWidth: .infinity)
                     .frame(minHeight: PageEditorMetrics.previewMinHeight)
                     .zoomShortcuts($readerZoom)
@@ -98,9 +103,59 @@ struct PageDetailView: View {
         .onChange(of: store.isAgentRunning) { _, isRunning in
             if isRunning { isEditing = false }
         }
+        .background { findShortcutButton }
+        .overlay(alignment: .top) { findBarOverlay }
+        .onChange(of: store.selection) { findModel.dismiss() }
+        .onChange(of: readerMarkdown) { _, newMarkdown in
+            findModel.content = newMarkdown
+            findModel.search()
+        }
+        .onChange(of: findModel.isShowing) { _, showing in
+            if showing {
+                findModel.content = readerMarkdown
+                findModel.search()
+            }
+        }
+        .onChange(of: findModel.currentMatchIndex) { _, _ in
+            guard findModel.currentMatchIndex > 0 else { return }
+            findVersion &+= 1
+        }
+    }
+
+    // MARK: - Find bar
+
+    @ViewBuilder
+    private var findBarOverlay: some View {
+        if findModel.isShowing {
+            VStack(spacing: 0) {
+                FindBarView(model: findModel)
+                Divider()
+            }
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+
+    private var findShortcutButton: some View {
+        Button("") { findModel.toggle() }
+            .keyboardShortcut("f", modifiers: .command)
+            .opacity(0).allowsHitTesting(false)
     }
 
     // MARK: - Computed
+
+    private var findText: String? {
+        guard findModel.isShowing,
+              let content = findModel.content,
+              findModel.currentMatchIndex > 0,
+              findModel.currentMatchIndex <= findModel.matches.count
+        else { return nil }
+        let range = findModel.matches[findModel.currentMatchIndex - 1]
+        return String(content[range])
+    }
+
+    /// 1-based current match index, forwarded to the reader so next/previous
+    /// navigation targets distinct occurrences instead of always the first.
+    private var findOccurrence: Int { findModel.currentMatchIndex }
 
     private var displayTitle: String {
         store.draftTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
