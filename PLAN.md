@@ -69,6 +69,7 @@ load-bearing for the app to function.
 | [`SWIFTUI-RULES.md`](SWIFTUI-RULES.md) | Hard-won SwiftUI/macOS rules. Apply when writing or reviewing any view. |
 | [`CLAUDE.md`](CLAUDE.md) | Working agreement (docs, skills to use, PR rules). |
 | [`ISSUES.md`](ISSUES.md) | Known limitations we've chosen to live with (with context to revisit), e.g. the ~5s replicated-File-Provider read-after-write window. |
+| [`plans/sandbox-agent.md`](plans/sandbox-agent.md) | **Agent seatbelt sandbox.** Confines the spawned agent's filesystem WRITES to a strict allowlist (per-run scratch dir + active wiki DB) via macOS's seatbelt (`sandbox-exec`). Provider-agnostic, macOS 15+, opt-in. Reads/network/exec stay open; the provider's config/temp are relocated into the scratch dir. Default-deny writes → no backdoors, no credential tampering, cross-wiki DB confinement. |
 
 ## Status
 
@@ -86,6 +87,16 @@ features below are merged to `main` (single-branch repo, ready for developer
 handoff). 341 tests green; clean signed bundle (app + appex + `wikictl`).**
 
 **Post-completion features (also on `main`):**
+- **Agent seatbelt sandbox (write whitelist)** — opt-in (Settings → Agent → Sandbox)
+  confines the spawned agent's filesystem WRITES to a strict allowlist via macOS's
+  seatbelt (`sandbox-exec`): only the per-run scratch dir + the active wiki's SQLite DB
+  (+ `-wal`/`-shm`/`-journal`) are writable; reads/network/exec stay open. Provider-
+  agnostic (wraps any `AgentCommandConfig` executable). The provider's config/temp are
+  relocated into the scratch dir (`CLAUDE_CONFIG_DIR`, `TMPDIR`). Default-deny writes
+  → no backdoors/credential-tampering, and cross-wiki DB confinement for free. Off by
+  default (byte-identical runs until toggled). New `SandboxConfig` / `SandboxProfile`;
+  `OperationCommand` gains a `sandbox:` param. 19 new tests (989 green). See
+  `plans/sandbox-agent.md`.
 - **File filter + batch ingest** — the Files section has a filter picker
   (All / Ready / Ingested) and a "Select…" button that enables batch mode with
   checkboxes. Selected files are ingested in a SINGLE agent run — all sources staged
