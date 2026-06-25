@@ -2,6 +2,53 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-24 — Find bar (⌘F) with next/prev navigation + match highlight
+
+Added a native macOS-style find bar (driven by a `FindModel` `@Observable`)
+overlaid at the top of every reader: search field, live match count
+("2 of 14"), case-sensitivity toggle, prev/next arrows, and ⌘F / Enter /
+Shift+Enter / Esc. It works in both the native `MarkdownPreview` reader and the
+`SourceWebView` (WKWebView) large-source reader, plus both detail views
+(`PageDetailView`, `SourceDetailView`).
+
+**State (`FindModel`).** Holds `query`, `caseSensitive`, `isShowing`, and the
+search results: `matches: [Range<String.Index>]` found by walking the content
+with `range(of:options:)` (case-insensitive by default), plus a 1-based
+`currentMatchIndex`. `nextMatch`/`previousMatch` wrap with modular arithmetic.
+Both detail views feed `content` (the rendered markdown) into the model and
+re-run `search()` on query / case-sensitivity / content changes.
+
+**The bug — forward arrow didn't advance.** The renderers were passed only the
+matched *substring* (`findText`), never *which* occurrence. So:
+- **Native reader:** `resolveAnchor` used `blocks.first(where:)` → always the
+  first block; the highlight (`WikiLinkStylingParser.quoteRange`) always picked
+  the first occurrence (`normalizedHaystack.range(of:)`).
+- **Web reader:** `applyFind` cleared the prior `<mark>` (collapsing the
+  selection) then called `window.find()` once → always re-found the first match.
+
+`currentMatchIndex` was computed correctly but discarded.
+
+**The fix — thread the occurrence index end to end.** Added `findOccurrence`
+(= `currentMatchIndex`) through `PageDetailView` / `SourceDetailView` → both
+readers:
+- **`AnchorBlock.resolveAnchor(_:occurrence:in:)`** (new) walks blocks in
+  document order counting non-overlapping case-insensitive matches, landing on
+  the block holding the Nth (with a fallback to the first matching block if the
+  count overshoots). The single-match `resolveAnchor` is unchanged for
+  URL/quote-anchor callers.
+- **`WikiLinkStylingParser.quoteRange(_:in:occurrence:)`** (new param) finds the
+  Nth non-overlapping occurrence; the parser stores `highlightOccurrence`.
+  `MarkdownPreview` tracks `highlightOccurrence` in `@State`, set alongside
+  `highlightQuote` in the find task.
+- **`SourceWebView.applyFind`** resets the selection to the document start and
+  advances `window.find()` N times so each click steps to a distinct match, with
+  a `surroundContents` fallback for matches spanning element boundaries.
+
+**Tests.** +12 (977 total, 71 suites, 0 failures): occurrence selection in
+`quoteRange` (2nd/3rd/beyond/zero/default), parser highlights the Nth occurrence,
+and occurrence-aware `resolveAnchor` (first, same-block repeat, step-to-next-block,
+zero→nil, beyond-count fallback). On branch `feature/find-bar`.
+
 ## 2026-06-24 — SourceWebView (WKWebView) gets the same "Add as Source" menu
 
 Extended `plans/url-context-menu-add.md` to the WKWebView large-source reader,

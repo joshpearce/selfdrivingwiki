@@ -47,6 +47,10 @@ struct SourceDetailView: View {
     /// `defaults write` (set very high to effectively disable).
     @AppStorage("reader.webThresholdKB") private var webThresholdKB: Int = 96
 
+    // Find bar state.
+    @State private var findModel = FindModel()
+    @State private var findVersion = 0
+
     private enum FileContentTab: String, CaseIterable {
         case markdown = "Markdown"
         case pdf = "PDF"
@@ -73,6 +77,31 @@ struct SourceDetailView: View {
     private var displayName: String {
         file.filename.isEmpty ? "Untitled" : file.filename
     }
+
+    /// The markdown content currently shown (from processed head or native
+    /// markdown source). Used as the find bar's search content.
+    private var currentMarkdownContent: String? {
+        if isEditing { return editBuffer }
+        if let head = headVersion { return head.content }
+        if isMarkdownNative, let data = store.sourceBytes(id: file.id) {
+            return String(data: data, encoding: .utf8)
+        }
+        return nil
+    }
+
+    private var findText: String? {
+        guard findModel.isShowing,
+              let content = findModel.content,
+              findModel.currentMatchIndex > 0,
+              findModel.currentMatchIndex <= findModel.matches.count
+        else { return nil }
+        let range = findModel.matches[findModel.currentMatchIndex - 1]
+        return String(content[range])
+    }
+
+    /// 1-based current match index, forwarded to the reader so next/previous
+    /// navigation targets distinct occurrences instead of always the first.
+    private var findOccurrence: Int { findModel.currentMatchIndex }
 
     private var alreadyIngested: Bool { hasBeenIngested }
 
@@ -136,6 +165,23 @@ struct SourceDetailView: View {
         .onChange(of: store.selection) { flushEditIfDirty(); isEditing = false }
         .onChange(of: store.isAgentRunning) {
             if $1 { flushEditIfDirty(); isEditing = false }
+        }
+        .background { findShortcutButton }
+        .overlay(alignment: .top) { findBarOverlay }
+        .onChange(of: file.id) { findModel.dismiss() }
+        .onChange(of: currentMarkdownContent) { _, newContent in
+            findModel.content = newContent
+            findModel.search()
+        }
+        .onChange(of: findModel.isShowing) { _, showing in
+            if showing {
+                findModel.content = currentMarkdownContent
+                findModel.search()
+            }
+        }
+        .onChange(of: findModel.currentMatchIndex) { _, _ in
+            guard findModel.currentMatchIndex > 0 else { return }
+            findVersion &+= 1
         }
     }
 
@@ -362,10 +408,12 @@ struct SourceDetailView: View {
             if useWeb {
                 SourceWebView(markdown: head.content,
                               currentSelection: store.selection,
-                              store: store)
+                              store: store,
+                              findText: findText, findVersion: findVersion, findOccurrence: findOccurrence)
             } else {
                 MarkdownPreview(store: store, markdown: head.content,
-                                currentSelection: store.selection)
+                                currentSelection: store.selection,
+                                findText: findText, findVersion: findVersion, findOccurrence: findOccurrence)
                     .zoomShortcuts($readerZoom)
                     .zoomScroll($readerZoom)
             }
@@ -517,6 +565,25 @@ struct SourceDetailView: View {
         if file.mimeType == "application/pdf" { return "doc.richtext" }
         if let mime = file.mimeType, mime.hasPrefix("text/") { return "doc.plaintext" }
         return "doc"
+    }
+
+    // MARK: - Find bar
+
+    @ViewBuilder
+    private var findBarOverlay: some View {
+        if findModel.isShowing {
+            VStack(spacing: 0) {
+                FindBarView(model: findModel)
+                Divider()
+            }
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+
+    private var findShortcutButton: some View {
+        Button("") { findModel.toggle() }
+            .keyboardShortcut("f", modifiers: .command)
+            .opacity(0).allowsHitTesting(false)
     }
 
     private static let sizeFormatter: ByteCountFormatter = {

@@ -44,6 +44,9 @@ struct MarkdownPreview: View {
     /// The quote to highlight, set after consuming a `pendingScrollAnchor` with
     /// a `#"quoted passage"` fragment. Nil when there's no active highlight.
     @State private var highlightQuote: String?
+    /// Occurrence (1-based) of `highlightQuote` to highlight — tracks find-bar
+    /// navigation so the highlight steps through successive matches.
+    @State private var highlightOccurrence: Int = 1
     /// Bumped each time `highlightQuote` changes. Used in the versioned markup
     /// to force `StructuredText` to re-parse without changing its view identity.
     @State private var highlightVersion: Int = 0
@@ -51,6 +54,15 @@ struct MarkdownPreview: View {
     /// `ContentView` so the right-click "Add as Source" item works in every
     /// reader (pages, sources, system prompt, changelog) without per-view wiring.
     @Environment(\.addURLHandler) private var addURLHandler
+
+    /// When set, scrolls to the anchor block containing this text and highlights
+    /// it. Bumped by the find bar as the user navigates through matches.
+    var findText: String? = nil
+    var findVersion: Int = 0
+    /// 1-based index of the current match within the content (from
+    /// `FindModel.currentMatchIndex`). Lets the scroll task target the Nth
+    /// occurrence rather than always the first.
+    var findOccurrence: Int = 1
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -70,7 +82,7 @@ struct MarkdownPreview: View {
                         let versioned = highlightVersion > 0
                             ? rendered + String(repeating: "\n", count: highlightVersion)
                             : rendered
-                        StructuredText(versioned, parser: WikiLinkStylingParser(highlightQuote: highlightQuote))
+                        StructuredText(versioned, parser: WikiLinkStylingParser(highlightQuote: highlightQuote, highlightOccurrence: highlightOccurrence))
                             .textual.paragraphStyle(NumberedParagraphStyle())
                             .textual.textSelection(.enabled)
                             .textual.fontScale(CGFloat(readerZoom))
@@ -134,6 +146,20 @@ struct MarkdownPreview: View {
                 highlightQuote = nil
                 highlightVersion = 0
             }
+            // Find bar scrolling: resolve the matched text to an anchor block,
+            // scroll to it, then highlight. Task(id:) re-fires on version bumps
+            // so repeated clicks on the same match still scroll.
+            .task(id: FindScrollKey(text: findText, version: findVersion, occurrence: findOccurrence)) {
+                guard let text = findText, !text.isEmpty else { return }
+                blocks = AnchorBlock.parse(markdown)
+                if let id = resolveAnchor(text, occurrence: findOccurrence, in: blocks) {
+                    try? await Task.sleep(for: .milliseconds(50))
+                    proxy.scrollTo(id, anchor: .top)
+                    highlightQuote = text.wikiNormalized
+                    highlightOccurrence = findOccurrence
+                    highlightVersion += 1
+                }
+            }
         }
     }
 
@@ -163,6 +189,14 @@ struct MarkdownPreview: View {
 private struct RenderKey: Hashable {
     let markdown: String
     let anchorVersion: Int
+}
+
+/// Keys the find-scroll task so it re-fires on version bumps (same text,
+/// bumped version = user clicked Next again for the same match).
+private struct FindScrollKey: Hashable {
+    let text: String?
+    let version: Int
+    let occurrence: Int
 }
 
 #Preview {

@@ -28,12 +28,12 @@ import WikiFSCore
 /// parser does not receive. `NSColor.linkColor` is SwiftUI's self-adapting
 /// semantic link color and is visually equivalent to Textual's link blue.
 ///
-/// **Quote highlighting.** When `highlightQuote` is non-nil, the parser finds
-/// the first whitespace-normalized occurrence of the quote in the rendered
-/// markdown and sets its `.backgroundColor` — exactly the same normalization
-/// `resolveAnchor` uses (`wikiNormalized`). The highlight color is the semantic
-/// Find color (`NSColor.findHighlightColor`), matching native macOS reader
-/// behavior.
+/// **Quote highlighting.** When `highlightQuote` is non-nil, the parser finds the
+/// whitespace-normalized occurrence of the quote (selected by
+/// `highlightOccurrence`, 1-based) in the rendered markdown and sets its
+/// `.backgroundColor` — exactly the same normalization `resolveAnchor` uses
+/// (`wikiNormalized`). The highlight color is the semantic Find color
+/// (`NSColor.findHighlightColor`), matching native macOS reader behavior.
 @MainActor
 struct WikiLinkStylingParser: MarkupParser {
     private let base: AttributedStringMarkdownParser = .init(baseURL: nil)
@@ -41,9 +41,14 @@ struct WikiLinkStylingParser: MarkupParser {
     /// An optional quote to highlight in the rendered output. Whitespace-normalized
     /// before matching (mirrors `wikiNormalized`). `nil` → no highlight.
     private let highlightQuote: String?
+    /// 1-based occurrence of the quote to highlight — lets find-bar next/previous
+    /// navigation step the highlight through distinct matches instead of always
+    /// highlighting the first one.
+    private let highlightOccurrence: Int
 
-    init(highlightQuote: String? = nil) {
+    init(highlightQuote: String? = nil, highlightOccurrence: Int = 1) {
         self.highlightQuote = highlightQuote
+        self.highlightOccurrence = max(1, highlightOccurrence)
     }
 
     func attributedString(for input: String) throws -> AttributedString {
@@ -81,7 +86,7 @@ struct WikiLinkStylingParser: MarkupParser {
     /// Uses a dynamic color that adapts to light/dark mode: the system Find color in
     /// light mode, and a lower-opacity warm tint in dark mode so white text stays readable.
     private func highlightQuote(_ quote: String, in string: inout AttributedString) {
-        guard let range = Self.quoteRange(quote, in: string) else { return }
+        guard let range = Self.quoteRange(quote, in: string, occurrence: highlightOccurrence) else { return }
         string[range].backgroundColor = Self.highlightColor
     }
 
@@ -102,15 +107,18 @@ struct WikiLinkStylingParser: MarkupParser {
 
     // MARK: - Pure, testable quote range
 
-    /// Find the first whitespace-normalized occurrence of `quote` in `string`,
-    /// returning the original `AttributedString` range, or `nil` on no match.
+    /// Find the whitespace-normalized occurrence `occurrence` (1-based) of `quote`
+    /// in `string`, returning the original `AttributedString` range, or `nil` on no
+    /// match.
     ///
     /// Whitespace in `string` is collapsed to single spaces (mirrors
     /// `wikiNormalized`), then an index map translates the normalized match
     /// bounds back to the original `AttributedString.Index` positions. The match
-    /// is case-sensitive and always picks the first occurrence.
-    static func quoteRange(_ quote: String, in string: AttributedString) -> Range<AttributedString.Index>? {
-        guard !quote.isEmpty else { return nil }
+    /// is case-sensitive; `occurrence` selects which non-overlapping match to use
+    /// (defaulting to the first), so find-bar navigation can step the highlight
+    /// through successive matches.
+    static func quoteRange(_ quote: String, in string: AttributedString, occurrence: Int = 1) -> Range<AttributedString.Index>? {
+        guard !quote.isEmpty, occurrence > 0 else { return nil }
 
         let chars = string.characters
         guard !chars.isEmpty else { return nil }
@@ -142,7 +150,20 @@ struct WikiLinkStylingParser: MarkupParser {
         while normalizedChars.last == " " { normalizedChars.removeLast(); indexMap.removeLast() }
 
         let normalizedHaystack = String(normalizedChars)
-        guard let matchRange = normalizedHaystack.range(of: quote) else { return nil }
+
+        // Find the Nth non-overlapping occurrence of quote.
+        var remaining = occurrence
+        var searchStart = normalizedHaystack.startIndex
+        var matchRange: Range<String.Index>?
+        while searchStart < normalizedHaystack.endIndex {
+            guard let r = normalizedHaystack.range(of: quote, range: searchStart..<normalizedHaystack.endIndex) else {
+                break
+            }
+            remaining -= 1
+            if remaining == 0 { matchRange = r; break }
+            searchStart = r.upperBound
+        }
+        guard let matchRange else { return nil }
 
         // Convert String.Index offsets in the normalized haystack to array indices.
         let lo = normalizedHaystack.distance(from: normalizedHaystack.startIndex, to: matchRange.lowerBound)

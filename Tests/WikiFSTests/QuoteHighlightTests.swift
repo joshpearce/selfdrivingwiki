@@ -104,6 +104,66 @@ struct QuoteHighlightTests {
         #expect(range.lowerBound == attributed.startIndex)
     }
 
+    // MARK: - quoteRange: occurrence selection (find-bar next/prev navigation)
+
+    @Test func occurrenceDefaultsToFirst() throws {
+        let input = "cat dog cat dog"
+        let attributed = try attributedString(input)
+        let range = try #require(WikiLinkStylingParser.quoteRange("cat", in: attributed))
+        let offset = attributed.characters.distance(from: attributed.startIndex, to: range.lowerBound)
+        #expect(offset == 0)
+    }
+
+    @Test func occurrencePicksSecond() throws {
+        let input = "cat dog cat dog"
+        let attributed = try attributedString(input)
+        let range = try #require(WikiLinkStylingParser.quoteRange("cat", in: attributed, occurrence: 2))
+        let matched = String(attributed[range].characters)
+        #expect(matched == "cat")
+        let offset = attributed.characters.distance(from: attributed.startIndex, to: range.lowerBound)
+        #expect(offset == 8)
+    }
+
+    @Test func occurrencePicksThird() throws {
+        let input = "cat cat cat"
+        let attributed = try attributedString(input)
+        let range = try #require(WikiLinkStylingParser.quoteRange("cat", in: attributed, occurrence: 3))
+        let offset = attributed.characters.distance(from: attributed.startIndex, to: range.lowerBound)
+        #expect(offset == 8)
+    }
+
+    @Test func occurrenceBeyondCountReturnsNil() throws {
+        let attributed = try attributedString("only one match here")
+        #expect(WikiLinkStylingParser.quoteRange("match", in: attributed, occurrence: 5) == nil)
+    }
+
+    @Test func occurrenceZeroReturnsNil() throws {
+        let attributed = try attributedString("cat cat")
+        #expect(WikiLinkStylingParser.quoteRange("cat", in: attributed, occurrence: 0) == nil)
+    }
+
+    // MARK: - Integration: parser highlights the Nth occurrence
+
+    @Test func parserHighlightsNthOccurrence() throws {
+        let input = "cat dog cat dog"
+        let parser = WikiLinkStylingParser(highlightQuote: "cat", highlightOccurrence: 2)
+        let attributed = try parser.attributedString(for: input)
+        let bgRuns = attributed.runs.filter { $0.backgroundColor != nil }
+        let highlighted = try #require(bgRuns.first)
+        let text = String(attributed[highlighted.range].characters)
+        #expect(text == "cat")
+        let offset = attributed.characters.distance(from: attributed.startIndex, to: highlighted.range.lowerBound)
+        #expect(offset == 8)
+    }
+
+    @Test func parserDefaultOccurrenceHighlightsFirst() throws {
+        let parser = WikiLinkStylingParser(highlightQuote: "cat")
+        let attributed = try parser.attributedString(for: "cat dog cat dog")
+        let highlighted = try #require(attributed.runs.first { $0.backgroundColor != nil })
+        let offset = attributed.characters.distance(from: attributed.startIndex, to: highlighted.range.lowerBound)
+        #expect(offset == 0)
+    }
+
     // MARK: - Integration: parser applies backgroundColor
 
     @Test func parserAppliesBackgroundColor() throws {

@@ -39,6 +39,15 @@ struct SourceWebView: View {
     /// (covers re-clicking the same `[[…#"quote"]]` on an already-open source).
     @State private var scrollVersion = 0
 
+    /// Find bar: when set, the matched text is passed to the web view for
+    /// `window.find()` highlighting and scrolling.
+    var findText: String? = nil
+    var findVersion: Int = 0
+    /// 1-based index of the current match (`FindModel.currentMatchIndex`).
+    /// `applyFind` advances `window.find()` this many times so next/previous
+    /// navigation lands on distinct matches instead of always the first.
+    var findOccurrence: Int = 1
+
     var body: some View {
         ZStack {
             WebViewRep(markdown: markdown,
@@ -46,7 +55,8 @@ struct SourceWebView: View {
                        isLoading: $isLoading,
                        pendingScroll: pendingScroll,
                        scrollVersion: scrollVersion,
-                       addURLHandler: addURLHandler)
+                       addURLHandler: addURLHandler,
+                       findText: findText, findVersion: findVersion, findOccurrence: findOccurrence)
             if isLoading {
                 ProgressView()
                     .controlSize(.large)
@@ -250,6 +260,9 @@ private struct WebViewRep: NSViewRepresentable {
     let pendingScroll: PendingScroll?
     let scrollVersion: Int
     let addURLHandler: ((String) -> Void)?
+    let findText: String?
+    let findVersion: Int
+    let findOccurrence: Int
 
     func makeNSView(context: Context) -> SourceDetailWebView {
         let webView = SourceDetailWebView(frame: .zero, configuration: WKWebViewConfiguration())
@@ -273,6 +286,13 @@ private struct WebViewRep: NSViewRepresentable {
         } else {
             context.coordinator.applyPendingScrollIfNeeded(in: webView)
         }
+        // Find: apply to the loaded page.
+        if context.coordinator.appliedFindVersion != findVersion {
+            context.coordinator.appliedFindVersion = findVersion
+            if let text = findText, !text.isEmpty {
+                context.coordinator.applyFind(text, occurrence: findOccurrence, in: webView)
+            }
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -286,6 +306,7 @@ private struct WebViewRep: NSViewRepresentable {
         var pendingScroll: PendingScroll?
         var pendingScrollVersion = 0
         var appliedScrollVersion = 0
+        var appliedFindVersion = 0
         private var convertTask: Task<Void, Never>?
         private var loadStart: DispatchTime?
         private var isLoadingBinding: Binding<Bool>?
@@ -325,6 +346,51 @@ private struct WebViewRep: NSViewRepresentable {
                   appliedScrollVersion != pendingScrollVersion else { return }
             appliedScrollVersion = pendingScrollVersion
             WebViewRep.apply(target, in: webView)
+        }
+
+        /// Highlight and scroll to the find match using `window.find()`.
+        /// `occurrence` is 1-based: the selection is reset to the document start
+        /// and `window.find()` is advanced that many times, so repeated next/prev
+        /// clicks step through distinct matches instead of re-finding the first.
+        func applyFind(_ text: String, occurrence: Int, in webView: WKWebView) {
+            guard pageLoaded else { return }
+            let q = WebViewRep.jsString(text)
+            let n = max(1, occurrence)
+            webView.evaluateJavaScript("""
+            (function(q, n){
+              // Clear any previous highlight, collapsing the selection.
+              document.querySelectorAll("mark.sdwhl").forEach(function(m){
+                var p=m.parentNode; while(m.firstChild) p.insertBefore(m.firstChild,m);
+                p.removeChild(m); p.normalize();
+              });
+              // Reset the selection to the start of the body so window.find()
+              // walks matches in order from the top — making occurrence N
+              // deterministic instead of resuming from the previous highlight.
+              var sel=window.getSelection();
+              sel.removeAllRanges();
+              var body=document.body;
+              if(body){
+                var r0=document.createRange();
+                r0.setStart(body,0);
+                r0.collapse(true);
+                sel.addRange(r0);
+              }
+              // Advance forward N times to land on the requested occurrence.
+              for(var i=0;i<n;i++){ window.find(q,false,false,false,false); }
+              if(sel.rangeCount>0 && !sel.isCollapsed){
+                var r=sel.getRangeAt(0); var mark=document.createElement("mark");
+                mark.className="sdwhl";
+                try{ r.surroundContents(mark); }catch(e){
+                  // surroundContents fails across element boundaries; fall back
+                  // to a plain node at the selection start and scroll to it.
+                  mark.appendChild(document.createTextNode(q));
+                  r.insertNode(mark);
+                }
+                var mk=document.querySelector("mark.sdwhl");
+                if(mk){ mk.scrollIntoView({block:"center"}); }
+              }
+            })("\(q)", \(n));
+            """)
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
