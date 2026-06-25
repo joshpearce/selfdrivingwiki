@@ -59,6 +59,7 @@ public enum ClaudePromptHelp {
   }
 
   public static var commandTemplate: String {
+    let sandbox = currentSandboxInvocation()
     let command = OperationCommand.build(
       operation: curatedIngest,
       wikiRoot: wikiRootPlaceholder,
@@ -68,18 +69,59 @@ public enum ClaudePromptHelp {
       wikictlDirectory: wikictlDirectoryPlaceholder,
       resolvedExecutable: "claude",
       command: AgentCommandConfig.default,
+      sandbox: sandbox,
       baseEnvironment: ["PATH": "<inherited PATH>"])
 
-    return """
-      cwd: \(command.currentDirectoryPath)
-      env:
-        WIKI_ROOT=\(command.environment["WIKI_ROOT"] ?? "")
-        WIKI_DB=\(command.environment["WIKI_DB"] ?? "")
-        PATH=\(command.environment["PATH"] ?? "")
+    var envPairs: [(String, String)] = [
+      ("WIKI_ROOT", command.environment["WIKI_ROOT"] ?? ""),
+      ("WIKI_DB", command.environment["WIKI_DB"] ?? ""),
+      ("PATH", command.environment["PATH"] ?? ""),
+    ]
+    // When sandboxed, the relocation env is part of the real invocation surface.
+    if sandbox != nil {
+      envPairs.append(("CLAUDE_CONFIG_DIR", command.environment["CLAUDE_CONFIG_DIR"] ?? ""))
+      envPairs.append(("TMPDIR", command.environment["TMPDIR"] ?? ""))
+    }
 
-      argv:
-      \(renderCommand(command))
-      """
+    // Build explicitly (no multi-line literal) so the dynamic env list has consistent
+    // indentation regardless of how many keys are present.
+    var lines: [String] = []
+    lines.append("cwd: \(command.currentDirectoryPath)")
+    lines.append("env:")
+    for (key, value) in envPairs {
+      lines.append("    \(key)=\(value)")
+    }
+    lines.append("")
+    lines.append("argv:")
+    lines.append(renderCommandTemplate(command))
+    return lines.joined(separator: "\n")
+  }
+
+  /// The seatbelt sandbox invocation that reflects the user's current SandboxConfig
+  /// (loaded from the App Group container), built with placeholder paths so the Help
+  /// → Command Template previews the real argv shape. `nil` when the sandbox is off.
+  private static func currentSandboxInvocation() -> SandboxProfile.SandboxInvocation? {
+    guard let dir = try? DatabaseLocation.appGroupContainerDirectory() else { return nil }
+    let config = SandboxConfig.load(from: dir)
+    guard config.enabled else { return nil }
+    return SandboxProfile.invocation(
+      homePath: "<HOME>",
+      scratchDir: scratchDirectoryPlaceholder,
+      wikiDBPath: "<container>/\(wikiIDPlaceholder).sqlite",
+      extraAllowedPaths: config.parsedExtraAllowedPaths())
+  }
+
+  /// Render the argv for the Command Template, abbreviating the (long) seatbelt
+  /// profile string to `<profile>` for legibility when the run is sandboxed.
+  private static func renderCommandTemplate(_ command: OperationCommand) -> String {
+    var parts = [command.executable] + command.arguments
+    if command.executable == OperationCommand.sandboxExecutable,
+       let pIndex = parts.firstIndex(of: "-p"),
+       pIndex + 1 < parts.count {
+      // The first `-p` is sandbox-exec's profile arg (it precedes `-D` / `--`).
+      parts[pIndex + 1] = "<profile>"
+    }
+    return parts.map(shellQuoted).joined(separator: " \\\n  ")
   }
 
   private static var tinyIngest: WikiOperation {
