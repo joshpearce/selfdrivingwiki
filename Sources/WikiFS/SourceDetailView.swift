@@ -75,7 +75,7 @@ struct SourceDetailView: View {
     }
 
     private var displayName: String {
-        file.filename.isEmpty ? "Untitled" : file.filename
+        file.displayName ?? (file.filename.isEmpty ? "Untitled" : file.filename)
     }
 
     /// The markdown content currently shown (from processed head or native

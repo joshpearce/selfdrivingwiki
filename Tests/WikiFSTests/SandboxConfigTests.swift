@@ -1,0 +1,93 @@
+import Foundation
+import Testing
+@testable import WikiFSCore
+
+/// Tests for the seatbelt sandbox config — load/save round-trip, missing/corrupt →
+/// default, and the extra-allowed-paths parser (tilde expansion, blanks, relative
+/// drop). Mirrors `AgentCommandConfigTests`.
+struct SandboxConfigTests {
+
+  // MARK: - Defaults
+
+  @Test func defaultIsDisabledWithEmptyAllowedPaths() {
+    let config = SandboxConfig.default
+    #expect(config.enabled == false)
+    #expect(config.extraAllowedPaths == "")
+  }
+
+  @Test func defaultFileNameIsStable() {
+    #expect(SandboxConfig.fileName == "sandbox-config.json")
+  }
+
+  // MARK: - Persistence
+
+  @Test func roundTripsThroughJSON() throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sbconfig-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let original = SandboxConfig(enabled: true, extraAllowedPaths: "/tmp/one\n/tmp/two")
+    try original.save(to: dir)
+
+    let loaded = SandboxConfig.load(from: dir)
+    #expect(loaded == original)
+    #expect(loaded.enabled == true)
+    #expect(loaded.extraAllowedPaths == "/tmp/one\n/tmp/two")
+  }
+
+  @Test func missingFileDegradesToDefault() {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sbconfig-missing-\(UUID().uuidString)")
+    let loaded = SandboxConfig.load(from: dir)
+    #expect(loaded == .default)
+    #expect(loaded.enabled == false)
+  }
+
+  @Test func corruptFileDegradesToDefault() throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sbconfig-corrupt-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let url = dir.appendingPathComponent(SandboxConfig.fileName, isDirectory: false)
+    try "{ this is not valid json".data(using: .utf8)!.write(to: url)
+
+    let loaded = SandboxConfig.load(from: dir)
+    #expect(loaded == .default)
+    #expect(loaded.enabled == false)
+  }
+
+  // MARK: - parsedExtraAllowedPaths
+
+  @Test func parsesAbsolutePathsOnePerLine() {
+    let config = SandboxConfig(enabled: true, extraAllowedPaths: "/tmp/a\n/tmp/b\n/tmp/c")
+    #expect(config.parsedExtraAllowedPaths() == ["/tmp/a", "/tmp/b", "/tmp/c"])
+  }
+
+  @Test func skipsBlankAndWhitespaceOnlyLines() {
+    let config = SandboxConfig(enabled: true, extraAllowedPaths: "/tmp/a\n\n   \n/tmp/b")
+    #expect(config.parsedExtraAllowedPaths() == ["/tmp/a", "/tmp/b"])
+  }
+
+  @Test func expandsLeadingTilde() {
+    let config = SandboxConfig(enabled: true, extraAllowedPaths: "~/Documents\n~/.cache")
+    let paths = config.parsedExtraAllowedPaths()
+    #expect(paths.count == 2)
+    // Both must be absolute after expansion.
+    #expect(paths.allSatisfy { $0.hasPrefix("/") })
+    #expect(paths.contains { $0.hasSuffix("/Documents") })
+    #expect(paths.contains { $0.hasSuffix("/.cache") })
+  }
+
+  @Test func dropsRelativeAndUnresolvableEntries() {
+    // A bare `~` that fails to expand stays as `~` (not absolute) → dropped.
+    // Relative paths are dropped. Absolute paths survive.
+    let config = SandboxConfig(
+      enabled: true,
+      extraAllowedPaths: "relative/path\n/tmp/ok\n~/ok-sub")
+    let paths = config.parsedExtraAllowedPaths()
+    #expect(paths.contains("/tmp/ok"))
+    // `~/ok-sub` expands to an absolute path.
+    #expect(paths.contains { $0.hasSuffix("/ok-sub") })
+    // The relative entry never survives.
+    #expect(!paths.contains("relative/path"))
+  }
+}

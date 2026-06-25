@@ -42,6 +42,11 @@ public struct OperationCommand: Equatable, Sendable {
     ///     (e.g. `/opt/homebrew/bin/claude`). Preflight happens in AgentLauncher.
     ///   - command: the agent command config (prefix args, model override, extra
     ///     env). Default reproduces today's `claude -p …` exactly.
+    ///   - sandbox: when non-nil, wrap the invocation in `/usr/bin/sandbox-exec`
+    ///     with the seatbelt profile that confines writes to the scratch dir + active
+    ///     wiki DB (`plans/sandbox-agent.md`). Default `nil` reproduces today's run
+    ///     byte-for-byte. The relocation env (`CLAUDE_CONFIG_DIR`, `TMPDIR`) is set
+    ///     only when non-nil; it never clobbers `WIKI_ROOT`/`WIKI_DB`/`PATH`.
     ///   - baseEnvironment: the parent environment to inherit (default the current
     ///     process's). Injected so tests can pin a known PATH.
     public static func build(
@@ -53,6 +58,7 @@ public struct OperationCommand: Equatable, Sendable {
         wikictlDirectory: String,
         resolvedExecutable: String = "claude",
         command: AgentCommandConfig = .default,
+        sandbox: SandboxProfile.SandboxInvocation? = nil,
         baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) -> OperationCommand {
         // User env first, then app-owned keys (authoritative).
@@ -85,9 +91,17 @@ public struct OperationCommand: Equatable, Sendable {
             arguments.append(contentsOf: ["--agents", agentsJSON])
         }
 
-        return OperationCommand(
-            executable: resolvedExecutable,
+        let (executable, wrappedArguments) = applySandbox(
+            to: resolvedExecutable,
             arguments: arguments,
+            environment: &environment,
+            scratchDirectory: scratchDirectory,
+            sandbox: sandbox
+        )
+
+        return OperationCommand(
+            executable: executable,
+            arguments: wrappedArguments,
             environment: environment,
             currentDirectoryPath: scratchDirectory
         )
@@ -105,6 +119,7 @@ public struct OperationCommand: Equatable, Sendable {
         wikictlDirectory: String,
         resolvedExecutable: String = "claude",
         command: AgentCommandConfig = .default,
+        sandbox: SandboxProfile.SandboxInvocation? = nil,
         baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) -> OperationCommand {
         var environment = baseEnvironment
@@ -131,11 +146,53 @@ public struct OperationCommand: Equatable, Sendable {
             "--dangerously-skip-permissions",
         ])
 
-        return OperationCommand(
-            executable: resolvedExecutable,
+        let (executable, wrappedArguments) = applySandbox(
+            to: resolvedExecutable,
             arguments: arguments,
+            environment: &environment,
+            scratchDirectory: scratchDirectory,
+            sandbox: sandbox
+        )
+
+        return OperationCommand(
+            executable: executable,
+            arguments: wrappedArguments,
             environment: environment,
             currentDirectoryPath: scratchDirectory
         )
+    }
+
+    // MARK: - Seatbelt wrapping
+
+    /// The macOS seatbelt executable. Always present at this absolute path on macOS
+    /// 15+ (deprecated but functional; no entitlement needed by an un-sandboxed app).
+    static let sandboxExecutable = "/usr/bin/sandbox-exec"
+
+    /// When `sandbox` is non-nil, rewrite the invocation so the provider runs inside
+    /// `/usr/bin/sandbox-exec -p <profile> -D … -- <provider>`, and relocate the
+    /// provider's own config/temp into the scratch dir so they land inside the
+    /// allowlist. When `nil`, returns the inputs unchanged (byte-identical to a
+    /// pre-sandbox run). Pure; mutates `environment` only to add the relocation keys.
+    private static func applySandbox(
+        to resolvedExecutable: String,
+        arguments: [String],
+        environment: inout [String: String],
+        scratchDirectory: String,
+        sandbox: SandboxProfile.SandboxInvocation?
+    ) -> (executable: String, arguments: [String]) {
+        guard let sandbox else { return (resolvedExecutable, arguments) }
+
+        // Relocate the provider's self-writes into the writable scratch zone so the
+        // profile allowlist stays tiny. These keys are distinct from WIKI_ROOT /
+        // WIKI_DB / PATH, so they don't clobber the app-owned block.
+        environment["CLAUDE_CONFIG_DIR"] = scratchDirectory + "/.claude-config"
+        environment["TMPDIR"] = scratchDirectory + "/.tmp"
+
+        var head: [String] = ["-p", sandbox.profile]
+        for (key, value) in sandbox.defines {
+            head.append(contentsOf: ["-D", "\(key)=\(value)"])
+        }
+        head.append(contentsOf: ["--", resolvedExecutable])
+        return (sandboxExecutable, head + arguments)
     }
 }

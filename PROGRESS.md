@@ -48,6 +48,77 @@ readers:
 `quoteRange` (2nd/3rd/beyond/zero/default), parser highlights the Nth occurrence,
 and occurrence-aware `resolveAnchor` (first, same-block repeat, step-to-next-block,
 zero→nil, beyond-count fallback). On branch `feature/find-bar`.
+## 2026-06-24 — Agent runs without the File Provider mount
+
+The agent (Ingest / Query / Lint + interactive Query) no longer hard-requires a
+mounted File Provider. `fileProvider.path` was a hard gate for Query/Lint/interactive
+(the query conversation bailed with "File Provider is not mounted. Open a wiki
+first."), even though the prompts route ALL reads through `wikictl` (SQLite via
+`WIKI_DB`) and label the mount **reference-only**. Ingest already tolerated a missing
+mount.
+
+- `AgentOperationRunner.run` and `startQueryConversation` now pass
+  `fileProvider.path ?? ""` for every operation (no bail). The mount is still used
+  when available; it's just no longer load-bearing for the agent to start.
+- The closing `WIKI_ROOT` prompt line is now adaptive: when the mount is down it says
+  "File Provider mount is not available for this run — read pages and raw sources via
+  `wikictl` only" (was a dangling empty path). So the agent knows not to read a
+  non-existent mount.
+- Diagnosed live: a `build/`-located app instance can't mount (FP only reliably
+  mounts from the `/Applications` install), which silently blocked every agent op
+  even though the app otherwise worked. This removes that failure mode.
+- Tests: 2 new (`promptsNoteWhenTheMountIsUnavailable`,
+  `promptsKeepTheResolvedMountPathWhenAvailable`); 967 pass.
+
+## 2026-06-24 — Agent seatbelt sandbox (write whitelist)
+
+Implemented `plans/sandbox-agent.md`. Opt-in (off by default) confinement of the
+spawned agent process's filesystem **writes** to a strict allowlist via the macOS
+seatbelt (`/usr/bin/sandbox-exec`). Provider-agnostic; macOS 15+.
+
+- **What's fenced:** when enabled, every agent spawn (Ingest / Query / Lint +
+  interactive Query) runs so the agent AND every child it spawns (`wikictl`, `node`,
+  bash) can write ONLY the per-run scratch dir + the active wiki's `<ulid>.sqlite`
+  (+ `-wal`/`-shm`/`-journal`). Reads, all network, and process exec stay OPEN (the
+  provider still reaches its LLM API and runs `wikictl` unchanged). Default-deny writes
+  → no backdoors/credential-tampering, and cross-wiki DB confinement for free.
+- **Why seatbelt, not Apple Container:** Apple Container needs macOS 26 AND runs a
+  Linux container where the macOS `wikictl` binary cannot run. The seatbelt keeps
+  everything native macOS and is inherited across fork/exec.
+- **Composes around the provider:** the seatbelt wraps whatever
+  `AgentCommandConfig` executable is set (`sandbox-exec -p <profile> -D HOME=… -D
+  SCRATCH_DIR=… -D WIKI_DB=… -- <provider> …`); swapping providers needs no profile
+  change. The profile is **generated in Swift** (`SandboxProfile.generate`, pure) and
+  passed via `sandbox-exec -p`.
+- **Provider self-writes relocated** into the scratch dir (`CLAUDE_CONFIG_DIR`,
+  `TMPDIR`) so the allowlist stays tiny. `WIKI_DB` is NOT conflated: the `-D
+  WIKI_DB=<path>` is a profile param (not in the child env); the `WIKI_DB=<ulid>` env
+  var `wikictl` reads is unchanged.
+- **Byte-identical when off:** `OperationCommand.build`/`buildInteractiveQuery` gained
+  an optional `sandbox: SandboxInvocation? = nil`; nil reproduces today's argv/env
+  exactly. New `SandboxConfig` (`sandbox-config.json`) + `SandboxProfile` mirror the
+  `AgentCommandConfig` config pattern. Settings → Agent has a new "Sandbox" section;
+  Help → Command Template reflects the sandbox when on (profile abbreviated).
+- **Tests:** 19 new (`SandboxConfigTests`, `SandboxProfileTests`,
+  `SandboxedOperationCommandTests` — config round-trip/missing/corrupt, profile
+  skeleton + sidecars + extra-path splicing/tilde/drop, AC.1/AC.2 argv, relocation env
+  present-on/absent-off, prefix-args-after-`--`). 989 tests pass.
+- **Live AC.6 verified:** ran the real generated profile through `/usr/bin/sandbox-exec`
+  — writes inside the scratch dir + to the DB path are ALLOWED; writes to `~/.zshrc` and
+  unrelated dirs are DENIED. This also surfaced and fixed the **symlink trap**: seatbelt
+  `subpath`/`literal` match the canonical path, so a symlinked path (e.g. `/tmp` →
+  `/private/tmp`) makes the allow silently fail. The core layer (`SandboxProfile.invocation`)
+  now canonicalizes the scratch dir, DB path, and every user extra-allowed path with
+  `realpath(3)` — the kernel's own resolver (Foundation's `URL.resolvingSymlinksInPath()`
+  is unreliable and does NOT resolve `/tmp`); 2 regression tests guard it.
+- **Review:** post-hoc `plan-reviewer` pass (on `glm-5.2`, which avoids the thinking-mode
+  `tool_choice` failure that blocked earlier reviews) — no critical/high findings. Fixed:
+  documented `CLAUDE_CONFIG_DIR`/`TMPDIR` as app-owned when sandbox on (Medium); moved
+  symlink resolution into the tested core layer + added tests (Low); added a `WIKI_DB`
+  env-var-not-clobbered assertion (Low). Rebutted the `-D` value-escaping note as latent
+  (app-controlled paths can't contain bad chars; user paths are escaped).
+- **Manual gate pending:** AC.5 — a live `make run` with the sandbox toggled on,
+  confirming a Query completes (scratch + `wikictl` DB writes work end-to-end in-app).
 
 ## 2026-06-24 — SourceWebView (WKWebView) gets the same "Add as Source" menu
 

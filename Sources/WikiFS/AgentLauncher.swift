@@ -433,6 +433,7 @@ final class AgentLauncher {
             return
         }
 
+        let sandbox = resolveSandboxInvocation(wikiID: wikiID, scratch: scratch, dir: dir)
         let command = OperationCommand.build(
             operation: operation,
             wikiRoot: wikiRoot,
@@ -441,7 +442,8 @@ final class AgentLauncher {
             scratchDirectory: scratch.path,
             wikictlDirectory: wikictlDirectory,
             resolvedExecutable: resolvedPath,
-            command: agentConfig
+            command: agentConfig,
+            sandbox: sandbox
         )
 
         // RESERVE per-run metadata. `isRunning` is already `true` (the slot set it on
@@ -608,6 +610,7 @@ final class AgentLauncher {
         }
 
         let operation = WikiOperation.queryConversation(stateFilePath: stateFilePath)
+        let sandbox = resolveSandboxInvocation(wikiID: wikiID, scratch: scratch, dir: dir)
         let command = OperationCommand.buildInteractiveQuery(
             operation: operation,
             wikiRoot: wikiRoot,
@@ -616,7 +619,8 @@ final class AgentLauncher {
             scratchDirectory: scratch.path,
             wikictlDirectory: wikictlDirectory,
             resolvedExecutable: resolvedPath,
-            command: agentConfig
+            command: agentConfig,
+            sandbox: sandbox
         )
 
         // RESERVE per-run metadata. `isRunning` is already `true` (slot acquire).
@@ -916,5 +920,63 @@ final class AgentLauncher {
         } catch {
             return nil
         }
+    }
+
+    // MARK: - Seatbelt sandbox
+
+    /// Resolve the seatbelt sandbox invocation for this spawn, or `nil` to run
+    /// un-sandboxed. Loads `SandboxConfig` FRESH at spawn (so Settings changes apply
+    /// on the next run, mirroring `AgentCommandConfig`). When enabled, resolves the
+    /// per-run scratch path + the active wiki's DB path and creates the provider's
+    /// relocation subdirs inside scratch (the app process is unsandboxed; only the
+    /// spawned child is confined). Returns `nil` (fail-open) when disabled OR when a
+    /// required path can't be resolved — logged. Fail-open is acceptable because the
+    /// feature is opt-in and default-off.
+    private func resolveSandboxInvocation(
+        wikiID: String,
+        scratch: URL,
+        dir: URL
+    ) -> SandboxProfile.SandboxInvocation? {
+        let sandboxConfig = SandboxConfig.load(from: dir)
+        guard sandboxConfig.enabled else { return nil }
+
+        // HOME for the `-D HOME` profile param. Read from the environment the child
+        // will inherit (fall back to the process home). Forwarded for forward-compat
+        // and debugging; the current whitelist profile does not reference it.
+        let homePath = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+
+        // The active wiki's SQLite DB path mirrors `WikiResolver.databaseURL(for:)`:
+        // `<container>/<ulid>.sqlite`. `dir` is the App Group container the DB lives in.
+        // Symlink resolution is performed inside `SandboxProfile.invocation` (the
+        // tested core layer) so the canonical path reaches the seatbelt profile.
+        let dbPath = dir.appendingPathComponent("\(wikiID).sqlite", isDirectory: false).path
+
+        // Fail-open if any required path is empty/relative (misconfiguration).
+        guard !scratch.path.isEmpty, scratch.path.hasPrefix("/"),
+              !dbPath.isEmpty, dbPath.hasPrefix("/") else {
+            DebugLog.agent("sandbox: could not resolve scratch/db path — running UNSANDBOXED")
+            return nil
+        }
+
+        createSandboxRelocationDirs(in: scratch)
+
+        let invocation = SandboxProfile.invocation(
+            homePath: homePath,
+            scratchDir: scratch.path,
+            wikiDBPath: dbPath,
+            extraAllowedPaths: sandboxConfig.parsedExtraAllowedPaths()
+        )
+        DebugLog.agent("sandbox: enabled — confining agent writes to scratch + \(dbPath)")
+        return invocation
+    }
+
+    /// Create the provider self-write relocation subdirs inside scratch so they land
+    /// inside the seatbelt allowlist. Best-effort: failure (e.g. scratch unwritable)
+    /// is surfaced later by the provider's own write errors.
+    private func createSandboxRelocationDirs(in scratch: URL) {
+        let claudeConfig = scratch.appendingPathComponent(".claude-config", isDirectory: true)
+        let tmp = scratch.appendingPathComponent(".tmp", isDirectory: true)
+        try? FileManager.default.createDirectory(at: claudeConfig, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     }
 }
