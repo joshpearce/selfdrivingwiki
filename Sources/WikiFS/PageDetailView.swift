@@ -20,8 +20,6 @@ struct PageDetailView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            AgentRunBanner(isVisible: store.isAgentRunning)
-
             // Header — always visible, same layout in both modes.
             VStack(alignment: .leading, spacing: PageEditorMetrics.sectionSpacing) {
                 Text(displayTitle)

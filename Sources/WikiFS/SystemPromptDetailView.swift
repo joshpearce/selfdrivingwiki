@@ -14,8 +14,6 @@ struct SystemPromptDetailView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            AgentRunBanner(isVisible: store.isAgentRunning)
-
             VStack(alignment: .leading, spacing: PageEditorMetrics.sectionSpacing) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("System Prompt")
