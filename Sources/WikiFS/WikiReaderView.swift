@@ -269,16 +269,52 @@ final class WikiReaderWebView: WKWebView {
 
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
         super.willOpenMenu(menu, with: event)
-        // WebKit only adds a "Copy Link" item when the right-click is on a link.
-        guard menu.items.contains(where: { $0.identifier?.rawValue == "WKMenuItemIdentifierCopyLink" }) else { return }
-        // The custom wiki-link items need the store for navigation; without it
-        // (no store wired) only WebKit's native menu shows.
-        guard let store,
-              let href = hoveredLinkHref, !href.isEmpty, let url = URL(string: href) else { return }
+
+        // Dump WebKit's menu items so we can see what identifiers / titles WKWebView
+        // actually ships on this macOS version — useful diagnostic until the menu is
+        // shipping reliably across macOS releases.  Logged public so Console shows it.
+        let itemDescs = menu.items.map { "id=\($0.identifier?.rawValue ?? "nil") title=\"\($0.title)\"" }.joined(separator: ", ")
+        DebugLog.reader("willOpenMenu \(menu.items.count) items: [\(itemDescs)]")
+
+        // WebKit adds "Copy Link" / "Open Link" when the right-click lands on an <a>
+        // IMPORTANT: WebKit may NOT add link items for custom URL schemes (wiki://),
+        // so also accept a wiki:// hoveredLinkHref as proof we're on a link.
+        let hasCopyLink = menu.items.contains {
+            $0.identifier?.rawValue == "WKMenuItemIdentifierCopyLink"
+        }
+        let hasLinkItem = hasCopyLink || menu.items.contains {
+            $0.identifier?.rawValue == "WKMenuItemIdentifierOpenLink"
+        }
+        let hasWikiHref = hoveredLinkHref?.hasPrefix("wiki://") ?? false
+        guard hasLinkItem || hasWikiHref else {
+            DebugLog.reader("willOpenMenu: no link item (hasCopyLink=\(hasCopyLink)) and no wiki href → bailing")
+            return
+        }
+
+        guard let store else {
+            DebugLog.reader("willOpenMenu: store is nil → bailing")
+            return
+        }
+
+        guard let href = hoveredLinkHref, !href.isEmpty else {
+            DebugLog.reader("willOpenMenu: hoveredLinkHref is nil/empty → bailing. href=\(hoveredLinkHref ?? "nil")")
+            return
+        }
+
+        guard let url = URL(string: href) else {
+            DebugLog.reader("willOpenMenu: URL(string:) failed for href=\"\(href)\" → bailing")
+            return
+        }
+
+        DebugLog.reader("willOpenMenu: building custom items for url=\(url.absoluteString)")
+
         let custom = WikiLinkMenuNSItems.items(for: url, store: store, fileProvider: fileProvider, addURL: addURLHandler)
-        guard !custom.isEmpty else { return }
+        guard !custom.isEmpty else {
+            DebugLog.reader("willOpenMenu: WikiLinkMenuNSItems returned empty for url=\(url.absoluteString) → bailing")
+            return
+        }
+        DebugLog.reader("willOpenMenu: prepending \(custom.count) custom items")
         menu.insertItem(NSMenuItem.separator(), at: 0)
-        // Insert reversed so the first custom item ends up at the top.
         for item in custom.reversed() { menu.insertItem(item, at: 0) }
     }
 
@@ -316,17 +352,42 @@ final class WikiReaderWebView: WKWebView {
 
     nonisolated static let linkHoverName = "linkHover"
 
-    /// The `mouseover` listener injected at document end. Uses the capture phase
-    /// so it sees bubbled events reliably, and posts the hovered `<a>` href (or
-    /// `""`) to the `linkHover` message handler.
+    /// Tracks the `<a>` href under the cursor by listening for `mouseover` on the
+    /// document (capture phase) AND per-link `mouseenter`/`mouseleave`.  Both paths
+    /// post to the same `linkHover` message handler.  A `lastHref` guard suppresses
+    /// duplicate posts so we don't flood WebKit's IPC queue (which can throttle or
+    /// drop messages when the mouse moves rapidly over dense inline content).
+    ///
+    /// `mouseenter` fires only when the pointer enters an `<a>` element (far fewer
+    /// events than `mouseover`), so it acts as a reliable fallback even when the
+    /// capture-phase path is noisy.
     nonisolated static let hoverListenerJS = """
     (function(){
-      document.addEventListener('mouseover', function(e){
+      var lastHref="";
+      function post(href){
+        if(href!==lastHref){
+          lastHref=href;
+          try{window.webkit.messageHandlers.\(linkHoverName).postMessage(href);}catch(e){}
+        }
+      }
+      // capture-phase mouseover — catches every element entered
+      document.addEventListener('mouseover',function(e){
         var el=e.target;
-        while(el && el.tagName!=='A'){ el=el.parentElement; }
-        var href = (el && el.tagName==='A') ? el.href : "";
-        try { window.webkit.messageHandlers.\(linkHoverName).postMessage(href); } catch(x){}
-      }, true);
+        while(el&&el.tagName!=="A"){el=el.parentElement;}
+        post(el&&el.tagName==="A"?el.href:"");
+      },true);
+      // per-link mouseenter/leave — reliable for links, tiny event count
+      function bindLinks(){
+        var links=document.querySelectorAll("a:not([data-sdw-hover])");
+        for(var i=0;i<links.length;i++){(function(a){
+          a.setAttribute("data-sdw-hover","1");
+          a.addEventListener("mouseenter",function(){post(a.href);});
+          a.addEventListener("mouseleave",function(){post("");});
+        })(links[i]);}
+      }
+      // bind once the DOM is settled; re-bind on DOM mutation as a safety net
+      bindLinks();
+      new MutationObserver(bindLinks).observe(document.body||document.documentElement,{childList:true,subtree:true});
     })();
     """
 }

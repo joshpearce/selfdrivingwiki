@@ -21,6 +21,7 @@ public enum DebugLog {
     public static func store(_ message: @autoclosure () -> String) { emit("store", message()) }
     public static func config(_ message: @autoclosure () -> String) { emit("config", message()) }
     public static func fileprovider(_ message: @autoclosure () -> String) { emit("fileprovider", message()) }
+    public static func reader(_ message: @autoclosure () -> String) { emit("reader", message()) }
 
     private static let subsystem = "com.selfdrivingwiki.debug"
     private static let loggers: [String: Logger] = [
@@ -31,6 +32,7 @@ public enum DebugLog {
         "store": Logger(subsystem: subsystem, category: "store"),
         "config": Logger(subsystem: subsystem, category: "config"),
         "fileprovider": Logger(subsystem: subsystem, category: "fileprovider"),
+        "reader": Logger(subsystem: subsystem, category: "reader"),
     ]
 
     private static func emit(_ category: String, _ message: String) {
