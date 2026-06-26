@@ -116,6 +116,14 @@ final class AgentLauncher {
     /// a process that dies unreconciled strands `store.isAgentRunning` (and the
     /// "Agent is updating the wiki" banner) forever.
     @ObservationIgnored private var onUnlockHandler: (@MainActor @Sendable () -> Void)?
+    /// Per-turn edit-lock callback for interactive query sessions. Fires on every
+    /// REAL `isGenerating` transition (acquire on `true`, release on `false`). The
+    /// runner installs it so the per-turn lock releases BETWEEN turns even when the
+    /// Query view is not on screen — the old view-side `.onChange(of: isGenerating)`
+    /// never fired while the view was unmounted, so the lock stuck until session end.
+    /// `nil` for one-shot runs (those lock for the whole run via `onLock`/`onUnlock`
+    /// only). Cleared in `finish()` and `resetRunArtifacts()`.
+    @ObservationIgnored private var onTurnBoundaryHandler: (@MainActor (Bool) -> Void)?
     /// Backstop poller that reconciles the UI if the process `terminationHandler`
     /// is ever missed (see `startCompletionWatchdog`). Cancelled on teardown.
     private var watchdogTask: Task<Void, Never>?
@@ -141,6 +149,32 @@ final class AgentLauncher {
         isGenerating && runningKind == .query
     }
 
+    /// Centralize EVERY `isGenerating` transition through this one method so the
+    /// per-turn callback fires from a single place and redundant transitions (no
+    /// real change) are skipped. This is the single owner of the `isGenerating`
+    /// invariant: the lock toggles exactly once per real transition, never on a
+    /// no-op reassignment. Routing through a method (not a `didSet`) avoids
+    /// Observation-macro interaction pitfalls.
+    private func setGenerating(_ value: Bool) {
+        guard isGenerating != value else { return }
+        isGenerating = value
+        onTurnBoundaryHandler?(value)
+    }
+
+    /// Pure selection of the interactive-query sandbox. When "Allow wiki edits" is
+    /// OFF, the read-only seatbelt sandbox wins REGARDLESS of `editSandbox` — a
+    /// global sandbox config can never override the forced read-only boundary. When
+    /// ON, `editSandbox` is used (which may itself be `nil`, i.e. fail-open
+    /// un-sandboxed). Extracted as a pure static so the read-only-wins invariant is
+    /// unit-testable without driving spawn state.
+    static func selectQuerySandbox(
+        allowWikiEdits: Bool,
+        editSandbox: SandboxProfile.SandboxInvocation?,
+        readOnlySandbox: SandboxProfile.SandboxInvocation
+    ) -> SandboxProfile.SandboxInvocation? {
+        allowWikiEdits ? editSandbox : readOnlySandbox
+    }
+
     // MARK: - Three independent locks (relationship)
 
     /// The launcher coordinates three INDEPENDENT locks. They never touch each
@@ -151,10 +185,16 @@ final class AgentLauncher {
     ///    held ↔ `isRunning`): serializes ONLY `claude -p` spawns. One `claude`
     ///    process at a time across ingest / query / lint. Extraction does NOT take
     ///    it, so a `pdf2md` conversion may overlap a `claude` query run.
-    /// 2. **Edit lock** (`store.isAgentRunning`, driven by `onLock`/`onUnlock`
-    ///    around the spawn): `true` exactly while a `claude` process is running, so
-    ///    editing pages / processed markdown is locked during an agent run and free
-    ///    during extraction. Neither extraction path fires `onLock`/`onUnlock`.
+    /// 2. **Edit lock** (`store.isAgentRunning`), driven by TWO mechanisms:
+    ///      - **Session level** (`onLock`/`onUnlock` around the spawn): for
+    ///        one-shot runs (ingest/lint/query) and the lifetime of an interactive
+    ///        query session, the lock is `true` while a `claude` process is running.
+    ///      - **Per-turn** (`onTurnBoundary`, interactive query ONLY): for an
+    ///        edit-enabled interactive query, the lock additionally RELEASES between
+    ///        turns (`messageStop`/`result`) and RE-ACQUIRES on the next send — so
+    ///        the user can ingest while the query agent is idle mid-session. This is
+    ///        owned by `setGenerating` (single source of truth for the transition),
+    ///        not by any View. Neither extraction path touches the lock.
     /// 3. **Extraction slot** (`extractionWaiters` / `awaitExtractionSlot` /
     ///    `releaseExtractionSlot`, held ↔ `isExtractionSlotBusy`): serializes ONLY
     ///    `pdf2md` conversions against each other (the VLM pipeline is heavy; one
@@ -469,8 +509,11 @@ final class AgentLauncher {
         runStartedAt = now
         lastActivityAt = now
         openLogFiles(in: scratch)
-        // A one-shot run is "generating" for its whole duration.
-        isGenerating = true
+        // A one-shot run is "generating" for its whole duration. One-shot runs
+        // never install `onTurnBoundaryHandler` (it stays nil here), so this is a
+        // pure UI flag — the edit lock for one-shot runs is owned by
+        // `onLock`/`onUnlock` around the spawn, not the per-turn callback.
+        setGenerating(true)
         // SPAWN COMMIT: the agent phase now begins. Assign the agent-phase flag
         // (`ingestingSourceIDs`) here — NOT while queued for the slot — so the
         // "Ingesting…" label and the cross-file Ingest greyout activate only once
@@ -571,6 +614,8 @@ final class AgentLauncher {
 
     /// Start a stdin-backed query conversation. The first user message is sent
     /// immediately after the process launches; later turns use `sendInteractiveMessage`.
+    /// - Parameter allowWikiEdits: when `false` (default), the agent runs under a
+    ///   READ-ONLY seatbelt sandbox that physically blocks all writes to the wiki DB.
     func startInteractiveQuery(
         firstMessage: String,
         stateMarkdown: String,
@@ -578,8 +623,10 @@ final class AgentLauncher {
         wikiRoot: String,
         systemPrompt: String,
         wikictlDirectory: String,
+        allowWikiEdits: Bool = false,
         onLock: @escaping @MainActor () -> Void,
-        onUnlock: @escaping @MainActor @Sendable () -> Void
+        onUnlock: @escaping @MainActor @Sendable () -> Void,
+        onTurnBoundary: @escaping @MainActor (Bool) -> Void
     ) async {
         let acquired = await awaitSpawnSlot()
         guard acquired, !Task.isCancelled else {
@@ -625,8 +672,23 @@ final class AgentLauncher {
             return
         }
 
-        let operation = WikiOperation.queryConversation(stateFilePath: stateFilePath)
-        let sandbox = resolveSandboxInvocation(wikiID: wikiID, scratch: scratch, dir: dir)
+        let operation = WikiOperation.queryConversation(
+            stateFilePath: stateFilePath, allowWikiEdits: allowWikiEdits)
+        // When "Allow wiki edits" is off, force a read-only seatbelt sandbox that
+        // physically blocks writes to the wiki DB — regardless of global sandbox
+        // settings (the read-only sandbox ALWAYS wins over the edit sandbox, so a
+        // global config can never punch through the forced read-only boundary).
+        // When on, use the existing opt-in sandbox behavior (which may itself be
+        // `nil`, i.e. fail-open un-sandboxed). Resolved separately then handed to the
+        // pure selector so the invariant is unit-testable.
+        let editSandbox = resolveSandboxInvocation(wikiID: wikiID, scratch: scratch, dir: dir)
+        let homePath = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        let readOnlySandbox = SandboxProfile.readOnlyInvocation(
+            homePath: homePath, scratchDir: scratch.path)
+        let sandbox = Self.selectQuerySandbox(
+            allowWikiEdits: allowWikiEdits,
+            editSandbox: editSandbox,
+            readOnlySandbox: readOnlySandbox)
         let command = OperationCommand.buildInteractiveQuery(
             operation: operation,
             wikiRoot: wikiRoot,
@@ -646,13 +708,23 @@ final class AgentLauncher {
         runStartedAt = now
         lastActivityAt = now
         openLogFiles(in: scratch)
-        // The first turn is in flight as soon as we spawn + send.
-        isGenerating = true
         // SPAWN COMMIT: a query conversation never ingests, so the agent-phase flag
         // is empty — clearing any stale value (mirrors `run`'s spawn-commit).
         self.ingestingSourceIDs = []
         onLock()
         onUnlockHandler = onUnlock
+        // Install the per-turn callback now so it's ready when the first turn's
+        // transition fires. It fires on every real transition for the session's
+        // lifetime; `finish()` / `resetRunArtifacts()` clear it. This is what lets
+        // the lock release between turns EVEN WHEN the Query view is not on screen
+        // (the old view `.onChange` never fired while unmounted).
+        onTurnBoundaryHandler = onTurnBoundary
+        // NOTE: do NOT `setGenerating(true)` here. The first turn's transition is
+        // owned by `sendInteractiveMessage(firstMessage)` below, which sets
+        // `isGenerating(true)` (firing the handler above) at the moment it writes
+        // the first message to stdin. If we set it here, `sendInteractiveMessage`'s
+        // `guard !isGenerating` would DROP the first message — claude would then
+        // wait on stdin forever, producing zero events and a perpetual spinner.
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: command.executable)
@@ -715,20 +787,45 @@ final class AgentLauncher {
 
     /// Send one user turn to the active interactive query session.
     func sendInteractiveMessage(_ message: String) {
+        guard Self.shouldSendMessage(
+            isRunning: isRunning,
+            isInteractiveSession: isInteractiveSession,
+            isGenerating: isGenerating,
+            message: message
+        ) else { return }
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isRunning, isInteractiveSession, !trimmed.isEmpty else { return }
         guard let line = Self.streamJSONLine(forUserText: trimmed),
               let data = (line + "\n").data(using: .utf8)
         else { return }
 
         events.append(.userText(trimmed))
-        isGenerating = true
+        setGenerating(true)
         lastActivityAt = Date()
         do {
             try inputHandle?.write(contentsOf: data)
         } catch {
             ingestStderr("Failed to send message to the Agent: \(error.localizedDescription)\n")
         }
+    }
+
+    /// Pure decision: whether `sendInteractiveMessage` would actually send (vs. bail
+    /// on a guard). Extracted so the gate logic is unit-testable without a live
+    /// process (the full send path needs a spawned claude + stdin). The four
+    /// conditions: a run is active, it's an interactive (stdin-backed) session, the
+    /// text isn't blank, and the agent is NOT already generating a response (so two
+    /// turns never interleave on the shared stdin).
+    ///
+    /// Regression guard: `startInteractiveQuery` must NOT pre-set `isGenerating`
+    /// before calling `sendInteractiveMessage(firstMessage)` — the first send runs
+    /// with `isGenerating == false`, so it passes this gate and the message lands.
+    /// If that ordering regresses (isGenerating already true), the first message is
+    /// dropped and claude blocks on stdin forever (events=0, perpetual spinner) —
+    /// exactly the live bug `firstMessageIsSentBecauseGenerationIsNotPreSet` locks in.
+    static func shouldSendMessage(
+        isRunning: Bool, isInteractiveSession: Bool, isGenerating: Bool, message: String
+    ) -> Bool {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        return isRunning && isInteractiveSession && !trimmed.isEmpty && !isGenerating
     }
 
     /// Cancel ONLY the pdf2md conversion (standalone or ingest-path extraction
@@ -813,10 +910,13 @@ final class AgentLauncher {
             stdoutLineBuffer.removeSubrange(...newlineIndex)
             if let event = AgentEventParser.parse(line: line) {
                 events.append(event)
-                // The terminal `result` event ends an agent turn (and a one-shot
-                // run's output). Clear the active-generation flag so an idle
-                // interactive session stops spinning.
-                if case .result = event { isGenerating = false }
+                // `.result` fires at session end (one-shot runs, or when the
+                // interactive session terminates). `.messageStop` fires at the
+                // end of EACH turn in an interactive session — Claude emits it
+                // after every response when stdin/stdout are both stream-json.
+                // Clear isGenerating on either so the per-turn edit lock releases
+                // between turns instead of staying stuck until session end.
+                if AgentEvent.endsGeneration(event) { setGenerating(false) }
             }
         }
     }
@@ -855,7 +955,11 @@ final class AgentLauncher {
         inputHandle = nil
         currentProcessID = nil
         ingestingSourceIDs = []
-        isGenerating = false
+        // Clear the per-turn callback before the final state transition: the
+        // session is ending, so the lock's final release is the session-level
+        // `onUnlock` (via `releaseEditLock`), not a per-turn boundary.
+        onTurnBoundaryHandler = nil
+        setGenerating(false)
         lastActivityAt = Date()
         // Release the edit lock (`store.isAgentRunning`) from here — NOT from the
         // `terminationHandler` — so EVERY completion path releases it: the real
@@ -891,7 +995,10 @@ final class AgentLauncher {
         stdoutLineBuffer = ""
         exitStatus = nil
         isInteractiveSession = false
-        isGenerating = false
+        // Clear the per-turn callback first so this reset transition doesn't fire
+        // a stale handler; a reset is the start of a new run, not a turn boundary.
+        onTurnBoundaryHandler = nil
+        setGenerating(false)
         runningKind = nil
         logFileURL = nil
         runStartedAt = nil

@@ -2,6 +2,122 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-25 — Fix query/ingestion-agent review findings (per-turn lock, dead code, tests)
+
+Addressed every issue from the code review of the query/ingestion-agent
+separation.
+
+**Per-turn edit lock is now launcher-owned (HIGH).** The per-turn
+`store.isAgentRunning` toggle lived in `QueryConversationView`'s
+`.onChange(of: launcher.isGenerating)`, which never fires while the view is
+unmounted — so navigating to a Page mid-session stranded the lock (editor stayed
+read-only, ingestion stayed blocked) until session end. Moved the toggle into
+`AgentLauncher`:
+- Added `setGenerating(_:)` — the SINGLE mutation point for `isGenerating`. Every
+  assignment now routes through it; it fires an `onTurnBoundaryHandler` callback
+  only on a real transition. One-shot runs never install the handler (no-op).
+- `startInteractiveQuery` accepts an `onTurnBoundary` callback; the runner
+  installs `{ if allowWikiEdits { store.setAgentRunning($0) } }`. The lock now
+  releases between turns even when the Query view is off-screen.
+- Removed the view-side `.onChange`. `setAgentRunning` now has exactly one caller
+  (the runner callback); no View mutates lock state.
+
+**Deleted dead `EditLock`.** The per-wiki refcounting `EditLock` class had zero
+production references (the app uses the single-bool `store.isAgentRunning`).
+Deleted `Sources/WikiFSCore/EditLock.swift` + `Tests/WikiFSTests/EditLockTests.swift`.
+
+**Single lock owner.** Consolidated `WikiStoreModel`'s three mutation paths
+(`beginAgentRun` / `endAgentRun` / `setAgentRunning`) behind one private
+`mutateAgentRunning(_:reload:)`. The three public methods are now thin
+intent-named wrappers.
+
+**Send-while-generating guard.** `QueryConversationView.canSend` requires
+`!launcher.isGenerating` (composer disables during a response); added a defensive
+`guard !isGenerating` in `sendInteractiveMessage`; help text now reads "Wait for
+the response before sending the next message".
+
+> **Regression caught live + fixed.** The `guard !isGenerating` initially dropped
+> the FIRST message: `startInteractiveQuery` set `isGenerating=true` in
+> spawn-commit, so the `sendInteractiveMessage(firstMessage)` call right after hit
+> the new guard and returned early — claude spawned, waited on stdin forever, and
+> the Query page spun with zero events (confirmed via `DebugLog` heartbeats:
+> `pid=… procAlive=true events=0 idleSec` climbing). Fix: the first-turn
+> `isGenerating(true)` transition is now owned by `sendInteractiveMessage` itself
+> (spawn-commit no longer pre-sets it), so the guard passes for the first send and
+> still blocks follow-up sends while a turn is in flight.
+
+**Testable + tested.** Extracted two pure predicates so the new behavior is unit-
+covered: `AgentEvent.endsGeneration(_:)` (the `.result`/`.messageStop` rule) and
+`AgentLauncher.selectQuerySandbox(…)`. Tests: `messageStop` parse +
+`isInternalTranscriptEvent`, `endsGeneration` matrix, and the read-only-wins
+sandbox invariant (read-only returned even when a non-nil edit sandbox is set).
+
+**Copy/docs.** Banner now reads "Editing enabled — ingestion is paused while the
+agent is responding." (it releases between turns). Added a security/trust-surface
+note to `plans/query-conversation.md`.
+
+**Edit-mode is now switchable mid-session (restart-on-toggle).** "Allow wiki
+edits" was locked once a session started (`.disabled(isInteractiveSession)`),
+which frustrated users — but the lock was *necessary*: edit mode is baked into the
+spawned claude process (its seatbelt sandbox + system prompt), so a running process
+can't change it. Fix: the checkbox is now always tappable; flipping it mid-session
+calls `AgentOperationRunner.restartQueryConversation`, which **stops the current
+session and relaunches in the new mode**, re-feeding the prior transcript as
+opening context (`transcriptContextMessage`) so the new process keeps continuity.
+Switching to edit mode while an ingest holds the lock is refused without tearing
+down the read-only session (clear preflight error). Added `QueryRestartTests` for
+the context formatting (5 tests).
+
+## 2026-06-25 — Separate query agent from ingestion agent + opt-in edit lock
+
+Split the single `AgentLauncher` singleton into two independent instances so
+ingest and query can run concurrently, with a physical read-only boundary when
+the query agent shouldn't write.
+
+**Problem.** The query tool reused the same `AgentLauncher` as ingestion: (1) stale
+ingest text appeared in the query conversation view after switching tabs, (2) a
+single spawn slot prevented ingest and query from running concurrently, and (3)
+the prompt always included write instructions, so the agent wrote to the wiki
+regardless of user intent.
+
+**Two-launcher architecture.** `WikiFSApp` now creates a second `AgentLauncher`
+instance (`queryLauncher`) dedicated to query operations only, with its own spawn
+slot, events array, and process state. The existing `agentLauncher` remains for
+ingest and lint. Threaded through `RootView` → `ContentView` → `WikiDetailView`
+→ `QueryConversationView` (5 files, parameter-only changes).
+
+**Opt-in edit lock.** A new **"Allow wiki edits"** checkbox (`.toggleStyle(.checkbox)`)
+in the query composer. When checked:
+- The query agent takes `store.isAgentRunning` (the edit lock), blocking
+  ingestion and page editing — mirrored in the UI: the ingest button greys out
+  (`isEditLockedExternally` on `SourceDetailView`) and an orange **"Editing
+  enabled — ingestion is paused"** banner appears above the transcript.
+- `AgentOperationRunner.startQueryConversation` checks `store.isAgentRunning`
+  before starting — if ingest already holds the lock, it shows a preflight error:
+  "An ingestion is updating the wiki. Wait for it to finish, or uncheck 'Allow
+  wiki edits' to start a read-only query."
+- Conversely, `run()` (ingest/lint) checks `store.isAgentRunning` before taking
+  the lock — if the query agent holds it, it shows a preflight error: "The query
+  agent is currently editing the wiki."
+
+**Physical read-only enforcement.** When the checkbox is OFF:
+- A **read-only seatbelt sandbox** (`SandboxProfile.readOnlyInvocation`) is
+  always applied (regardless of global sandbox settings), allowing scratch writes
+  but denying writes to the wiki DB — `wikictl page upsert` physically fails at
+  the OS level.
+- The prompt is split into two variants in `WikiOperation`:
+  `queryConversationReadOnlyPrompt` (no `IngestWriteRule.writes`, no write
+  commands, explicit "You CANNOT create, update, or modify any wiki content") vs
+  `queryConversationReadWritePrompt` (current behavior, full write instructions).
+
+**Files changed (12):** `WikiFSApp.swift`, `RootView.swift`, `ContentView.swift`,
+`WikiDetailView.swift`, `QueryConversationView.swift`, `AgentLauncher.swift`,
+`AgentOperationRunner.swift`, `SourceDetailView.swift`, `SandboxProfile.swift`,
+`WikiOperation.swift`, plus test updates in `OperationCommandTests.swift` and
+`SandboxedOperationCommandTests.swift`.
+
+**Tests.** 1041 pass, 77 suites, 0 failures. `swift build` clean.
+
 ## 2026-06-25 — Fix quote-link highlight across inline elements (WKWebView reader)
 
 A clicked `[[source:Name#"quote"]]` no longer silently failed to

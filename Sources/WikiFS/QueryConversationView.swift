@@ -12,6 +12,7 @@ struct QueryConversationView: View {
     let fileProvider: FileProviderSpike
     @State private var draftMessage = ""
     @State private var showsInternals = false
+    @State private var allowWikiEdits = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -32,6 +33,12 @@ struct QueryConversationView: View {
             // `AgentActivityView`. (AC.1)
             if !isRunning { showsInternals = false }
         }
+        // NOTE: the per-turn edit lock is NO LONGER driven from this view. It is
+        // owned by `AgentLauncher` (via the `onTurnBoundary` callback the runner
+        // installs in `startQueryConversation`), so it releases between turns even
+        // when this view is unmounted — the old `.onChange(of: isGenerating)` here
+        // never fired while the view was off-screen, stranding the lock. The view
+        // only READS `isGenerating` now (banner, debug cluster, send gating).
     }
 
     private var controls: some View {
@@ -78,11 +85,41 @@ struct QueryConversationView: View {
         }
     }
 
+    /// Shown when the query agent has "Allow wiki edits" enabled and is actively
+    /// running — the agent CAN write to the wiki, and ingestion is blocked.
+    private var editingEnabledBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "pencil.and.list.clipboard")
+                .font(.system(size: 13, weight: .semibold))
+            Text("Editing enabled — ingestion is paused while the agent is responding.")
+                .font(.subheadline)
+                .fontWeight(.medium)
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(maxWidth: QueryConversationMetrics.chatColumnWidth)
+        .background(.orange.opacity(0.15))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(.orange.opacity(0.3), lineWidth: 1)
+        }
+    }
+
+    private var showsEditingEnabledBanner: Bool {
+        allowWikiEdits && launcher.isGenerating
+    }
+
     private var conversation: some View {
         VStack(spacing: 0) {
+            if showsEditingEnabledBanner {
+                editingEnabledBanner
+                    .padding(.bottom, QueryConversationMetrics.sectionSpacing)
+            }
             QueryTranscriptView(launcher: launcher, onWikiLink: WikiReaderView.onWikiLinkHandler(for: store))
                 .frame(maxWidth: QueryConversationMetrics.chatColumnWidth, maxHeight: .infinity)
-                .padding(.top, QueryConversationMetrics.conversationTopInset)
+                .padding(.top, showsEditingEnabledBanner ? 0 : QueryConversationMetrics.conversationTopInset)
             composer(maxWidth: QueryConversationMetrics.chatColumnWidth)
                 .padding(.horizontal, QueryConversationMetrics.conversationHorizontalInset)
                 .padding(.top, QueryConversationMetrics.sectionSpacing)
@@ -93,6 +130,9 @@ struct QueryConversationView: View {
 
     private var emptyState: some View {
         VStack(spacing: QueryConversationMetrics.emptyStateSpacing) {
+            if showsEditingEnabledBanner {
+                editingEnabledBanner
+            }
             Spacer(minLength: 0)
             Text("Ask \(activeWikiName)")
                 .font(.largeTitle)
@@ -106,35 +146,63 @@ struct QueryConversationView: View {
     }
 
     private func composer(maxWidth: CGFloat) -> some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            TextField("Ask a question, or ask the Agent to update the wiki…", text: $draftMessage, axis: .vertical)
-                .font(.body)
-                .textFieldStyle(.plain)
-                .lineLimit(1...6)
-                .padding(.leading, QueryConversationMetrics.composerHorizontalPadding)
-                .padding(.vertical, QueryConversationMetrics.composerVerticalPadding)
-                .onSubmit(sendMessage)
-                .disabled(!canType)
-
-            Button(action: sendMessage) {
-                Image(systemName: sendButtonIcon)
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(canSend ? Color.white : Color.secondary)
-                    .frame(width: QueryConversationMetrics.sendButtonSize, height: QueryConversationMetrics.sendButtonSize)
-                    .background(sendButtonBackground, in: Circle())
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle(isOn: $allowWikiEdits) {
+                Text("Allow wiki edits")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-                .buttonStyle(.borderless)
-                .disabled(!canSend)
-                .keyboardShortcut(.return, modifiers: .command)
-                .help(sendButtonTitle)
+            .toggleStyle(.checkbox)
+            .help("When on, the agent can edit the wiki. Toggling restarts the session with the new permission, keeping the conversation as context.")
+            .onChange(of: allowWikiEdits) { _, isOn in
+                // Edit mode is a property of the spawned claude process (its seatbelt
+                // sandbox + system prompt), so it can't change for a RUNNING session.
+                // Flipping the checkbox mid-session stops the current session and
+                // relaunches in the new mode, re-feeding the transcript so the new
+                // process keeps context. Pre-first-message (no session yet) this just
+                // sets the mode the next session starts in.
+                guard launcher.isInteractiveSession else { return }
+                Task {
+                    await AgentOperationRunner.restartQueryConversation(
+                        launcher: launcher,
+                        store: store,
+                        manager: manager,
+                        fileProvider: fileProvider,
+                        allowWikiEdits: isOn)
+                }
+            }
+            .padding(.horizontal, QueryConversationMetrics.composerHorizontalPadding)
+
+            HStack(alignment: .bottom, spacing: 10) {
+                TextField("Ask a question, or ask the Agent to update the wiki…", text: $draftMessage, axis: .vertical)
+                    .font(.body)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...6)
+                    .padding(.leading, QueryConversationMetrics.composerHorizontalPadding)
+                    .padding(.vertical, QueryConversationMetrics.composerVerticalPadding)
+                    .onSubmit(sendMessage)
+                    .disabled(!canType)
+
+                Button(action: sendMessage) {
+                    Image(systemName: sendButtonIcon)
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(canSend ? Color.white : Color.secondary)
+                        .frame(width: QueryConversationMetrics.sendButtonSize, height: QueryConversationMetrics.sendButtonSize)
+                        .background(sendButtonBackground, in: Circle())
+                }
+                    .buttonStyle(.borderless)
+                    .disabled(!canSend)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .help(sendButtonTitle)
+            }
+            .padding(.trailing, QueryConversationMetrics.composerButtonInset)
+            .background(Color(nsColor: .controlBackgroundColor), in: Capsule())
+            .overlay {
+                Capsule()
+                    .strokeBorder(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 1)
+            }
+            .shadow(color: Color.black.opacity(0.06), radius: 18, x: 0, y: 8)
         }
-        .padding(.trailing, QueryConversationMetrics.composerButtonInset)
-        .background(Color(nsColor: .controlBackgroundColor), in: Capsule())
-        .overlay {
-            Capsule()
-                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 1)
-        }
-        .shadow(color: Color.black.opacity(0.06), radius: 18, x: 0, y: 8)
         .frame(maxWidth: maxWidth)
     }
 
@@ -149,7 +217,7 @@ struct QueryConversationView: View {
                 return true
             case .assistantText(let text), .result(_, let text):
                 return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            case .systemInit, .toolUse, .toolResult, .subagent, .raw:
+            case .systemInit, .toolUse, .toolResult, .subagent, .messageStop, .raw:
                 return false
             }
         }
@@ -169,11 +237,15 @@ struct QueryConversationView: View {
     private var canSend: Bool {
         fileProvider.path != nil
             && canType
+            && !launcher.isGenerating
             && !draftMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var sendButtonTitle: String {
-        launcher.isInteractiveSession ? "Send" : "Start Query"
+        if launcher.isGenerating {
+            return "Wait for the response before sending the next message"
+        }
+        return launcher.isInteractiveSession ? "Send" : "Start Query"
     }
 
     private var sendButtonIcon: String {
@@ -193,7 +265,8 @@ struct QueryConversationView: View {
                     launcher: launcher,
                     store: store,
                     manager: manager,
-                    fileProvider: fileProvider
+                    fileProvider: fileProvider,
+                    allowWikiEdits: allowWikiEdits
                 )
             }
         }
