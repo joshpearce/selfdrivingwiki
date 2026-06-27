@@ -1,3 +1,22 @@
+## Branching
+
+* `personal` is the stable working line — base all work on it. It is a fork
+  (`origin` = `joshpearce/selfdrivingwiki`) of a fast-moving, frequently-buggy
+  upstream (`upstream` = `tqbf/selfdrivingwiki`).
+
+* Do NOT merge `upstream/main` into `personal` wholesale. Upstream churns (large
+  UI refactors land often); swallowing it whole reintroduces the instability we
+  branched away from.
+
+* Pull upstream changes in deliberately, one at a time:
+  `git fetch upstream` → review `git log --oneline personal..upstream/main` →
+  `git cherry-pick <sha>` only the specific fixes you want.
+
+* Let `main` just mirror `upstream/main` (fast-forward only) so it stays a clean
+  reference for the raw upstream delta. Don't develop on `main`.
+
+---
+
 * Keep a master PLAN.md as an index to the documentation you make for this codebase.
 
 * Store specific in-depth documentation in plans/whatever.md.
