@@ -150,7 +150,7 @@ struct WikiDetailView: View {
                     // ingestingSourceIDs.contains` overload.
                     isThisFileExtracting: launcher.extractingSourceIDs.contains(file.id),
                     // True when the edit lock is held but NO ingest is in flight —
-                    // the query agent has "Allow wiki edits" checked and owns the lock.
+                    // the query agent is in Edit mode and owns the lock.
                     isEditLockedExternally: store.isAgentRunning && launcher.ingestingSourceIDs.isEmpty,
                     runIngest: runIngest,
                     launcher: launcher,

@@ -51,4 +51,30 @@ struct QueryModeTests {
             readOnlySandbox: readOnly)
         #expect(selected == editSandbox)
     }
+
+    // MARK: - Banner predicate: (mode × isGenerating) matrix
+
+    /// Ask mode, not generating → no banner.
+    @Test func bannerPredicate_ask_notGenerating() {
+        #expect(QueryConversationView.showsEditingBanner(
+            allowsEdits: QueryMode.ask.allowsEdits, isGenerating: false) == false)
+    }
+
+    /// Ask mode, generating → no banner (Ask is read-only regardless).
+    @Test func bannerPredicate_ask_generating() {
+        #expect(QueryConversationView.showsEditingBanner(
+            allowsEdits: QueryMode.ask.allowsEdits, isGenerating: true) == false)
+    }
+
+    /// Edit mode, not generating → no banner (agent idle).
+    @Test func bannerPredicate_edit_notGenerating() {
+        #expect(QueryConversationView.showsEditingBanner(
+            allowsEdits: QueryMode.edit.allowsEdits, isGenerating: false) == false)
+    }
+
+    /// Edit mode, generating → banner shown (agent CAN write, ingestion is paused).
+    @Test func bannerPredicate_edit_generating() {
+        #expect(QueryConversationView.showsEditingBanner(
+            allowsEdits: QueryMode.edit.allowsEdits, isGenerating: true) == true)
+    }
 }

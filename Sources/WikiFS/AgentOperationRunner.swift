@@ -218,7 +218,7 @@ enum AgentOperationRunner {
         // If the query agent wants edit permissions, it must take the edit lock.
         // Refuse to start if another agent (ingest) already holds it.
         if allowWikiEdits && store.isAgentRunning {
-            launcher.preflightError = "An ingestion is updating the wiki. Wait for it to finish, or uncheck \"Allow wiki edits\" to start a read-only query."
+            launcher.preflightError = "An ingestion is updating the wiki. Wait for it to finish, or use the Ask tab for a read-only conversation."
             return
         }
 
@@ -229,8 +229,8 @@ enum AgentOperationRunner {
         let root = fileProvider.path ?? ""
         DebugLog.agent("startQueryConversation: wikiRoot=\(root.isEmpty ? "<mount unavailable>" : root)")
 
-        // Query agent takes the edit lock only when "Allow wiki edits" is checked.
-        // When unchecked, the seatbelt sandbox physically blocks writes to the wiki DB.
+        // Edit mode takes the edit lock; Ask mode is forced read-only by the seatbelt
+        // sandbox and never acquires the lock at all.
         await launcher.startInteractiveQuery(
             firstMessage: trimmed,
             stateMarkdown: store.currentStateSnapshot().renderStateFile(),

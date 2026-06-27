@@ -97,8 +97,8 @@ struct QueryConversationView: View {
         }
     }
 
-    /// Shown when the query agent has "Allow wiki edits" enabled and is actively
-    /// running — the agent CAN write to the wiki, and ingestion is blocked.
+    /// Shown in Edit mode while the agent is actively generating — the agent CAN
+    /// write to the wiki, and ingestion is paused.
     private var editingEnabledBanner: some View {
         HStack(spacing: 8) {
             Image(systemName: "pencil.and.list.clipboard")
@@ -119,8 +119,16 @@ struct QueryConversationView: View {
         }
     }
 
+    /// Pure predicate: true only when an Edit-mode session is actively generating.
+    /// Kept static so tests can verify the full (mode × isGenerating) matrix without
+    /// constructing a view. `mode.allowsEdits` is the sole input from the mode — there
+    /// is no parallel boolean; the mode drives the banner.
+    static func showsEditingBanner(allowsEdits: Bool, isGenerating: Bool) -> Bool {
+        allowsEdits && isGenerating
+    }
+
     private var showsEditingEnabledBanner: Bool {
-        mode.allowsEdits && launcher.isGenerating
+        Self.showsEditingBanner(allowsEdits: mode.allowsEdits, isGenerating: launcher.isGenerating)
     }
 
     private var conversation: some View {
@@ -158,37 +166,35 @@ struct QueryConversationView: View {
     }
 
     private func composer(maxWidth: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .bottom, spacing: 10) {
-                TextField("Ask a question, or ask the Agent to update the wiki…", text: $draftMessage, axis: .vertical)
-                    .font(.body)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...6)
-                    .padding(.leading, QueryConversationMetrics.composerHorizontalPadding)
-                    .padding(.vertical, QueryConversationMetrics.composerVerticalPadding)
-                    .onSubmit(sendMessage)
-                    .disabled(!canType)
+        HStack(alignment: .bottom, spacing: 10) {
+            TextField("Ask a question, or ask the Agent to update the wiki…", text: $draftMessage, axis: .vertical)
+                .font(.body)
+                .textFieldStyle(.plain)
+                .lineLimit(1...6)
+                .padding(.leading, QueryConversationMetrics.composerHorizontalPadding)
+                .padding(.vertical, QueryConversationMetrics.composerVerticalPadding)
+                .onSubmit(sendMessage)
+                .disabled(!canType)
 
-                Button(action: sendMessage) {
-                    Image(systemName: sendButtonIcon)
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(canSend ? Color.white : Color.secondary)
-                        .frame(width: QueryConversationMetrics.sendButtonSize, height: QueryConversationMetrics.sendButtonSize)
-                        .background(sendButtonBackground, in: Circle())
-                }
-                    .buttonStyle(.borderless)
-                    .disabled(!canSend)
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .help(sendButtonTitle)
+            Button(action: sendMessage) {
+                Image(systemName: sendButtonIcon)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(canSend ? Color.white : Color.secondary)
+                    .frame(width: QueryConversationMetrics.sendButtonSize, height: QueryConversationMetrics.sendButtonSize)
+                    .background(sendButtonBackground, in: Circle())
             }
-            .padding(.trailing, QueryConversationMetrics.composerButtonInset)
-            .background(Color(nsColor: .controlBackgroundColor), in: Capsule())
-            .overlay {
-                Capsule()
-                    .strokeBorder(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.06), radius: 18, x: 0, y: 8)
+                .buttonStyle(.borderless)
+                .disabled(!canSend)
+                .keyboardShortcut(.return, modifiers: .command)
+                .help(sendButtonTitle)
         }
+        .padding(.trailing, QueryConversationMetrics.composerButtonInset)
+        .background(Color(nsColor: .controlBackgroundColor), in: Capsule())
+        .overlay {
+            Capsule()
+                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 1)
+        }
+        .shadow(color: Color.black.opacity(0.06), radius: 18, x: 0, y: 8)
         .frame(maxWidth: maxWidth)
     }
 
