@@ -31,6 +31,10 @@ struct QueryConversationView: View {
             // Belt-and-suspenders: clear the internals toggle when a run ends so a
             // later ingest/lint run doesn't inherit it and strand the view on
             // `AgentActivityView`. (AC.1)
+            // Invariant: the query launcher acquires the spawn slot exactly once per
+            // session (follow-up turns use stdin, not a new awaitSpawnSlot), so
+            // isRunning only goes false when the session truly ends — this observer
+            // never fires on a spurious transient.
             if !isRunning { showsInternals = false }
         }
         // NOTE: the per-turn edit lock is NO LONGER driven from this view. It is

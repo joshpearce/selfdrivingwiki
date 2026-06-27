@@ -114,6 +114,104 @@ struct SpawnGateTests {
         #expect(!b.isRunning)
     }
 
+    // MARK: - Shared gate is FIFO across three launchers
+
+    /// Three launchers A, B, C share one gate. A acquires first; B and C enqueue
+    /// in that order. When A releases, B (the FIFO head) acquires — not C. When B
+    /// releases, C acquires. The waiter count decrements correctly at each step.
+    @Test func sharedGateIsFIFOAcrossLaunchers() async {
+        let gate = SpawnGate()
+        let a = makeLauncher(gate: gate)
+        let b = makeLauncher(gate: gate)
+        let c = makeLauncher(gate: gate)
+
+        // A acquires the shared slot fast-path.
+        let aAcquired = await a.awaitSpawnSlot()
+        #expect(aAcquired)
+        #expect(a.isRunning)
+
+        // B enqueues behind A.
+        let bTask = Task { await b.awaitSpawnSlot() }
+        await Task.yield()
+        await Task.yield()
+
+        // C enqueues behind B (yield again so B's continuation is registered first).
+        let cTask = Task { await c.awaitSpawnSlot() }
+        await Task.yield()
+        await Task.yield()
+
+        // Both B and C are waiting; order is B then C.
+        #expect(a.spawnSlotWaiterCount == 2)
+        #expect(!b.isRunning)
+        #expect(!c.isRunning)
+
+        // A releases: FIFO hands the slot to B, not C.
+        a.releaseSpawnSlot()
+        let bAcquired = await bTask.value
+        #expect(bAcquired)
+        #expect(b.isRunning)
+        #expect(!a.isRunning)
+        // C is still waiting.
+        #expect(b.spawnSlotWaiterCount == 1)
+        #expect(!c.isRunning)
+
+        // B releases: slot goes to C.
+        b.releaseSpawnSlot()
+        let cAcquired = await cTask.value
+        #expect(cAcquired)
+        #expect(c.isRunning)
+        #expect(!b.isRunning)
+        #expect(c.spawnSlotWaiterCount == 0)
+
+        c.releaseSpawnSlot()
+        #expect(!c.isRunning)
+    }
+
+    // MARK: - Shared gate skips a cancelled waiter and wakes the next
+
+    /// With three launchers on one gate: A holds, B enqueues, C enqueues (count 2).
+    /// Cancelling B's task causes it to self-remove (count 1). When A releases, the
+    /// slot skips the dead B and goes directly to C.
+    @Test func sharedGateSkipsCancelledWaiterAndWakesNext() async {
+        let gate = SpawnGate()
+        let a = makeLauncher(gate: gate)
+        let b = makeLauncher(gate: gate)
+        let c = makeLauncher(gate: gate)
+
+        // A holds the slot.
+        _ = await a.awaitSpawnSlot()
+        #expect(a.isRunning)
+
+        // B enqueues behind A.
+        let bTask = Task<Bool, Never> { await b.awaitSpawnSlot() }
+        await Task.yield()
+        await Task.yield()
+
+        // C enqueues behind B.
+        let cTask = Task { await c.awaitSpawnSlot() }
+        await Task.yield()
+        await Task.yield()
+        #expect(a.spawnSlotWaiterCount == 2)
+
+        // Cancel B — it self-removes from the queue.
+        bTask.cancel()
+        let bAcquired = await bTask.value
+        #expect(!bAcquired)
+        #expect(!b.isRunning)
+        #expect(a.spawnSlotWaiterCount == 1)  // only C remains
+
+        // A releases: slot must skip the dead B and go to C.
+        a.releaseSpawnSlot()
+        let cAcquired = await cTask.value
+        #expect(cAcquired)
+        #expect(c.isRunning)
+        #expect(!a.isRunning)
+        #expect(c.spawnSlotWaiterCount == 0)
+
+        c.releaseSpawnSlot()
+        #expect(!c.isRunning)
+    }
+
     // MARK: - Cancelled waiter on shared gate self-removes
 
     /// A second launcher's `awaitSpawnSlot()` Task that is cancelled while queued

@@ -192,10 +192,14 @@ final class AgentLauncher {
     ///    that are initialized from the same `SpawnGate` instance. One `claude`
     ///    process at a time across ingest / ask / edit / lint, regardless of which
     ///    launcher instance initiates it. `isRunning` is per-instance: it means
-    ///    "THIS launcher has a claude process running." A brief transient window
-    ///    where `isRunning` is `false` before the next waiter re-acquires is
-    ///    acceptable — all observers guard on `if isRunning` in the next event-loop
-    ///    iteration. Extraction does NOT take the spawn slot, so a `pdf2md`
+    ///    "THIS launcher has a claude process running." A brief `isRunning` dip
+    ///    (false on release, true when the next waiter resumes) only occurs on the
+    ///    INGEST launcher — the only launcher whose runner can issue two back-to-back
+    ///    `awaitSpawnSlot` calls. Ask/edit query launchers acquire the slot exactly
+    ///    once per interactive session; follow-up turns go to stdin via
+    ///    `sendInteractiveMessage`, never a new `awaitSpawnSlot` — so their
+    ///    `if !isRunning` observers never see a spurious false transient.
+    ///    Extraction does NOT take the spawn slot, so a `pdf2md`
     ///    conversion may overlap a `claude` query run.
     /// 2. **Edit lock** (`store.isAgentRunning`), driven by TWO mechanisms:
     ///      - **Session level** (`onLock`/`onUnlock` around the spawn): for

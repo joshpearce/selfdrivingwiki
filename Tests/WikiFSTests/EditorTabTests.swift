@@ -106,6 +106,20 @@ struct EditorTabTests {
         #expect(model.selection == .page(a.id))
     }
 
+    // MARK: - Two distinct singleton tabs coexist
+
+    /// The headline AC: `.ask` and `.edit` are distinct singleton keys and can
+    /// occupy two separate, coexisting tabs in the same store. Opening one after
+    /// the other must produce exactly two tabs, each carrying its own selection.
+    @Test func askAndEditTabsCoexist() throws {
+        let (model, _) = try tempModel()
+        model.openTab(.ask)
+        model.openTab(.edit)
+        #expect(model.tabs.count == 2)
+        #expect(model.tabs.contains { $0.selection == .ask })
+        #expect(model.tabs.contains { $0.selection == .edit })
+    }
+
     // MARK: - Singleton reuse
 
     @Test func singletonSelectionReusesExistingTab() throws {

@@ -50,8 +50,11 @@ struct AgentSpawnSlotTests {
         #expect(launcher.spawnSlotWaiterCount == 1)
         #expect(launcher.isRunning)
 
-        // Releasing hands the slot to the waiter; isRunning stays true (atomic
-        // handoff) and the waiter reports it acquired the slot.
+        // Releasing hands the slot: the gate keeps its `held` flag true across the
+        // atomic handoff; the launcher's per-instance `isRunning` is cleared on
+        // release and re-asserts when the waiter resumes. The test samples
+        // `isRunning` only after `await secondTask.value`, so it observes the
+        // re-asserted true.
         launcher.releaseSpawnSlot()
         let secondAcquired = await secondTask.value
         #expect(secondAcquired)
