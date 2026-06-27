@@ -78,6 +78,30 @@ struct SandboxConfigTests {
     #expect(loaded.enabled == false)
   }
 
+  /// Simulates the full `saveSandbox()` flow when `sandbox-config.json` is corrupt:
+  /// load degrades to `.default`, we set `enabled = true`, save succeeds, and the
+  /// reloaded config reflects the toggle with empty `extraAllowedPaths` (graceful
+  /// degradation — no crash, no data invented).
+  @Test func saveSandboxOnCorruptFileDegradesToDefault() throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sbconfig-corrupt-save-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    // Pre-seed a corrupt file.
+    let url = dir.appendingPathComponent(SandboxConfig.fileName, isDirectory: false)
+    try "{not json".data(using: .utf8)!.write(to: url)
+
+    // Simulate saveSandbox(): load (degrades to .default), flip enabled, save.
+    var config = SandboxConfig.load(from: dir)
+    config.enabled = true
+    try config.save(to: dir)
+
+    // Reload: enabled reflects the toggle; extraAllowedPaths is empty (from .default).
+    let reloaded = SandboxConfig.load(from: dir)
+    #expect(reloaded.enabled == true)
+    #expect(reloaded.extraAllowedPaths == "")
+  }
+
   // MARK: - parsedExtraAllowedPaths
 
   @Test func parsesAbsolutePathsOnePerLine() {

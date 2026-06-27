@@ -88,8 +88,13 @@ struct AgentCommandSettingsView: View {
     }
 
     private func saveSandbox() {
+        // Load fresh to PRESERVE extraAllowedPaths — we only mutate `enabled` here.
+        // Safe because this view is currently the sole writer of sandbox-config.json;
+        // revisit if an extraAllowedPaths editor is added. A corrupt file degrades to
+        // .default (empty paths), which is accepted.
         var config = SandboxConfig.load(from: containerDirectory)
         config.enabled = sandboxEnabled
+        // try? is deliberate: the view has no error-reporting surface. Matches saveCommand().
         try? config.save(to: containerDirectory)
     }
 
