@@ -11,6 +11,7 @@ struct AgentCommandSettingsView: View {
     @State private var prefixArguments: String
     @State private var modelOverride: String
     @State private var extraEnvironment: String
+    @State private var sandboxEnabled: Bool
 
     let containerDirectory: URL
 
@@ -21,6 +22,7 @@ struct AgentCommandSettingsView: View {
         _prefixArguments = State(initialValue: config.prefixArguments)
         _modelOverride = State(initialValue: config.modelOverride)
         _extraEnvironment = State(initialValue: config.extraEnvironment)
+        _sandboxEnabled = State(initialValue: SandboxConfig.load(from: containerDirectory).enabled)
     }
 
     var body: some View {
@@ -45,6 +47,16 @@ struct AgentCommandSettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
+                Section {
+                    Toggle("Run agent in sandbox", isOn: $sandboxEnabled)
+                } header: {
+                    Text("Sandbox")
+                } footer: {
+                    Text("When on, the main agent and Edit sessions run under a seatbelt that confines writes to the wiki DB and scratch directory (plus ~/.claude). The Ask session is always read-only sandboxed regardless of this setting.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .formStyle(.grouped)
 
@@ -61,6 +73,7 @@ struct AgentCommandSettingsView: View {
         .onChange(of: prefixArguments) { _, _ in saveCommand() }
         .onChange(of: modelOverride) { _, _ in saveCommand() }
         .onChange(of: extraEnvironment) { _, _ in saveCommand() }
+        .onChange(of: sandboxEnabled) { _, _ in saveSandbox() }
     }
 
     // MARK: - Actions
@@ -71,6 +84,12 @@ struct AgentCommandSettingsView: View {
             prefixArguments: prefixArguments,
             modelOverride: modelOverride,
             extraEnvironment: extraEnvironment)
+        try? config.save(to: containerDirectory)
+    }
+
+    private func saveSandbox() {
+        var config = SandboxConfig.load(from: containerDirectory)
+        config.enabled = sandboxEnabled
         try? config.save(to: containerDirectory)
     }
 
