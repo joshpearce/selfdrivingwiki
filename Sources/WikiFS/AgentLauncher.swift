@@ -449,7 +449,7 @@ final class AgentLauncher {
         }
 
         let sandbox = resolveSandboxInvocation(wikiID: wikiID, scratch: scratch, dir: dir)
-        if sandbox != nil { createSandboxRelocationDirs(in: scratch) }
+        if sandbox != nil { createSandboxTmpDir(in: scratch) }
         let command = OperationCommand.build(
             operation: operation,
             wikiRoot: wikiRoot,
@@ -652,7 +652,7 @@ final class AgentLauncher {
             allowWikiEdits: allowWikiEdits,
             editSandbox: editSandbox,
             readOnlySandbox: readOnlySandbox)
-        if sandbox != nil { createSandboxRelocationDirs(in: scratch) }
+        if sandbox != nil { createSandboxTmpDir(in: scratch) }
         let command = OperationCommand.buildInteractiveQuery(
             operation: operation,
             wikiRoot: wikiRoot,
@@ -1045,11 +1045,14 @@ final class AgentLauncher {
     /// Resolve the seatbelt sandbox invocation for this spawn, or `nil` to run
     /// un-sandboxed. Loads `SandboxConfig` FRESH at spawn (so Settings changes apply
     /// on the next run, mirroring `AgentCommandConfig`). When enabled, resolves the
-    /// per-run scratch path + the active wiki's DB path and creates the provider's
-    /// relocation subdirs inside scratch (the app process is unsandboxed; only the
-    /// spawned child is confined). Returns `nil` (fail-open) when disabled OR when a
-    /// required path can't be resolved — logged. Fail-open is acceptable because the
-    /// feature is opt-in and default-off.
+    /// per-run scratch path + the active wiki's DB path. Returns `nil` (fail-open)
+    /// when disabled OR when a required path can't be resolved — logged. Fail-open is
+    /// acceptable because the feature is opt-in and default-off.
+    ///
+    /// This function ONLY resolves the invocation; it does NOT create any directories.
+    /// Each spawn site that receives a non-nil result MUST call `createSandboxTmpDir(in:)`
+    /// before launching the child so that `TMPDIR` (set by `OperationCommand.applySandbox`)
+    /// points at a directory that actually exists.
     private func resolveSandboxInvocation(
         wikiID: String,
         scratch: URL,
@@ -1091,8 +1094,8 @@ final class AgentLauncher {
     /// whenever a non-nil sandbox is applied so the directory exists before the
     /// child process tries to write into it. Best-effort: failure (e.g. scratch
     /// unwritable) is surfaced later by the child's own write errors.
-    private func createSandboxRelocationDirs(in scratch: URL) {
-        let tmp = scratch.appendingPathComponent(".tmp", isDirectory: true)
+    private func createSandboxTmpDir(in scratch: URL) {
+        let tmp = scratch.appendingPathComponent(OperationCommand.tmpRelocationLeaf, isDirectory: true)
         try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     }
 }
