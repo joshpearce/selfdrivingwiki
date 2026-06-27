@@ -2,6 +2,14 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-26 — Lint Page, WikilinksFixer
+
+Some links to sources were showing up with "\]]" although they did not throw off the renderer.  
+
+* Added WikilinksFixer to the code to find and correct these.
+* Added a "Lint" button to the page and the page context menu.
+* Added some prompt instructions to the agent when linting a single page.
+
 ## 2026-06-26 — Vendored design skills (swiftui-pro, macos-design, typography-designer)
 
 Three public Agent Skills vendored into `.polytoken/skills/` (project-level) so
