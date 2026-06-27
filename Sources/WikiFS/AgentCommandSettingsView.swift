@@ -105,5 +105,8 @@ struct AgentCommandSettingsView: View {
         modelOverride = cmdDefaults.modelOverride
         extraEnvironment = cmdDefaults.extraEnvironment
         saveCommand()
+        // Also reset the sandbox toggle so "Reset to Default" is fully consistent.
+        sandboxEnabled = SandboxConfig.default.enabled
+        saveSandbox()
     }
 }

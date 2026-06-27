@@ -16,8 +16,8 @@ struct WikiFSApp: App {
     private let containerDirectory: URL
     @State private var manager: WikiManager
     @State private var fileProvider = FileProviderSpike()
-    /// All three launchers share one `SpawnGate` so ingest, ask, and edit spawns
-    /// serialize globally — only one `claude -p` process runs at a time.
+    /// All three launchers share one `GenerationGate` so ingest, ask-turn, and
+    /// edit-turn generations serialize globally — only one active generation at a time.
     @State private var agentLauncher: AgentLauncher
     @State private var askLauncher: AgentLauncher
     @State private var editLauncher: AgentLauncher
@@ -53,12 +53,14 @@ struct WikiFSApp: App {
         _manager = State(initialValue: WikiManager(containerDirectory: directory))
         _extractionCoordinator = State(
             initialValue: ExtractionCoordinator(containerDirectory: directory))
-        // All three launchers share one SpawnGate so ingest, ask, and edit spawns
-        // contend on the same FIFO queue — only one claude -p process runs at a time.
-        let spawnGate = SpawnGate()
-        _agentLauncher = State(initialValue: AgentLauncher(spawnGate: spawnGate))
-        _askLauncher   = State(initialValue: AgentLauncher(spawnGate: spawnGate))
-        _editLauncher  = State(initialValue: AgentLauncher(spawnGate: spawnGate))
+        // All three launchers share one GenerationGate so ingest, ask-turn, and
+        // edit-turn generations contend on the same FIFO queue — only one active
+        // generation at a time. Interactive sessions' processes coexist freely;
+        // only one GENERATES at a time (per-turn gate).
+        let generationGate = GenerationGate()
+        _agentLauncher = State(initialValue: AgentLauncher(generationGate: generationGate))
+        _askLauncher   = State(initialValue: AgentLauncher(generationGate: generationGate))
+        _editLauncher  = State(initialValue: AgentLauncher(generationGate: generationGate))
     }
 
     var body: some Scene {

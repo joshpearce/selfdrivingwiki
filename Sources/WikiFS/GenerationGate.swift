@@ -1,27 +1,37 @@
 import Foundation
 
-/// A shared, FIFO-serialized spawn gate that enforces "at most one claude
-/// process running at a time" across any number of `AgentLauncher` instances.
+/// A shared, FIFO-serialized generation gate that enforces "at most one active
+/// generation across any number of `AgentLauncher` instances."
 ///
-/// Moving the gate out of `AgentLauncher` means a second launcher (e.g.
-/// `editLauncher`) can share the same gate with the first, so Ask + Edit +
-/// ingest still serialize globally even though they use different launchers.
+/// "Active generation" means:
+/// - A one-shot `claude -p` run (ingest / lint / query) holds the gate for the
+///   entire run (spawn to finish).
+/// - An interactive session (Ask / Edit) holds the gate only for the duration of
+///   ONE TURN — from when the user's message is written to stdin until the agent
+///   emits `messageStop` or `result`. The interactive process itself stays alive
+///   between turns without holding the gate, so a second interactive session can
+///   hold its own process simultaneously; only one GENERATES at a time.
+///
+/// This is a significant semantic shift from the old "spawn gate" model: holding
+/// the gate does NOT mean "a process is alive" — it means "a process is actively
+/// producing output." Use `AgentLauncher.isRunning` to test whether a process is
+/// alive; use `AgentLauncher.isGenerating` to test whether a turn is in flight.
 ///
 /// The API is intentionally minimal: `acquire()` / `release()` / `waiterCount`.
 /// The same cancellation-safe `CheckedContinuation` + `withTaskCancellationHandler`
 /// shape as the original per-instance slot is preserved — a cancelled waiter must
 /// never be handed the slot.
 @MainActor
-final class SpawnGate {
+final class GenerationGate {
 
     // MARK: - Waiter
 
-    /// One queued spawn request. A class so the cancellation handler can identify
-    /// its waiter by reference and self-remove it from `waiters` — a cancelled
-    /// waiter must never be handed the slot. `@unchecked Sendable` because it is
-    /// only ever touched on the main actor (registration in `acquire`'s
-    /// continuation; removal in the cancel handler's `@MainActor` hop).
-    fileprivate final class SpawnWaiter: @unchecked Sendable {
+    /// One queued generation request. A class so the cancellation handler can
+    /// identify its waiter by reference and self-remove it from `waiters` — a
+    /// cancelled waiter must never be handed the slot. `@unchecked Sendable`
+    /// because it is only ever touched on the main actor (registration in
+    /// `acquire`'s continuation; removal in the cancel handler's `@MainActor` hop).
+    fileprivate final class GenerationWaiter: @unchecked Sendable {
         var continuation: CheckedContinuation<Void, Never>?
         var didReceiveSlot = false
         var didCancel = false
@@ -33,14 +43,14 @@ final class SpawnGate {
     /// that share this gate).
     private var held = false
     /// FIFO queue of callers awaiting the slot.
-    private var waiters: [SpawnWaiter] = []
+    private var waiters: [GenerationWaiter] = []
 
     // MARK: - Interface
 
     /// The number of waiters currently queued (test seam).
     var waiterCount: Int { waiters.count }
 
-    /// Acquire the spawn slot. Fast path: if the slot is free and nobody is
+    /// Acquire the generation slot. Fast path: if the slot is free and nobody is
     /// queued, takes it immediately without suspending (zero overhead for the
     /// common single-run case). Otherwise enqueues a cancellation-safe waiter
     /// and suspends until the slot is handed over.
@@ -56,7 +66,7 @@ final class SpawnGate {
             held = true
             return true
         }
-        let waiter = SpawnWaiter()
+        let waiter = GenerationWaiter()
         await withTaskCancellationHandler {
             await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
                 if waiter.didCancel {
@@ -86,12 +96,12 @@ final class SpawnGate {
         return waiter.didReceiveSlot
     }
 
-    /// Release the spawn slot, handing it to the next live waiter (FIFO) or
+    /// Release the generation slot, handing it to the next live waiter (FIFO) or
     /// freeing it.
     ///
     /// Atomic transfer: `held` stays `true` on a handoff — there is no window
     /// where another task could grab the slot via the fast path and cause a
-    /// double-spawn. Only when no live waiters remain does `held` become `false`.
+    /// double-generation. Only when no live waiters remain does `held` become `false`.
     func release() {
         // Pop the next non-cancelled waiter and hand off the slot. `held` stays
         // `true` on a handoff so the transfer is atomic — there is no window

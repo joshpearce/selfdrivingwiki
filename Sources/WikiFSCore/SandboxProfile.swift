@@ -117,16 +117,23 @@ public enum SandboxProfile {
 
     /// Build a read-only `SandboxInvocation` that confines the agent to scratch
     /// writes only. No wiki DB path is allowed — wikictl writes will fail.
+    ///
+    /// Both `homePath` and `scratchDir` are canonicalized via `realpath` so a
+    /// symlinked HOME (e.g. on systems where the home directory path goes through
+    /// a symlink) does not make the `~/.claude` allow rule silently fail. For
+    /// non-existent paths `realpath` falls back to the input, which matches the
+    /// behavior in `invocation(...)`.
     public static func readOnlyInvocation(
         homePath: String,
         scratchDir: String
     ) -> SandboxInvocation {
+        let resolvedHome = Self.canonical(homePath)
         let resolvedScratch = Self.canonical(scratchDir)
         let profile = generateReadOnly(scratchDir: resolvedScratch)
         return SandboxInvocation(
             profile: profile,
             defines: [
-                ("HOME", homePath),
+                ("HOME", resolvedHome),
                 ("SCRATCH_DIR", resolvedScratch),
             ]
         )
@@ -148,6 +155,11 @@ public enum SandboxProfile {
         func realPath(_ s: String) -> String {
             Self.canonical(s)
         }
+        // Canonicalize ALL paths — including HOME — so a symlinked component (e.g.
+        // a HOME that goes through a symlink, or the classic `/tmp` → `/private/tmp`
+        // on macOS) does not make a seatbelt allow rule silently fail. Non-existent
+        // paths fall back to the input (realpath returns nil for non-existent paths).
+        let resolvedHome = realPath(homePath)
         let resolvedScratch = realPath(scratchDir)
         let resolvedDB = realPath(wikiDBPath)
         let resolvedExtra = extraAllowedPaths.map(realPath)
@@ -162,7 +174,7 @@ public enum SandboxProfile {
         return SandboxInvocation(
             profile: profile,
             defines: [
-                ("HOME", homePath),
+                ("HOME", resolvedHome),
                 ("SCRATCH_DIR", resolvedScratch),
                 ("WIKI_DB", resolvedDB),
             ]

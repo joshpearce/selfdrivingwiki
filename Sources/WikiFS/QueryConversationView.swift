@@ -39,10 +39,8 @@ struct QueryConversationView: View {
             // Belt-and-suspenders: clear the internals toggle when a run ends so a
             // later ingest/lint run doesn't inherit it and strand the view on
             // `AgentActivityView`. (AC.1)
-            // Invariant: the query launcher acquires the spawn slot exactly once per
-            // session (follow-up turns use stdin, not a new awaitSpawnSlot), so
-            // isRunning only goes false when the session truly ends — this observer
-            // never fires on a spurious transient.
+            // Invariant: interactive session's isRunning only goes false when the
+            // process truly exits — this observer never fires on spurious transients.
             if !isRunning { showsInternals = false }
         }
         // NOTE: the per-turn edit lock is NO LONGER driven from this view. It is
@@ -54,10 +52,14 @@ struct QueryConversationView: View {
     }
 
     private var controls: some View {
-        // Only shown during an active query run (gated by `showsDebugControls`).
+        // Only shown during an active query run or while awaiting the gate
+        // (gated by `showsDebugControls`). The spinner shows only while generating;
+        // the stop button shows in both states.
         HStack(spacing: 8) {
-            ProgressView()
-                .controlSize(.small)
+            if launcher.isGenerating {
+                ProgressView()
+                    .controlSize(.small)
+            }
             Menu {
                 Toggle("Show internals", isOn: $showsInternals)
                 if let status = launcher.exitStatus {
@@ -74,12 +76,23 @@ struct QueryConversationView: View {
             .labelStyle(.iconOnly)
             .menuStyle(.borderlessButton)
             .help("Show activity and transcript internals")
+            // Stop button: visible while generating OR awaiting the generation slot.
+            // Wired to stopAgent() which cancels any pending send and terminates the process.
+            Button(action: { launcher.stopAgent() }) {
+                Image(systemName: "stop.circle.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Color.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Stop the current response")
         }
     }
 
     private var showsDebugControls: Bool {
-        AgentLauncher.showsQueryDebugControls(
-            isGenerating: launcher.isGenerating, runningKind: launcher.runningKind)
+        // Show controls while generating (spinner + menu + stop) OR while awaiting
+        // the generation slot (stop only — the session is live but waiting its turn).
+        (launcher.isGenerating || launcher.isAwaitingGenerationSlot)
+            && launcher.runningKind == .query
     }
 
     @ViewBuilder
@@ -230,10 +243,14 @@ struct QueryConversationView: View {
         fileProvider.path != nil
             && canType
             && !launcher.isGenerating
+            && !launcher.isAwaitingGenerationSlot
             && !draftMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var sendButtonTitle: String {
+        if launcher.isAwaitingGenerationSlot {
+            return "Waiting for the other session to finish before sending…"
+        }
         if launcher.isGenerating {
             return "Wait for the response before sending the next message"
         }
