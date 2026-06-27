@@ -35,6 +35,29 @@ struct SandboxConfigTests {
     #expect(loaded.extraAllowedPaths == "/tmp/one\n/tmp/two")
   }
 
+  /// Mirrors the exact load→mutate-`enabled`→save round-trip performed by
+  /// `AgentCommandSettingsView.saveSandbox()`: a pre-existing `extraAllowedPaths`
+  /// must survive an `enabled`-only mutation.
+  @Test func mutatingEnabledPreservesExtraAllowedPaths() throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sbconfig-toggle-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    // Step 1: save an initial config with paths set and sandbox off.
+    let initial = SandboxConfig(enabled: false, extraAllowedPaths: "/some/path\n/other")
+    try initial.save(to: dir)
+
+    // Step 2: simulate saveSandbox() — load, flip enabled, save.
+    var loaded = SandboxConfig.load(from: dir)
+    loaded.enabled = true
+    try loaded.save(to: dir)
+
+    // Step 3: reload and assert both fields survived.
+    let reloaded = SandboxConfig.load(from: dir)
+    #expect(reloaded.enabled == true)
+    #expect(reloaded.extraAllowedPaths == "/some/path\n/other")
+  }
+
   @Test func missingFileDegradesToDefault() {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sbconfig-missing-\(UUID().uuidString)")
     let loaded = SandboxConfig.load(from: dir)
