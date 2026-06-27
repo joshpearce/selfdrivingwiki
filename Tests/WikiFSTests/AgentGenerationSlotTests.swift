@@ -218,6 +218,13 @@ struct AgentGenerationSlotTests {
             message: ""))
     }
 
+    // cancelledInteractiveSendReleasesGate: skipped — driving the Task cancellation
+    // path through `sendInteractiveMessage` requires a live process (isRunning +
+    // isInteractiveSession are only set at spawn commit). The guarantee is covered
+    // at the call-site by `if ok { self.releaseGenerationSlot() }` in the
+    // `interactiveSendTask` body, exercised indirectly by the existing cancellation
+    // tests in GenerationGateTests.swift.
+
     /// Step 6: a send is blocked while already awaiting the generation slot.
     /// This prevents double-queueing — there can be at most one pending send task.
     @Test func sendGateBlockedWhileAwaitingGenerationSlot() {

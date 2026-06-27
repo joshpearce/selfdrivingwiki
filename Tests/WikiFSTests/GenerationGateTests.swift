@@ -9,18 +9,30 @@ import Testing
 /// at the same time even though they run on different launchers. Interactive
 /// sessions' PROCESSES can coexist; only one GENERATES at a time (per-turn gate).
 ///
-/// The suite has four tests:
+/// Tests:
 ///
-/// 1. `sharedGateSerializesAcrossLaunchers` — the KEY invariant: A holds the slot,
-///    B (on a different launcher but the SAME gate) must wait; A's release hands the
-///    slot to B atomically.
-/// 2. `independentGatesDoNotSerialize` — isolation/contrast: launchers with SEPARATE
-///    default gates contend on independent queues and can both acquire concurrently.
-/// 3. `sharedGateIsFIFOAcrossLaunchers` — FIFO ordering: three launchers on one
-///    gate enqueue in order and receive the slot in that order.
-/// 4. `cancelledWaiterOnSharedGateSelfRemoves` — safety: a waiter that is cancelled
-///    while queued on a shared gate self-removes cleanly; the holder's subsequent
-///    release finds no live waiters and frees the slot without a stale handoff.
+/// Primitives (cross-instance serialization and cancellation):
+/// - `sharedGateSerializesAcrossLaunchers` — the KEY invariant: A holds the slot,
+///   B (on a different launcher but the SAME gate) must wait; A's release hands the
+///   slot to B atomically.
+/// - `independentGatesDoNotSerialize` — isolation/contrast: launchers with SEPARATE
+///   default gates contend on independent queues and can both acquire concurrently.
+/// - `sharedGateIsFIFOAcrossLaunchers` — FIFO ordering: three launchers on one
+///   gate enqueue in order and receive the slot in that order.
+/// - `sharedGateSkipsCancelledWaiterAndWakesNext` — release skips a dead waiter.
+/// - `cancelledWaiterOnSharedGateSelfRemoves` — safety: a waiter that is cancelled
+///   while queued on a shared gate self-removes cleanly; the holder's subsequent
+///   release finds no live waiters and frees the slot without a stale handoff.
+///
+/// Generation-scoped model (Step 6 behavioral guarantees):
+/// - `idleHolderDoesNotBlockPeer_modelsIngestBetweenTurns` — THE key regression
+///   guard: an idle interactive session (not mid-turn) holds nothing, so ingest /
+///   another session acquires immediately. Contrasts with the OLD spawn-gate model.
+/// - `turnsInterleaveAcrossTwoSessions` — "only one generates at a time" across two
+///   live sessions; turn 1/turn 2 interleaving is strictly serialized.
+/// - `releaseGenerationSlotIsIdempotent` — double-release is a no-op; guarded by
+///   `holdsGenerationSlot`, so a spurious second release does NOT hand the slot to a
+///   waiting peer. Proven observable: a third waiter is NOT woken by the double call.
 ///
 /// NOTE: `awaitGenerationSlot()` does NOT set `isRunning` (process lifetime is
 /// decoupled from gate ownership in Step 6). Tests verify slot behavior via the
@@ -242,5 +254,141 @@ struct GenerationGateTests {
         a.releaseGenerationSlot()
         // Direct gate check confirms the shared queue is empty after the release.
         #expect(gate.waiterCount == 0)
+    }
+
+    // MARK: - Generation-scoped model: idle holder does not block peers
+
+    /// THE key regression guard for the Step 6 semantic shift.
+    ///
+    /// In the OLD spawn-gate model an interactive session held the gate for its
+    /// entire lifetime — so ingest (or a second session) was blocked even when the
+    /// first session was sitting idle between turns.
+    ///
+    /// In the NEW generation-scoped model the gate is per-TURN: releasing at the
+    /// turn boundary (`ingestStdout` endsGeneration / `finish()`) leaves the gate
+    /// free even though the process is still alive. This test proves that guarantee:
+    ///
+    /// - `session` acquires (simulates a turn generating).
+    /// - `session` releases at the turn boundary (session now idle — no process
+    ///   lifecycle change, gate is free).
+    /// - `ingest` acquires IMMEDIATELY via the fast path (zero suspension); the
+    ///   waiter count stays 0, proving no queuing occurred.
+    @Test func idleHolderDoesNotBlockPeer_modelsIngestBetweenTurns() async {
+        let gate = GenerationGate()
+        let session = makeLauncher(gate: gate)
+        let ingest = makeLauncher(gate: gate)
+
+        // Session acquires the slot for its turn (simulates the send → endsGeneration arc).
+        let sessionAcquired = await session.awaitGenerationSlot()
+        #expect(sessionAcquired)
+
+        // Turn boundary: session releases. Process stays "alive" (isRunning would be
+        // true in production) but the gate is free — this is the key Step 6 property.
+        session.releaseGenerationSlot()
+
+        // With the old spawn-gate model the gate would still be held here and ingest
+        // would suspend. With the generation-scoped model the fast path runs.
+        let ingestAcquired = await ingest.awaitGenerationSlot()
+        #expect(ingestAcquired)
+        // No queuing: fast path. Proves idle session does NOT block peer.
+        #expect(ingest.generationSlotWaiterCount == 0)
+
+        ingest.releaseGenerationSlot()
+    }
+
+    // MARK: - Generation-scoped model: turn interleaving across two live sessions
+
+    /// Models "only one generates at a time" with both sessions persisting across
+    /// multiple turns. Each turn is serialized through the shared gate; between turns
+    /// the gate is free and the next turn (from either session) can run immediately.
+    ///
+    /// Sequence:
+    ///   ask turn 1 → edit queues → ask releases → edit acquires → edit releases
+    ///   → ask turn 2 acquires immediately (fast path, no queuing).
+    @Test func turnsInterleaveAcrossTwoSessions() async {
+        let gate = GenerationGate()
+        let ask = makeLauncher(gate: gate)
+        let edit = makeLauncher(gate: gate)
+
+        // ask starts turn 1.
+        let askTurn1 = await ask.awaitGenerationSlot()
+        #expect(askTurn1)
+
+        // edit tries to generate concurrently — must queue (only one generates at a time).
+        let editTask = Task { await edit.awaitGenerationSlot() }
+        await Task.yield()
+        await Task.yield()
+        #expect(ask.generationSlotWaiterCount == 1)
+
+        // ask turn 1 ends → slot transfers atomically to edit.
+        ask.releaseGenerationSlot()
+        let editAcquired = await editTask.value
+        #expect(editAcquired)
+        #expect(edit.generationSlotWaiterCount == 0)
+
+        // edit turn ends → gate is free. ask starts turn 2 on the fast path.
+        edit.releaseGenerationSlot()
+        let askTurn2 = await ask.awaitGenerationSlot()
+        #expect(askTurn2)
+        // Fast path: no queuing for ask's next turn (gate was free).
+        #expect(ask.generationSlotWaiterCount == 0)
+
+        ask.releaseGenerationSlot()
+    }
+
+    // MARK: - Idempotent release: double-call is a no-op
+
+    /// `releaseGenerationSlot()` is guarded by the private `holdsGenerationSlot`
+    /// flag so a double-call is a no-op — it does NOT hand the slot to the next
+    /// waiter a second time.
+    ///
+    /// The test makes the bug observable: with A, B, C queued in that order,
+    ///   A.release() → B acquires (C still waiting, count == 1).
+    ///   A.release() AGAIN → no-op; C must NOT be woken prematurely (count still 1).
+    ///   B.release() → C acquires normally.
+    ///
+    /// A buggy implementation (no `holdsGenerationSlot` guard) would call
+    /// `gate.release()` on the spurious second call, waking C early and leaving B
+    /// holding the slot while C also thinks it holds the slot — a double-generation.
+    @Test func releaseGenerationSlotIsIdempotent() async {
+        let gate = GenerationGate()
+        let a = makeLauncher(gate: gate)
+        let b = makeLauncher(gate: gate)
+        let c = makeLauncher(gate: gate)
+
+        // A holds the slot.
+        _ = await a.awaitGenerationSlot()
+
+        // B enqueues behind A.
+        let bTask = Task { await b.awaitGenerationSlot() }
+        await Task.yield()
+        await Task.yield()
+
+        // C enqueues behind B.
+        let cTask = Task { await c.awaitGenerationSlot() }
+        await Task.yield()
+        await Task.yield()
+        #expect(a.generationSlotWaiterCount == 2)
+
+        // A's first release hands the slot to B (FIFO).
+        a.releaseGenerationSlot()
+        let bAcquired = await bTask.value
+        #expect(bAcquired)
+        // C is still waiting.
+        #expect(b.generationSlotWaiterCount == 1)
+
+        // A's spurious second release must be a no-op — `holdsGenerationSlot` is
+        // false so the guard exits immediately and `gate.release()` is never called.
+        a.releaseGenerationSlot()
+        // C must still be waiting — it was NOT woken by the spurious release.
+        #expect(b.generationSlotWaiterCount == 1)
+
+        // B releases properly: C acquires.
+        b.releaseGenerationSlot()
+        let cAcquired = await cTask.value
+        #expect(cAcquired)
+        #expect(c.generationSlotWaiterCount == 0)
+
+        c.releaseGenerationSlot()
     }
 }
