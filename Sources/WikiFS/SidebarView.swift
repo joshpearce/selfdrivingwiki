@@ -20,12 +20,43 @@ struct SidebarView: View {
     /// "Extracting…" spinner on those rows. Independent of `ingestingSourceIDs`.
     var extractingSourceIDs: Set<PageID> = []
 
+    @Binding var showingAddFromZotero: Bool
+    @Binding var showingImportMarkdown: Bool
+    var onAddFromURL: () -> Void
+    var onNewPage: () -> Void
+    var isZoteroConfigured: Bool = false
+
     @State private var renameTarget: WikiPageSummary?
     @State private var renameText: String = ""
-    /// Whether the "Pages" section is expanded. Pure UI state — not persisted.
-    @State private var isPagesExpanded = true
-    @State private var isToolsExpanded = true
-    @State private var isSystemExpanded = true
+
+    /// Which section is currently shown. Like Xcode's navigator, the icon bar at
+    /// the top of the sidebar is a mutually-exclusive selector — exactly one
+    /// section's "window" is visible at a time. Pure UI state — not persisted.
+    @State private var selectedSection: SidebarSection = .pages
+
+    /// The sidebar's sections. Each gets an icon in the selector bar and, when
+    /// selected, fills the list below.
+    enum SidebarSection: String, CaseIterable, Identifiable {
+        case pages, sources, agent
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .pages: "Pages"
+            case .sources: "Sources"
+            case .agent: "Agent"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .pages: "doc.text"
+            case .sources: "tray.full"
+            case .agent: "sparkles"
+            }
+        }
+    }
 
     // MARK: - Multi-select
 
@@ -40,36 +71,78 @@ struct SidebarView: View {
     enum ActiveSection { case pages, sources }
 
     var body: some View {
-        listContent
-            .listStyle(.inset)
-            .scrollContentBackground(.hidden)
-            .navigationTitle(activeWikiName)
-            .onChange(of: listSelection) { _, newValue in selectionDidChange(newValue) }
-            .onChange(of: store.selection) { _, newValue in
-                if let sel = newValue, !listSelection.contains(sel) { listSelection = [sel] }
+        VStack(spacing: 0) {
+            sectionSelectorBar
+                .padding(.top, 8)
+            Divider()
+            listContent
+                .listStyle(.inset)
+                .scrollContentBackground(.hidden)
+        }
+        .navigationTitle(activeWikiName)
+        .onChange(of: listSelection) { _, newValue in selectionDidChange(newValue) }
+        .onChange(of: store.selection) { _, newValue in
+            if let sel = newValue, !listSelection.contains(sel) { listSelection = [sel] }
+        }
+        .navigationSplitViewColumnWidth(min: PageEditorMetrics.sidebarMinWidth,
+                                         ideal: PageEditorMetrics.sidebarIdealWidth)
+        .alert("Rename Page", isPresented: renamePresented) {
+            TextField("Title", text: $renameText)
+            Button("Cancel", role: .cancel) { renameTarget = nil }
+            Button("Rename") { commitRename() }
+        }
+    }
+
+    /// A row of evenly-spaced icons — one per section — that selects which
+    /// section's "window" is shown, exactly like Xcode's navigator selector.
+    private var sectionSelectorBar: some View {
+        HStack(spacing: 0) {
+            ForEach(SidebarSection.allCases) { section in
+                sectionSelectorButton(section)
             }
-            .navigationSplitViewColumnWidth(min: PageEditorMetrics.sidebarMinWidth,
-                                             ideal: PageEditorMetrics.sidebarIdealWidth)
-            .alert("Rename Page", isPresented: renamePresented) {
-                TextField("Title", text: $renameText)
-                Button("Cancel", role: .cancel) { renameTarget = nil }
-                Button("Rename") { commitRename() }
-            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.bottom, 6)
+    }
+
+    private func sectionSelectorButton(_ section: SidebarSection) -> some View {
+        let isSelected = selectedSection == section
+        // Nothing to show for an empty Sources list — disable rather than select
+        // an empty window.
+        let isDisabled = section == .sources && store.sources.isEmpty
+        return Button {
+            selectedSection = section
+        } label: {
+            Image(systemName: section.systemImage)
+                .font(.body)
+                .frame(maxWidth: .infinity)
+                .frame(height: 26)
+                .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                .background(isSelected ? Color.accentColor.opacity(0.15) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .help(section.title)
     }
 
     private var listContent: some View {
         List(selection: $listSelection) {
-            WikiSwitcher(manager: manager).listRowSeparator(.hidden)
-            toolsSection()
-            pagesSection()
-            if !store.sources.isEmpty {
+            switch selectedSection {
+            case .pages: pagesSection()
+            case .sources:
                 SourcesSectionView(store: store, fileProvider: fileProvider,
                     ingestingSourceIDs: ingestingSourceIDs,
                     extractingSourceIDs: extractingSourceIDs,
                     onBatchIngest: onBatchIngest,
+                    showingAddFromZotero: $showingAddFromZotero,
+                    showingImportMarkdown: $showingImportMarkdown,
+                    onAddFromURL: onAddFromURL,
+                    isZoteroConfigured: isZoteroConfigured,
                     listSelection: $listSelection, activeSection: $activeSection)
+            case .agent: toolsSection()
             }
-            systemSection()
         }
     }
 
@@ -82,48 +155,53 @@ struct SidebarView: View {
 
     private func toolsSection() -> some View {
         Section {
-            if isToolsExpanded {
-                SidebarModeRow(title: "Query", subtitle: "Ask or update",
-                    systemImage: "bubble.left.and.text.bubble.right")
-                    .tag(WikiSelection.query)
-                    .help("Ask questions and decide whether the Agent should update the wiki")
-            }
-        } header: { SidebarSectionHeader(title: "Tools", isExpanded: $isToolsExpanded) }
-    }
+            SidebarModeRow(title: "Query", subtitle: "Ask or update",
+                systemImage: "bubble.left.and.text.bubble.right")
+                .tag(WikiSelection.query)
+                .help("Ask questions and decide whether the Agent should update the wiki")
 
-    private func systemSection() -> some View {
-        Section {
-            if isSystemExpanded {
-                SidebarModeRow(title: "Lint", subtitle: "Health-check the wiki",
-                    systemImage: "checkmark.shield")
-                    .tag(WikiSelection.lint)
-                    .help("Check the wiki for stale content, broken links, and inconsistencies")
-                Button {
-                    _ = store.recomputeMissingEmbeddings()
-                } label: {
-                    SidebarModeRow(title: "Reindex Search", subtitle: "Rebuild semantic embeddings",
-                        systemImage: "arrow.triangle.2.circlepath")
-                }
-                .buttonStyle(.plain)
-                .help("Recompute embeddings for all missing pages for semantic search")
-                SidebarModeRow(title: "Activity", subtitle: "Operation log",
-                    systemImage: "clock.arrow.circlepath")
-                    .tag(WikiSelection.changeLog)
-                    .help("Operation history, projected read-only as log.md")
-                SidebarModeRow(title: "Instructions", subtitle: "Agent prompt",
-                    systemImage: "sparkles")
-                    .tag(WikiSelection.systemPrompt)
-                    .help("Agent instructions, projected read-only as CLAUDE.md and AGENTS.md")
+            SidebarModeRow(title: "Lint", subtitle: "Health-check the wiki",
+                systemImage: "checkmark.shield")
+                .tag(WikiSelection.lint)
+                .help("Check the wiki for stale content, broken links, and inconsistencies")
+
+            Button {
+                _ = store.recomputeMissingEmbeddings()
+            } label: {
+                SidebarModeRow(title: "Reindex Search", subtitle: "Rebuild semantic embeddings",
+                    systemImage: "arrow.triangle.2.circlepath")
             }
-        } header: { SidebarSectionHeader(title: "System", isExpanded: $isSystemExpanded) }
+            .buttonStyle(.plain)
+            .help("Recompute embeddings for all missing pages for semantic search")
+
+            SidebarModeRow(title: "Activity", subtitle: "Operation log",
+                systemImage: "clock.arrow.circlepath")
+                .tag(WikiSelection.changeLog)
+                .help("Operation history, projected read-only as log.md")
+
+            SidebarModeRow(title: "Instructions", subtitle: "Agent prompt",
+                systemImage: "sparkles")
+                .tag(WikiSelection.systemPrompt)
+                .help("Agent instructions, projected read-only as CLAUDE.md and AGENTS.md")
+        } header: { SidebarSectionHeader(title: "Agent") }
     }
 
     private func pagesSection() -> some View {
         Section {
-            if isPagesExpanded { pagesSectionRows() }
-        } header: {
-            HStack(spacing: 0) {
-                SidebarSectionHeader(title: "Pages", isExpanded: $isPagesExpanded)
+            Button {
+                onNewPage()
+            } label: {
+                SidebarModeRow(title: "New Page", subtitle: "Create empty page",
+                    systemImage: "plus")
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut("n", modifiers: .command)
+            .help("Create a new page")
+
+            Divider()
+
+            HStack {
+                Text("Sort by").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Picker("Sort", selection: $store.pageSortOrder) {
                     Text("Last Updated").tag(PageSortOrder.lastUpdated)
@@ -131,7 +209,30 @@ struct SidebarView: View {
                     Text("Title A–Z").tag(PageSortOrder.titleAZ)
                 }
                 .pickerStyle(.menu).buttonStyle(.borderless).labelsHidden().fixedSize()
-                .help("Sort pages by date or title")
+            }
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+
+            searchBar
+                .padding(.horizontal, 4)
+                .padding(.vertical, 6)
+
+            pagesSectionRows()
+        } header: {
+            SidebarSectionHeader(title: "Pages")
+        }
+    }
+
+    private var searchBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary).font(.callout)
+            TextField("Search pages…", text: $store.searchQuery)
+                .textFieldStyle(.plain).font(.callout).disableAutocorrection(true)
+            if !store.searchQuery.isEmpty {
+                Button { store.searchQuery = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }.buttonStyle(.borderless)
             }
         }
     }
@@ -139,18 +240,6 @@ struct SidebarView: View {
     /// Extracted to keep the `body` type-checkable.
     private func pagesSectionRows() -> some View {
         Group {
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary).font(.callout)
-                TextField("Search pages…", text: $store.searchQuery)
-                    .textFieldStyle(.plain).font(.callout).disableAutocorrection(true)
-                if !store.searchQuery.isEmpty {
-                    Button { store.searchQuery = "" } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                    }.buttonStyle(.borderless)
-                }
-            }
-            .padding(.vertical, 4).padding(.horizontal, 2)
             let source = store.searchQuery.isEmpty ? store.summaries : store.searchResults
             if source.isEmpty, !store.searchQuery.isEmpty {
                 Text("No matching pages").foregroundStyle(.secondary).font(.callout)
@@ -233,20 +322,12 @@ struct SidebarView: View {
     }
 }
 
-/// A collapsible section header with chevron + title.
+/// A plain section header. Visibility is now driven by the icon toggle bar at the
+/// top of the sidebar, so the header is a static title rather than a chevron.
 struct SidebarSectionHeader: View {
     let title: String
-    @Binding var isExpanded: Bool
 
     var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                .font(.caption).foregroundStyle(.secondary)
-            Text(title).font(.headline).foregroundStyle(.primary)
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
-        }
+        Text(title).font(.headline).foregroundStyle(.primary)
     }
 }
