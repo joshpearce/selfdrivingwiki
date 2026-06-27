@@ -155,10 +155,10 @@ struct SidebarView: View {
 
     private func toolsSection() -> some View {
         Section {
-            SidebarModeRow(title: "Query", subtitle: "Ask or update",
+            SidebarModeRow(title: "Ask", subtitle: "Ask questions read-only",
                 systemImage: "bubble.left.and.text.bubble.right")
-                .tag(WikiSelection.query)
-                .help("Ask questions and decide whether the Agent should update the wiki")
+                .tag(WikiSelection.ask)
+                .help("Ask questions in a read-only conversation — the agent cannot write the wiki")
 
             SidebarModeRow(title: "Lint", subtitle: "Health-check the wiki",
                 systemImage: "checkmark.shield")

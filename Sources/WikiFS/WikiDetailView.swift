@@ -6,8 +6,9 @@ import WikiFSCore
 /// selected document/source surface.
 struct WikiDetailView: View {
     @Bindable var store: WikiStoreModel
-    @Bindable var launcher: AgentLauncher       // ingest launcher
-    @Bindable var queryLauncher: AgentLauncher   // query-only launcher
+    @Bindable var launcher: AgentLauncher       // ingest/lint launcher
+    @Bindable var askLauncher: AgentLauncher    // ask (read-only) conversation launcher
+    @Bindable var editLauncher: AgentLauncher   // edit conversation launcher
     @Bindable var manager: WikiManager
     let fileProvider: FileProviderSpike
     let extractionCoordinator: ExtractionCoordinator
@@ -102,9 +103,16 @@ struct WikiDetailView: View {
                 .padding(.horizontal, 40)
                 .frame(maxWidth: .infinity)
             }
-        case .query:
+        case .ask:
             QueryConversationView(
-                launcher: queryLauncher,
+                launcher: askLauncher,
+                store: store,
+                manager: manager,
+                fileProvider: fileProvider
+            )
+        case .edit:
+            QueryConversationView(
+                launcher: editLauncher,
                 store: store,
                 manager: manager,
                 fileProvider: fileProvider

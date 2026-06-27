@@ -186,10 +186,17 @@ final class AgentLauncher {
     /// other's state; understanding the boundaries is what keeps extraction from
     /// blocking the user.
     ///
-    /// 1. **Spawn slot** (`spawnWaiters` / `awaitSpawnSlot` / `releaseSpawnSlot`,
-    ///    held ↔ `isRunning`): serializes ONLY `claude -p` spawns. One `claude`
-    ///    process at a time across ingest / query / lint. Extraction does NOT take
-    ///    it, so a `pdf2md` conversion may overlap a `claude` query run.
+    /// 1. **Spawn slot** (`spawnGate` / `awaitSpawnSlot` / `releaseSpawnSlot`,
+    ///    per-instance `isRunning` tracks THIS launcher): serializes ONLY
+    ///    `claude -p` spawns GLOBALLY — the gate is shared across all launchers
+    ///    that are initialized from the same `SpawnGate` instance. One `claude`
+    ///    process at a time across ingest / ask / edit / lint, regardless of which
+    ///    launcher instance initiates it. `isRunning` is per-instance: it means
+    ///    "THIS launcher has a claude process running." A brief transient window
+    ///    where `isRunning` is `false` before the next waiter re-acquires is
+    ///    acceptable — all observers guard on `if isRunning` in the next event-loop
+    ///    iteration. Extraction does NOT take the spawn slot, so a `pdf2md`
+    ///    conversion may overlap a `claude` query run.
     /// 2. **Edit lock** (`store.isAgentRunning`), driven by TWO mechanisms:
     ///      - **Session level** (`onLock`/`onUnlock` around the spawn): for
     ///        one-shot runs (ingest/lint/query) and the lifetime of an interactive
@@ -214,95 +221,45 @@ final class AgentLauncher {
     /// pure extraction is never labeled "Ingesting…" and never greys out a peer's
     /// Ingest button.
 
-    // MARK: - Serialized claude spawn slot
+    // MARK: - Serialized claude spawn slot (shared SpawnGate)
 
-    /// The single serialized "claude spawn slot." Only one `claude -p` process may
-    /// run at a time across all surfaces (ingest / query / lint all share this
-    /// launcher). The slot is "held" exactly while `isRunning == true`. A spawn
-    /// request `await`s it via `awaitSpawnSlot()`; the fast path (slot free, no
-    /// waiters) acquires without suspending. `releaseSpawnSlot()` (called by
-    /// `finish()` and on any post-acquire early-return) hands the slot to the next
-    /// waiter (keeping `isRunning == true`) or frees it.
-    private var spawnWaiters: [SpawnWaiter] = []
-
-    /// One queued spawn request. A class so the cancellation handler can identify
-    /// its waiter by reference and self-remove it from `spawnWaiters` — a cancelled
-    /// waiter must never be handed the slot. `@unchecked Sendable` because it is
-    /// only ever touched on the main actor (registration in `awaitSpawnSlot`'s
-    /// continuation; removal in the cancel handler's `@MainActor` hop).
-    private final class SpawnWaiter: @unchecked Sendable {
-        var continuation: CheckedContinuation<Void, Never>?
-        var didReceiveSlot = false
-        var didCancel = false
-    }
+    /// The shared gate that serializes all `claude -p` spawns. All launchers
+    /// sharing the same `SpawnGate` instance contend on a single FIFO queue —
+    /// ingest, ask, edit, and lint never overlap. Each instance has its own
+    /// `isRunning` flag to track whether THIS launcher has an active process;
+    /// the gate's `held` flag is the global "at most one" invariant.
+    let spawnGate: SpawnGate
 
     /// The number of spawn requests currently queued for the slot (test seam).
-    var spawnSlotWaiterCount: Int { spawnWaiters.count }
+    /// Delegates to the shared gate so single-launcher tests observe the same
+    /// count as before.
+    var spawnSlotWaiterCount: Int { spawnGate.waiterCount }
 
-    /// Wait for the single serialized claude spawn slot, returning `true` iff this
+    init(spawnGate: SpawnGate = SpawnGate()) {
+        self.spawnGate = spawnGate
+    }
+
+    /// Wait for the serialized claude spawn slot, returning `true` iff this
     /// caller acquired it (and `isRunning` is now `true`). Returns `false` if the
     /// wait was cancelled before the slot was handed over — in that case the caller
     /// owns nothing and must simply return (no release). Cancellation-safe: a
-    /// cancelled waiter self-removes from the queue and is never handed the slot.
+    /// cancelled waiter self-removes from the gate's queue and is never handed the
+    /// slot. See `SpawnGate` for the full FIFO + cancellation protocol.
     func awaitSpawnSlot() async -> Bool {
-        // Fast path: slot free and nobody queued — acquire atomically. There is no
-        // suspension point, so no other main-actor task can interleave between the
-        // check and the set. Zero overhead for the common single-run case; keeps
-        // single-run tests unchanged.
-        if !isRunning && spawnWaiters.isEmpty {
-            isRunning = true
-            return true
-        }
-        let waiter = SpawnWaiter()
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-                if waiter.didCancel {
-                    // Cancelled before we could register — resume immediately, don't
-                    // enqueue. The caller will see `didReceiveSlot == false`.
-                    c.resume()
-                    return
-                }
-                waiter.continuation = c
-                spawnWaiters.append(waiter)
-            }
-        } onCancel: {
-            // Hop to the main actor (the launcher is @MainActor) to self-remove. A
-            // cancelled waiter must not be handed the slot; if it already was (race
-            // with `releaseSpawnSlot`), do nothing — the woken caller will see
-            // `Task.isCancelled` and bail, releasing the slot it was handed.
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                waiter.didCancel = true
-                if let idx = self.spawnWaiters.firstIndex(where: { $0 === waiter }),
-                   let c = waiter.continuation {
-                    self.spawnWaiters.remove(at: idx)
-                    c.resume()
-                }
-            }
-        }
-        return waiter.didReceiveSlot
+        let acquired = await spawnGate.acquire()
+        if acquired { isRunning = true }
+        return acquired
     }
 
     /// Release the spawn slot, handing it to the next live waiter (FIFO) or freeing
     /// it. Called by `finish()` on process termination and by every post-acquire
-    /// early-return in `run` / `startInteractiveQuery`.
+    /// early-return in `run` / `startInteractiveQuery`. Clears `isRunning` first so
+    /// this instance is no longer marked active, then delegates to the gate which
+    /// will either wake the next waiter (who sets THEIR `isRunning = true`) or free
+    /// the global slot.
     func releaseSpawnSlot() {
-        // Pop the next non-cancelled waiter and hand off the slot. `isRunning` stays
-        // `true` on a handoff so the transfer is atomic — there is no window where
-        // another task could grab the slot via the fast path and double-spawn.
-        while let head = spawnWaiters.first {
-            spawnWaiters.removeFirst()
-            if head.didCancel {
-                // Already resumed by its cancel handler; don't hand the slot to a
-                // dead task.
-                continue
-            }
-            head.didReceiveSlot = true
-            head.continuation?.resume()
-            return
-        }
-        // No live waiters: free the slot.
         isRunning = false
+        spawnGate.release()
     }
 
     // MARK: - Serialized extraction slot (pdf2md only)
