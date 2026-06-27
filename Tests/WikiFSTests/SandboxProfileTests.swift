@@ -48,6 +48,18 @@ struct SandboxProfileTests {
     #expect(SandboxProfile.sqliteSidecarSuffixes == ["-wal", "-shm", "-journal"])
   }
 
+  // MARK: - Claude config writes (generate)
+
+  @Test func generate_allowsClaudeSubpathWrite() {
+    let p = profile()
+    #expect(p.contains("(allow file-write* (subpath (string-append (param \"HOME\") \"/.claude\")))"))
+  }
+
+  @Test func generate_allowsClaudeJsonLiteralWrite() {
+    // Note: two spaces between `literal` and `(` — matches the emitted rule exactly.
+    #expect(profile().contains("(allow file-write* (literal  (string-append (param \"HOME\") \"/.claude.json\")))"))
+  }
+
   // MARK: - Extra allowed paths
 
   @Test func splicesInValidAbsolutePathAsLiteral() {
@@ -71,6 +83,34 @@ struct SandboxProfileTests {
   @Test func escapesQuotesAndBackslashesInExtraPaths() {
     let p = profile(["/path/with\"quote"])
     #expect(p.contains("\\\"quote"))
+  }
+
+  // MARK: - generateReadOnly
+
+  private func readOnlyProfile() -> String {
+    SandboxProfile.generateReadOnly(scratchDir: Self.scratchDir)
+  }
+
+  @Test func readOnly_startsWithVersionAndAllowDefault() {
+    let p = readOnlyProfile()
+    let lines = p.split(separator: "\n").map(String.init)
+    #expect(lines[0] == "(version 1)")
+    #expect(lines[1] == "(allow default)")
+    #expect(lines[2] == "(deny file-write*)")
+  }
+
+  /// Regression guard: adding new allowances must not drop the default-deny fence.
+  @Test func readOnly_stillDeniesFileWriteStar() {
+    #expect(readOnlyProfile().contains("(deny file-write*)"))
+  }
+
+  @Test func readOnly_allowsClaudeSubpathWrite() {
+    #expect(readOnlyProfile().contains("(allow file-write* (subpath (string-append (param \"HOME\") \"/.claude\")))"))
+  }
+
+  @Test func readOnly_allowsClaudeJsonLiteralWrite() {
+    // Note: two spaces between `literal` and `(` — matches the emitted rule exactly.
+    #expect(readOnlyProfile().contains("(allow file-write* (literal  (string-append (param \"HOME\") \"/.claude.json\")))"))
   }
 
   // MARK: - SandboxInvocation (Equatable + defines)
