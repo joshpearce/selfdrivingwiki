@@ -2,17 +2,25 @@ import AppKit
 import SwiftUI
 import WikiFSCore
 
+/// Whether the session can write to the wiki. Ask = read-only; Edit = can write.
+/// This is a property of the mounted session, not a runtime toggle.
+enum QueryMode {
+    case ask, edit
+
+    var allowsEdits: Bool { self == .edit }
+}
+
 /// Dedicated query workspace for the active wiki. It keeps a Claude session open
 /// so the user can ask follow-ups and choose when an answer should become wiki
 /// content, instead of every query being a one-shot background operation.
 struct QueryConversationView: View {
+    let mode: QueryMode
     @Bindable var launcher: AgentLauncher
     @Bindable var store: WikiStoreModel
     @Bindable var manager: WikiManager
     let fileProvider: FileProviderSpike
     @State private var draftMessage = ""
     @State private var showsInternals = false
-    @State private var allowWikiEdits = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -112,7 +120,7 @@ struct QueryConversationView: View {
     }
 
     private var showsEditingEnabledBanner: Bool {
-        allowWikiEdits && launcher.isGenerating
+        mode.allowsEdits && launcher.isGenerating
     }
 
     private var conversation: some View {
@@ -138,7 +146,7 @@ struct QueryConversationView: View {
                 editingEnabledBanner
             }
             Spacer(minLength: 0)
-            Text("Ask \(activeWikiName)")
+            Text(mode == .edit ? "Edit \(activeWikiName)" : "Ask \(activeWikiName)")
                 .font(.largeTitle)
                 .fontWeight(.regular)
                 .multilineTextAlignment(.center)
@@ -151,32 +159,6 @@ struct QueryConversationView: View {
 
     private func composer(maxWidth: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Toggle(isOn: $allowWikiEdits) {
-                Text("Allow wiki edits")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .toggleStyle(.checkbox)
-            .help("When on, the agent can edit the wiki. Toggling restarts the session with the new permission, keeping the conversation as context.")
-            .onChange(of: allowWikiEdits) { _, isOn in
-                // Edit mode is a property of the spawned claude process (its seatbelt
-                // sandbox + system prompt), so it can't change for a RUNNING session.
-                // Flipping the checkbox mid-session stops the current session and
-                // relaunches in the new mode, re-feeding the transcript so the new
-                // process keeps context. Pre-first-message (no session yet) this just
-                // sets the mode the next session starts in.
-                guard launcher.isInteractiveSession else { return }
-                Task {
-                    await AgentOperationRunner.restartQueryConversation(
-                        launcher: launcher,
-                        store: store,
-                        manager: manager,
-                        fileProvider: fileProvider,
-                        allowWikiEdits: isOn)
-                }
-            }
-            .padding(.horizontal, QueryConversationMetrics.composerHorizontalPadding)
-
             HStack(alignment: .bottom, spacing: 10) {
                 TextField("Ask a question, or ask the Agent to update the wiki…", text: $draftMessage, axis: .vertical)
                     .font(.body)
@@ -270,7 +252,7 @@ struct QueryConversationView: View {
                     store: store,
                     manager: manager,
                     fileProvider: fileProvider,
-                    allowWikiEdits: allowWikiEdits
+                    allowWikiEdits: mode.allowsEdits
                 )
             }
         }

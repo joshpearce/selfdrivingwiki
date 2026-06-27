@@ -105,6 +105,7 @@ struct WikiDetailView: View {
             }
         case .ask:
             QueryConversationView(
+                mode: .ask,
                 launcher: askLauncher,
                 store: store,
                 manager: manager,
@@ -112,6 +113,7 @@ struct WikiDetailView: View {
             )
         case .edit:
             QueryConversationView(
+                mode: .edit,
                 launcher: editLauncher,
                 store: store,
                 manager: manager,
