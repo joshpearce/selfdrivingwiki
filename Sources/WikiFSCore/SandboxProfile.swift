@@ -73,7 +73,7 @@ public enum SandboxProfile {
             // to ~/.claude.json — allow the subtree and the top-level file so sandboxed
             // runs can record their transcript without EPERM.
             "(allow file-write* (subpath (string-append (param \"HOME\") \"/.claude\")))",
-            "(allow file-write* (literal  (string-append (param \"HOME\") \"/.claude.json\")))",
+            "(allow file-write* (literal (string-append (param \"HOME\") \"/.claude.json\")))",
             // The active wiki DB and its SQLite sidecars are exact files.
             "(allow file-write* (literal (param \"WIKI_DB\")))",
         ]
@@ -110,7 +110,7 @@ public enum SandboxProfile {
             // to ~/.claude.json — allow the subtree and the top-level file so sandboxed
             // runs can record their transcript without EPERM.
             "(allow file-write* (subpath (string-append (param \"HOME\") \"/.claude\")))",
-            "(allow file-write* (literal  (string-append (param \"HOME\") \"/.claude.json\")))",
+            "(allow file-write* (literal (string-append (param \"HOME\") \"/.claude.json\")))",
         ]
         return lines.joined(separator: "\n") + "\n"
     }

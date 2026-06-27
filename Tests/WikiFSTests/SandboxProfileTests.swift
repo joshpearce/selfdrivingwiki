@@ -56,8 +56,7 @@ struct SandboxProfileTests {
   }
 
   @Test func generate_allowsClaudeJsonLiteralWrite() {
-    // Note: two spaces between `literal` and `(` — matches the emitted rule exactly.
-    #expect(profile().contains("(allow file-write* (literal  (string-append (param \"HOME\") \"/.claude.json\")))"))
+    #expect(profile().contains("(allow file-write* (literal (string-append (param \"HOME\") \"/.claude.json\")))"))
   }
 
   // MARK: - Extra allowed paths
@@ -109,8 +108,7 @@ struct SandboxProfileTests {
   }
 
   @Test func readOnly_allowsClaudeJsonLiteralWrite() {
-    // Note: two spaces between `literal` and `(` — matches the emitted rule exactly.
-    #expect(readOnlyProfile().contains("(allow file-write* (literal  (string-append (param \"HOME\") \"/.claude.json\")))"))
+    #expect(readOnlyProfile().contains("(allow file-write* (literal (string-append (param \"HOME\") \"/.claude.json\")))"))
   }
 
   // MARK: - SandboxInvocation (Equatable + defines)
@@ -129,6 +127,20 @@ struct SandboxProfileTests {
     #expect(inv.defines[2].0 == "WIKI_DB")
     #expect(inv.defines[2].1 == Self.wikiDB)
     #expect(inv.profile == profile([]))
+  }
+
+  @Test func readOnlyInvocationCarriesHomeAndScratchDefines() {
+    let inv = SandboxProfile.readOnlyInvocation(
+      homePath: "/Users/me",
+      scratchDir: Self.scratchDir)
+    #expect(inv.defines.count == 2)
+    // Order matters for the argv emit.
+    #expect(inv.defines[0].0 == "HOME")
+    #expect(inv.defines[0].1 == "/Users/me")
+    #expect(inv.defines[1].0 == "SCRATCH_DIR")
+    // readOnlyInvocation canonicalizes via realpath; non-existent paths fall back to
+    // the input (same behaviour the invocation test relies on for Self.scratchDir).
+    #expect(inv.defines[1].1 == Self.scratchDir)
   }
 
   @Test func invocationEquatableComparesProfileAndDefines() {
