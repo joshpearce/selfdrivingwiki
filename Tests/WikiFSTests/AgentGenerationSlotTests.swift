@@ -244,6 +244,20 @@ struct AgentGenerationSlotTests {
             message: "hi"))
     }
 
+    // MARK: - Per-turn gate release predicate
+
+    /// `AgentLauncher.releasesGenerationSlotPerTurn` encodes the invariant that
+    /// interactive sessions release the gate at each turn boundary while one-shot
+    /// runs hold the gate through `finish()`. This prevents a one-shot run from
+    /// releasing per-turn (which would double-release with finish and, more
+    /// importantly, let a peer interleave mid-run).
+    @Test func perTurnReleasePredicateTrueForInteractiveFalseForOneShot() {
+        // Interactive session: releases per turn so peers can generate between turns.
+        #expect(AgentLauncher.releasesGenerationSlotPerTurn(isInteractiveSession: true))
+        // One-shot run (ingest/lint/query): holds gate through finish(); must NOT release per turn.
+        #expect(!AgentLauncher.releasesGenerationSlotPerTurn(isInteractiveSession: false))
+    }
+
     // MARK: - Edit-lock phase: extraction does not lock, agent generation does
 
     /// `store.isAgentRunning` is the edit lock. It is `true` only while a claude

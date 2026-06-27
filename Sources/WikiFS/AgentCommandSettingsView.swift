@@ -107,6 +107,10 @@ struct AgentCommandSettingsView: View {
         saveCommand()
         // Also reset the sandbox toggle so "Reset to Default" is fully consistent.
         sandboxEnabled = SandboxConfig.default.enabled
+        // Explicit save mirrors saveCommand() above: persistence-on-reset is
+        // unconditional regardless of .onChange timing. The .onChange(of: sandboxEnabled)
+        // would also fire and call saveSandbox(), but the explicit call here is
+        // intentional — do not remove it as "redundant".
         saveSandbox()
     }
 }

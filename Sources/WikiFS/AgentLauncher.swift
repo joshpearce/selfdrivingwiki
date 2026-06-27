@@ -184,6 +184,19 @@ final class AgentLauncher {
         onTurnBoundaryHandler?(value)
     }
 
+    /// Per-turn generation-gate release policy. Interactive sessions release the
+    /// gate at EACH turn boundary (`.messageStop`/`.result`) so a peer launcher or
+    /// ingest run can generate between turns. One-shot runs (ingest/lint/query) do
+    /// NOT release per-turn — they hold the gate through `finish()`. Releasing in
+    /// a one-shot would double-release with `finish()`, but `releaseGenerationSlot`
+    /// is idempotent, so the real invariant being encoded is: one-shot runs must
+    /// hold the gate for their full duration so no peer generation interleaves.
+    /// Extracted as a pure static so the policy is unit-testable without driving
+    /// launcher state.
+    static func releasesGenerationSlotPerTurn(isInteractiveSession: Bool) -> Bool {
+        isInteractiveSession
+    }
+
     /// Pure selection of the interactive-query sandbox. When "Allow wiki edits" is
     /// OFF, the read-only seatbelt sandbox wins REGARDLESS of `editSandbox` — a
     /// global sandbox config can never override the forced read-only boundary. When
@@ -578,6 +591,10 @@ final class AgentLauncher {
             runningKind = nil
             currentProcessID = nil
             lastActivityAt = Date()
+            // Clear the agent-phase ingest flag so spawn failure doesn't strand
+            // the "Ingesting…" row label or the cross-file Ingest greyout. finish()
+            // is not called on this path, so we clear explicitly here.
+            self.ingestingSourceIDs = []
             releaseEditLock()
             // Release the generation gate so a queued peer isn't stranded.
             // Also clear isRunning (set above at gate acquire; spawn failed).
@@ -967,11 +984,19 @@ final class AgentLauncher {
                 // between turns instead of staying stuck until session end.
                 if AgentEvent.endsGeneration(event) {
                     setGenerating(false)
+                    // Correctness assumption: `AgentEvent.endsGeneration` is true
+                    // for `.result` and `.messageStop`. The per-turn release below
+                    // relies on `.result` firing only at interactive SESSION end
+                    // (not per turn) and `.messageStop` firing per turn — the same
+                    // assumption the pre-existing per-turn edit-lock transition
+                    // (via `setGenerating`) depends on. If that ever changes,
+                    // both the lock and the gate would need re-evaluation.
+                    //
                     // For interactive sessions: release the generation gate per turn
                     // so other launchers (or ingest) can generate between turns.
                     // For one-shot runs: the gate is held through finish() — do NOT
                     // release here; finish() handles it.
-                    if isInteractiveSession {
+                    if Self.releasesGenerationSlotPerTurn(isInteractiveSession: isInteractiveSession) {
                         releaseGenerationSlot()
                     }
                 }
