@@ -69,6 +69,11 @@ public enum SandboxProfile {
             "(deny file-write*)",
             // The scratch dir is a directory tree.
             "(allow file-write* (subpath (param \"SCRATCH_DIR\")))",
+            // Claude Code writes its session transcript and config under ~/.claude/ and
+            // to ~/.claude.json — allow the subtree and the top-level file so sandboxed
+            // runs can record their transcript without EPERM.
+            "(allow file-write* (subpath (string-append (param \"HOME\") \"/.claude\")))",
+            "(allow file-write* (literal  (string-append (param \"HOME\") \"/.claude.json\")))",
             // The active wiki DB and its SQLite sidecars are exact files.
             "(allow file-write* (literal (param \"WIKI_DB\")))",
         ]
@@ -101,6 +106,11 @@ public enum SandboxProfile {
             "(deny file-write*)",
             // The scratch dir is writable — the agent needs a cwd.
             "(allow file-write* (subpath (param \"SCRATCH_DIR\")))",
+            // Claude Code writes its session transcript and config under ~/.claude/ and
+            // to ~/.claude.json — allow the subtree and the top-level file so sandboxed
+            // runs can record their transcript without EPERM.
+            "(allow file-write* (subpath (string-append (param \"HOME\") \"/.claude\")))",
+            "(allow file-write* (literal  (string-append (param \"HOME\") \"/.claude.json\")))",
         ]
         return lines.joined(separator: "\n") + "\n"
     }
