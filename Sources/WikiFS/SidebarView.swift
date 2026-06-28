@@ -11,6 +11,8 @@ struct SidebarView: View {
     @Bindable var manager: WikiManager
     /// Used to open an ingested file in its default app via its user-visible URL.
     let fileProvider: FileProviderSpike
+    /// Required to launch the LLM lint from the sidebar context menu.
+    @Bindable var launcher: AgentLauncher
     /// Callback when the user clicks "Ingest N Files" in batch mode.
     var onBatchIngest: (([PageID]) -> Void)? = nil
     /// Files whose agent run is in flight (agent phase) — shows the
@@ -155,10 +157,15 @@ struct SidebarView: View {
 
     private func toolsSection() -> some View {
         Section {
-            SidebarModeRow(title: "Query", subtitle: "Ask or update",
+            SidebarModeRow(title: "Ask", subtitle: "Read-only Q&A",
                 systemImage: "bubble.left.and.text.bubble.right")
-                .tag(WikiSelection.query)
-                .help("Ask questions and decide whether the Agent should update the wiki")
+                .tag(WikiSelection.ask)
+                .help("Chat with the agent — read-only, the agent cannot write the wiki.")
+
+            SidebarModeRow(title: "Edit", subtitle: "Ask & update the wiki",
+                systemImage: "square.and.pencil")
+                .tag(WikiSelection.edit)
+                .help("Chat with the agent and let it update the wiki.")
 
             SidebarModeRow(title: "Lint", subtitle: "Health-check the wiki",
                 systemImage: "checkmark.shield")
@@ -250,6 +257,16 @@ struct SidebarView: View {
                     .tag(WikiSelection.page(summary.id))
                     .contextMenu {
                         Button("Rename") { beginRename(summary) }
+                        Button("Lint Page", systemImage: "checkmark.seal") {
+                            Task {
+                                await AgentOperationRunner.runLintPage(
+                                    pageID: summary.id, pageTitle: summary.title,
+                                    launcher: launcher, store: store,
+                                    manager: manager, fileProvider: fileProvider)
+                            }
+                        }
+                        .disabled(store.isAgentRunning)
+                        Divider()
                         Button("Delete", role: .destructive) { store.delete(summary.id) }
                     }
                     .swipeActions(edge: .trailing) {

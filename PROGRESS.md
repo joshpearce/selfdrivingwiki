@@ -2,6 +2,55 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-27 — Better context menu for links in the reader
+
+Overhauled the right-click context menu for links in `WikiReaderView`. The old menu
+exposed several WebKit built-ins that don't work in this app (new window, download
+linked file) and lacked useful tab/download actions. The new menu:
+
+* **Removed** non-functional WebKit items: "Open Link in New Window",
+  "Download Linked File". Orphaned separators are collapsed automatically.
+* **Open in Background Tab** (wiki links) — opens the target page/source in a new
+  tab without leaving the current page. Backed by a new `openTabInBackground(_:)`
+  method on `WikiStoreModel`.
+* **Download…** (wiki links) — copies the linked file from the File Provider mount
+  (`file://`) to `~/Downloads`, with automatic filename-collision numbering, then
+  reveals it in Finder. (External http/https links download via `URLSession`.)
+* **Find Similar…** moved from the top of the custom section to its own group
+  between the Open/Copy Link items and Share, keeping exploration actions visually
+  separate from navigation/file actions.
+* **Share…** (wiki links) — WebKit's built-in Share item (which would share the
+  raw `wiki://` URL) is replaced with one that passes the File Provider-mounted
+  file to `NSSharingServicePicker`, so recipients get a real file.
+* Removed "Copy as Wiki Link" (was redundant with Copy Link for most workflows).
+
+Pure logic lives in `WikiLinkMenuBuilder` (top `actions(for:)` + new
+`bottomActions(for:)`); AppKit wiring in `WikiLinkMenuNSItems`; menu assembly and
+WebKit item surgery in `WikiReaderWebView.willOpenMenu`.
+
+## 2026-06-27 — Outline Pane
+
+Added an outline pane for the page detail view that shows headers in the Markdown document in a tree.
+Clicking on an element takes you to the position of the header in the document.
+
+## 2026-06-27 — Hover tooltips for wiki links in the WKWebView reader
+
+Wiki links in `WikiReaderView` now show human-readable tooltips on hover
+instead of raw `wiki://` URLs. `[[Page]]`, `[[source:Paper#"quote"]]`, and
+same-page anchor links reconstruct their original `[[…]]` notation via the
+existing `WikiLinkMarkdown` helpers; external links show the URL (browser
+default). Change is entirely in `MarkdownHTMLRenderer.visitLink` — a `title`
+attribute generated alongside the existing `href`. Two existing tests updated
+to assert the new attribute. See `plans/hover-wikilink.md`.
+
+## 2026-06-26 — Lint Page, WikilinksFixer
+
+Some links to sources were showing up with "\]]" although they did not throw off the renderer.
+
+* Added WikilinksFixer to the code to find and correct these.
+* Added a "Lint" button to the page and the page context menu.
+* Added some prompt instructions to the agent when linting a single page.
+
 ## 2026-06-26 — Vendored design skills (swiftui-pro, macos-design, typography-designer)
 
 Three public Agent Skills vendored into `.polytoken/skills/` (project-level) so
