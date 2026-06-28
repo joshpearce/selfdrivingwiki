@@ -72,6 +72,11 @@ struct SidebarView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            WikiSwitcher(manager: manager)
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
+            Divider()
             sectionSelectorBar
                 .padding(.top, 8)
             Divider()
