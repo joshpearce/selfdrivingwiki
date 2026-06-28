@@ -71,14 +71,25 @@ struct PageDetailView: View {
                             .disabled(store.isAgentRunning)
                             .help("Fix [[wiki-link]] syntax and run LLM lint on this page")
                         }
-                        if let path = pageMountPath {
-                            Button("Copy Path", systemImage: "terminal") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(path, forType: .string)
+                        if fileProvider.path != nil, case .page(let pageID) = store.selection {
+                            Button("Share", systemImage: "square.and.arrow.up") {
+                                Task {
+                                    guard let url = await fileProvider.resolvePageByTitleURL(id: pageID) else { return }
+                                    let picker = NSSharingServicePicker(items: [url])
+                                    let mouseScreen = NSEvent.mouseLocation
+                                    guard let window = NSApplication.shared.keyWindow,
+                                          let contentView = window.contentView else { return }
+                                    let windowPoint = window.convertPoint(fromScreen: mouseScreen)
+                                    let viewPoint = contentView.convert(windowPoint, from: nil)
+                                    picker.show(
+                                        relativeTo: NSRect(origin: viewPoint,
+                                                           size: NSSize(width: 1, height: 1)),
+                                        of: contentView, preferredEdge: .minY)
+                                }
                             }
-                            .help("Copy the Unix path of this page on the mounted filesystem")
+                            .help("Share this page")
                         }
-                        
+
                         Button {
                             isOutlineExpanded.toggle()
                         } label: {
@@ -219,15 +230,6 @@ struct PageDetailView: View {
         guard let selection = store.selection,
               case .page(let id) = selection else { return nil }
         return store.summaries.first(where: { $0.id == id })?.updatedAt
-    }
-
-    private var pageMountPath: String? {
-        guard let selection = store.selection,
-              case .page(let id) = selection else { return nil }
-        guard let title = store.summaries.first(where: { $0.id == id })?.title,
-              let root = fileProvider.path else { return nil }
-        let leaf = FilenameEscaping.byTitleFilename(title: title, pageID: id.rawValue)
-        return "\(root)/pages/by-title/\(leaf)"
     }
 
     // MARK: - Subviews

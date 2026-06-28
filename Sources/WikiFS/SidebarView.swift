@@ -248,6 +248,11 @@ struct SidebarView: View {
     private func pagesSectionRows() -> some View {
         Group {
             let source = store.searchQuery.isEmpty ? store.summaries : store.searchResults
+            // ---- batch share plumbing ----
+            let selectedPageIDs: Set<PageID> = Set(listSelection.compactMap { sel in
+                if case .page(let id) = sel { return id } else { return nil }
+            })
+            // ---- end batch share plumbing ----
             if source.isEmpty, !store.searchQuery.isEmpty {
                 Text("No matching pages").foregroundStyle(.secondary).font(.callout)
                     .padding(.vertical, 8).frame(maxWidth: .infinity, alignment: .leading)
@@ -266,6 +271,53 @@ struct SidebarView: View {
                             }
                         }
                         .disabled(store.isAgentRunning)
+                        // Batch share — appears only when this row is part of a
+                        // multi-select (2+ pages). Resolves all URLs in parallel
+                        // via the daemon, then passes them to one picker.
+                        if selectedPageIDs.count > 1, selectedPageIDs.contains(summary.id) {
+                            let ids = selectedPageIDs
+                            Button("Share \(ids.count) Pages",
+                                   systemImage: "square.and.arrow.up") {
+                                Task {
+                                    let urls: [URL] = await withTaskGroup(of: URL?.self) { group in
+                                        for id in ids {
+                                            group.addTask { await fileProvider.resolvePageByTitleURL(id: id) }
+                                        }
+                                        var results: [URL] = []
+                                        for await url in group { if let url { results.append(url) } }
+                                        return results
+                                    }
+                                    guard !urls.isEmpty else { return }
+                                    let picker = NSSharingServicePicker(items: urls)
+                                    let mouseScreen = NSEvent.mouseLocation
+                                    guard let window = NSApplication.shared.keyWindow,
+                                          let contentView = window.contentView else { return }
+                                    let windowPoint = window.convertPoint(fromScreen: mouseScreen)
+                                    let viewPoint = contentView.convert(windowPoint, from: nil)
+                                    picker.show(
+                                        relativeTo: NSRect(origin: viewPoint,
+                                                           size: NSSize(width: 1, height: 1)),
+                                        of: contentView, preferredEdge: .minY)
+                                }
+                            }
+                        } else if fileProvider.path != nil {
+                            let pageID = summary.id
+                            Button("Share", systemImage: "square.and.arrow.up") {
+                                Task {
+                                    guard let url = await fileProvider.resolvePageByTitleURL(id: pageID) else { return }
+                                    let picker = NSSharingServicePicker(items: [url])
+                                    let mouseScreen = NSEvent.mouseLocation
+                                    guard let window = NSApplication.shared.keyWindow,
+                                          let contentView = window.contentView else { return }
+                                    let windowPoint = window.convertPoint(fromScreen: mouseScreen)
+                                    let viewPoint = contentView.convert(windowPoint, from: nil)
+                                    picker.show(
+                                        relativeTo: NSRect(origin: viewPoint,
+                                                           size: NSSize(width: 1, height: 1)),
+                                        of: contentView, preferredEdge: .minY)
+                                }
+                            }
+                        }
                         Divider()
                         Button("Delete", role: .destructive) { store.delete(summary.id) }
                     }
