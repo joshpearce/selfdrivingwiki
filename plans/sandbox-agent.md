@@ -38,7 +38,8 @@ Explicitly NOT guarded (accepted non-goals):
 The seatbelt composes *around* the configured provider command, so swapping providers
 needs no profile change. `OperationCommand.build` (when `sandbox` is non-nil) sets
 `executable = /usr/bin/sandbox-exec` and prepends `-p <profile> -D HOME=… -D
-SCRATCH_DIR=… -D WIKI_DB=… -- <providerExe>` to the unchanged provider argv.
+SCRATCH_DIR=… -D WIKI_DB=… -D CLAUDE_TMP=… -- <providerExe>` to the unchanged provider
+argv.
 
 The profile is **generated in Swift** (`SandboxProfile.generate`) and passed as one
 argv element via `sandbox-exec -p`:
@@ -48,12 +49,22 @@ argv element via `sandbox-exec -p`:
 (allow default)                                  ; reads/network/exec open
 (deny file-write*)                               ; default-deny writes
 (allow file-write* (subpath (param "SCRATCH_DIR")))
+(allow file-write* (subpath (string-append (param "HOME") "/.claude")))   ; transcript/config
+(allow file-write* (literal (string-append (param "HOME") "/.claude.json")))
+(allow file-write* (subpath (param "CLAUDE_TMP")))   ; /private/tmp/claude-<uid> session temp
 (allow file-write* (literal (param "WIKI_DB")))
 (allow file-write* (literal (string-append (param "WIKI_DB") "-wal")))
 (allow file-write* (literal (string-append (param "WIKI_DB") "-shm")))
 (allow file-write* (literal (string-append (param "WIKI_DB") "-journal")))
 ;; one (allow file-write* (literal|subpath <userPath>)) per extra-allowed line
 ```
+
+> **Why `CLAUDE_TMP`:** Claude Code derives a per-session temp dir from the **cwd** and
+> places it under `/private/tmp/claude-<uid>/<munged-cwd>/…` — independent of `$TMPDIR`.
+> Its Bash tool `mkdir`s that dir before running any command, so without this subtree
+> allow the sandboxed agent's shell fails with `EPERM` on the first invocation (and
+> subagents inherit the same broken shell). `SandboxProfile.defaultClaudeTempBase()`
+> computes the `/private/tmp/claude-<uid>` base from `getuid()`.
 
 ### Path canonicalization (symlink trap) — verified empirically
 
@@ -71,16 +82,21 @@ is defensive). (Verified: a `/tmp`-based scratch dir is denied; the same profile
 
 ### Provider self-write relocation
 
-The provider process writes its own config/temp to run. Those are **relocated into the
-scratch dir** so the allowlist stays tiny and provider-agnostic. `OperationCommand`
-sets (only when sandbox is on), as distinct env keys that never clobber
-`WIKI_ROOT`/`WIKI_DB`/`PATH`:
+The provider writes its own config/temp to run. `OperationCommand` relocates the node/CLI
+temp into the scratch dir (only when sandbox is on), as a distinct env key that never
+clobbers `WIKI_ROOT`/`WIKI_DB`/`PATH`:
 
-- `CLAUDE_CONFIG_DIR=<scratch>/.claude-config` — Claude Code's config/history.
-- `TMPDIR=<scratch>/.tmp` — node/CLI temp.
+- `TMPDIR=<scratch>/.tmp` — node/CLI temp. The launcher creates this subdir before spawn.
 
-The launcher creates both subdirectories before spawn (the app process is unsandboxed;
-only the spawned child is confined).
+`CLAUDE_CONFIG_DIR` is intentionally **not** redirected: Claude Code reads its
+credentials from `~/.claude/.credentials.json`, and pointing it at an empty scratch dir
+hid those credentials and caused "Not logged in" auth failures. Instead the profile
+**allowlists** `~/.claude` + `~/.claude.json` for writes (transcript/history) while the
+default-deny fence still blocks the rest of `$HOME`.
+
+Claude Code's cwd-derived session temp dir (`/private/tmp/claude-<uid>/`) cannot be
+relocated via an env var, so it too is **allowlisted** rather than relocated — see the
+`CLAUDE_TMP` note above. The app process is unsandboxed; only the spawned child is confined.
 
 ### `WIKI_DB` is not conflated
 
