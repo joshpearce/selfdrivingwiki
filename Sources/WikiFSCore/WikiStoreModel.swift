@@ -30,6 +30,15 @@ public final class WikiStoreModel {
     /// Results of the last search (empty when searchQuery is empty).
     public private(set) var searchResults: [WikiPageSummary] = []
     @ObservationIgnored private var searchTask: Task<Void, Never>?
+
+    /// Live SOURCES search query from the Sources search bar. Debounced 300ms.
+    /// Mirrors the page `searchQuery` (semantic cosine, LIKE fallback).
+    public var sourceSearchQuery: String = "" {
+        didSet { scheduleSourceSearch() }
+    }
+    /// Results of the last sources search (empty when sourceSearchQuery is empty).
+    public private(set) var sourceSearchResults: [SourceSummary] = []
+    @ObservationIgnored private var sourceSearchTask: Task<Void, Never>?
     /// The sidebar selection: a page, the system-prompt document, or nothing.
     public var selection: WikiSelection?
     public private(set) var backStack: [WikiSelection] = []
@@ -240,6 +249,12 @@ public final class WikiStoreModel {
     /// `[]` on any error so the menu never throws.
     public func searchSimilar(query: String, limit: Int = 8) -> [WikiPageSummary] {
         (try? store.searchSimilar(query: query, limit: limit)) ?? []
+    }
+
+    /// Semantic source search wrapper for the Sources sidebar search bar and
+    /// context menus. Best-effort: returns `[]` on any error.
+    public func searchSimilarSources(query: String, limit: Int = 20) -> [SourceSummary] {
+        (try? store.searchSimilarSources(query: query, limit: limit)) ?? []
     }
 
     /// Resolve a page title to its id (lowest-ULID on a duplicate-title
@@ -1269,10 +1284,52 @@ public final class WikiStoreModel {
 
     // MARK: - Search
 
-    /// Recompute embeddings for all pages that are missing one, so semantic
-    /// search covers pre‑v7 pages. Returns the count of newly‑embedded pages.
-    public func recomputeMissingEmbeddings() -> Int {
-        store.recomputeMissingEmbeddings()
+    /// Background chunk-embedding backfill. NLEmbedding's inference (CoreNLP →
+    /// BNNS) is **not safe off the main thread** — calling it from a detached
+    /// Task crashes with EXC_BAD_ACCESS inside `BNNSFilterApplyBatch`. So this
+    /// runs ON the main actor, but embeds chunk-by-chunk with a `Task.yield()`
+    /// between chunks so the run loop can service the UI between NLEmbedding
+    /// calls (each ~0.3 s). Fire-and-forget; safe to call repeatedly (only
+    /// embeds documents still missing chunks). FTS search works immediately;
+    /// semantic search fills in as chunks land. (The per-chunk jank goes away
+    /// once we switch to CoreML MiniLM, which is safe off-main on the ANE.)
+    public func backfillMissingEmbeddings() {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.backfill(
+                kind: "page",
+                work: self.store.missingPageEmbeddingWork(),
+                store: { id, chunks in try? self.store.storePageChunks(id: id, chunks: chunks) })
+            await self.backfill(
+                kind: "source",
+                work: self.store.missingSourceEmbeddingWork(),
+                store: { id, chunks in try? self.store.storeSourceChunks(id: id, chunks: chunks) })
+            DebugLog.store("backfill: complete")
+        }
+    }
+
+    /// Embed each document's chunks on the main actor, yielding between chunks
+    /// (and between documents) so the UI stays responsive. Writes via `store`.
+    @MainActor
+    private func backfill(
+        kind: String,
+        work: [(id: PageID, text: String)],
+        store: @escaping @MainActor (PageID, [Data]) -> Void
+    ) async {
+        guard EmbeddingService.isAvailable else { return }
+        for (id, text) in work {
+            var blobs: [Data] = []
+            for chunk in EmbeddingService.chunks(for: text) {
+                if let blob = EmbeddingService.embeddingBlob(for: chunk) {
+                    blobs.append(blob)
+                }
+                await Task.yield()   // let the run loop keep the UI alive between calls
+            }
+            guard !blobs.isEmpty else { continue }
+            store(id, blobs)
+            DebugLog.store("backfill: \(kind) \(id.rawValue) ← \(blobs.count) chunk(s)")
+            await Task.yield()
+        }
     }
 
     private func scheduleSearch() {
@@ -1289,6 +1346,23 @@ public final class WikiStoreModel {
             )) ?? []
             guard !Task.isCancelled else { return }
             self.searchResults = results
+        }
+    }
+
+    private func scheduleSourceSearch() {
+        sourceSearchTask?.cancel()
+        guard !sourceSearchQuery.isEmpty else {
+            sourceSearchResults = []
+            return
+        }
+        sourceSearchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled, let self else { return }
+            let results = (try? self.store.searchSimilarSources(
+                query: self.sourceSearchQuery, limit: 20
+            )) ?? []
+            guard !Task.isCancelled else { return }
+            self.sourceSearchResults = results
         }
     }
 
