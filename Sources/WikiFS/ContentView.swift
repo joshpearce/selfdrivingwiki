@@ -25,6 +25,7 @@ struct ContentView: View {
     @State private var pendingAddURL: PendingAddURL?
     @State private var showingImportMarkdown = false
     @State private var showingAddFromZotero = false
+    @State private var showCloseTabAlert = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -131,6 +132,19 @@ struct ContentView: View {
         }
         .onChange(of: agentLauncher.extractingSourceIDs) { _, newValue in
             if !newValue.isEmpty { isTranscriptExpanded = true }
+        }
+        // Close-while-editing guard: fires for any tab with isEditing set.
+        .onChange(of: store.pendingCloseTabID) { _, id in
+            showCloseTabAlert = id != nil
+        }
+        .onChange(of: showCloseTabAlert) { _, showing in
+            if !showing { store.cancelCloseTab() }
+        }
+        .alert("Close Tab?", isPresented: $showCloseTabAlert) {
+            Button("Close & Discard", role: .destructive) { store.confirmCloseTab() }
+            Button("Keep Editing", role: .cancel) {}
+        } message: {
+            Text("You're in edit mode. Unsaved changes will be discarded.")
         }
     }
 

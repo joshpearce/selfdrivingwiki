@@ -10,6 +10,13 @@ public struct EditorTab: Hashable, Sendable, Identifiable {
     public var selection: WikiSelection
     /// Display label in the tab bar (page title, "Query", "Instructions", etc.).
     public var title: String
+    /// Whether the page editor was open when this tab was last focused.
+    /// Persisted here so switching back to the tab restores edit mode.
+    public var isEditing: Bool = false
+    /// In-progress page draft stashed when the user switches away without saving.
+    /// Non-nil only while `isEditing` and the user has unsaved changes.
+    public var pendingDraftTitle: String? = nil
+    public var pendingDraftBody: String? = nil
 
     public init(selection: WikiSelection, title: String) {
         self.id = UUID()
