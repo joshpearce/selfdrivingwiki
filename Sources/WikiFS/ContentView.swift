@@ -25,13 +25,13 @@ struct ContentView: View {
     @State private var pendingAddURL: PendingAddURL?
     @State private var showingImportMarkdown = false
     @State private var showingAddFromZotero = false
+    @State private var showCloseTabAlert = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         NavigationSplitView {
             SidebarView(store: store, manager: manager, fileProvider: fileProvider,
                         launcher: agentLauncher,
-                        onBatchIngest: batchIngest,
                         ingestingSourceIDs: agentLauncher.ingestingSourceIDs,
                         extractingSourceIDs: agentLauncher.extractingSourceIDs,
                         showingAddFromZotero: $showingAddFromZotero,
@@ -133,6 +133,19 @@ struct ContentView: View {
         .onChange(of: agentLauncher.extractingSourceIDs) { _, newValue in
             if !newValue.isEmpty { isTranscriptExpanded = true }
         }
+        // Close-while-editing guard: fires for any tab with isEditing set.
+        .onChange(of: store.pendingCloseTabID) { _, id in
+            showCloseTabAlert = id != nil
+        }
+        .onChange(of: showCloseTabAlert) { _, showing in
+            if !showing { store.cancelCloseTab() }
+        }
+        .alert("Close Tab?", isPresented: $showCloseTabAlert) {
+            Button("Close & Discard", role: .destructive) { store.confirmCloseTab() }
+            Button("Keep Editing", role: .cancel) {}
+        } message: {
+            Text("You're in edit mode. Unsaved changes will be discarded.")
+        }
     }
 
     /// The agent is doing work — running, or in a local pdf2md extraction / an
@@ -201,21 +214,6 @@ struct ContentView: View {
             defer { agentLauncher.ingestTask = nil }
             await AgentOperationRunner.runIngest(
                 sourceID: sourceID,
-                launcher: agentLauncher,
-                store: store,
-                manager: manager,
-                fileProvider: fileProvider,
-                extractionCoordinator: extractionCoordinator)
-        }
-        agentLauncher.ingestTask = task
-    }
-
-    private func batchIngest(sourceIDs: [PageID]) {
-        DebugLog.ingest("ContentView.batchIngest: user pressed Ingest \(sourceIDs.count) sources")
-        let task = Task {
-            defer { agentLauncher.ingestTask = nil }
-            await AgentOperationRunner.runMultiIngest(
-                sourceIDs: sourceIDs,
                 launcher: agentLauncher,
                 store: store,
                 manager: manager,

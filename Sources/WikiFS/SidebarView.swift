@@ -13,8 +13,6 @@ struct SidebarView: View {
     let fileProvider: FileProviderSpike
     /// Required to launch the LLM lint from the sidebar context menu.
     @Bindable var launcher: AgentLauncher
-    /// Callback when the user clicks "Ingest N Files" in batch mode.
-    var onBatchIngest: (([PageID]) -> Void)? = nil
     /// Files whose agent run is in flight (agent phase) — shows the
     /// "Ingesting…" spinner on those rows.
     var ingestingSourceIDs: Set<PageID> = []
@@ -140,9 +138,9 @@ struct SidebarView: View {
             case .pages: pagesSection()
             case .sources:
                 SourcesSectionView(store: store, fileProvider: fileProvider,
+                    manager: manager, launcher: launcher,
                     ingestingSourceIDs: ingestingSourceIDs,
                     extractingSourceIDs: extractingSourceIDs,
-                    onBatchIngest: onBatchIngest,
                     showingAddFromZotero: $showingAddFromZotero,
                     showingImportMarkdown: $showingImportMarkdown,
                     onAddFromURL: onAddFromURL,
@@ -176,15 +174,6 @@ struct SidebarView: View {
                 systemImage: "checkmark.shield")
                 .tag(WikiSelection.lint)
                 .help("Check the wiki for stale content, broken links, and inconsistencies")
-
-            Button {
-                _ = store.recomputeMissingEmbeddings()
-            } label: {
-                SidebarModeRow(title: "Reindex Search", subtitle: "Rebuild semantic embeddings",
-                    systemImage: "arrow.triangle.2.circlepath")
-            }
-            .buttonStyle(.plain)
-            .help("Recompute embeddings for all missing pages for semantic search")
 
             SidebarModeRow(title: "Activity", subtitle: "Operation log",
                 systemImage: "clock.arrow.circlepath")
@@ -253,6 +242,11 @@ struct SidebarView: View {
     private func pagesSectionRows() -> some View {
         Group {
             let source = store.searchQuery.isEmpty ? store.summaries : store.searchResults
+            // ---- batch share plumbing ----
+            let selectedPageIDs: Set<PageID> = Set(listSelection.compactMap { sel in
+                if case .page(let id) = sel { return id } else { return nil }
+            })
+            // ---- end batch share plumbing ----
             if source.isEmpty, !store.searchQuery.isEmpty {
                 Text("No matching pages").foregroundStyle(.secondary).font(.callout)
                     .padding(.vertical, 8).frame(maxWidth: .infinity, alignment: .leading)
@@ -261,18 +255,114 @@ struct SidebarView: View {
                 SidebarPageRow(summary: summary)
                     .tag(WikiSelection.page(summary.id))
                     .contextMenu {
-                        Button("Rename") { beginRename(summary) }
-                        Button("Lint Page", systemImage: "checkmark.seal") {
+                        let pageID = summary.id
+                        let isBatch = selectedPageIDs.count > 1 && selectedPageIDs.contains(pageID)
+                        Button(isBatch ? "Open \(selectedPageIDs.count) Pages" : "Open",
+                               systemImage: "arrow.up.forward.app") {
+                            if isBatch {
+                                for id in selectedPageIDs { store.openTab(.page(id)) }
+                            } else {
+                                store.openTab(.page(pageID))
+                            }
+                        }
+                        Button(isBatch ? "Open \(selectedPageIDs.count) in Background" : "Open in Background",
+                               systemImage: "dock.arrow.down.rectangle") {
+                            if isBatch {
+                                for id in selectedPageIDs { store.openTabInBackground(.page(id)) }
+                            } else {
+                                store.openTabInBackground(.page(pageID))
+                            }
+                        }
+                        // Batch share — appears only when this row is part of a
+                        // multi-select (2+ pages). Resolves all URLs in parallel
+                        // via the daemon, then passes them to one picker.
+                        if selectedPageIDs.count > 1, selectedPageIDs.contains(summary.id) {
+                            let ids = selectedPageIDs
+                            Button("Share \(ids.count) Pages",
+                                   systemImage: "square.and.arrow.up") {
+                                Task {
+                                    let urls: [URL] = await withTaskGroup(of: URL?.self) { group in
+                                        for id in ids {
+                                            group.addTask { await fileProvider.resolvePageByTitleURL(id: id) }
+                                        }
+                                        var results: [URL] = []
+                                        for await url in group { if let url { results.append(url) } }
+                                        return results
+                                    }
+                                    guard !urls.isEmpty else { return }
+                                    let picker = NSSharingServicePicker(items: urls)
+                                    let mouseScreen = NSEvent.mouseLocation
+                                    guard let window = NSApplication.shared.keyWindow,
+                                          let contentView = window.contentView else { return }
+                                    let windowPoint = window.convertPoint(fromScreen: mouseScreen)
+                                    let viewPoint = contentView.convert(windowPoint, from: nil)
+                                    picker.show(
+                                        relativeTo: NSRect(origin: viewPoint,
+                                                           size: NSSize(width: 1, height: 1)),
+                                        of: contentView, preferredEdge: .minY)
+                                }
+                            }
+                        } else if fileProvider.path != nil {
+                            Button("Share", systemImage: "square.and.arrow.up") {
+                                Task {
+                                    guard let url = await fileProvider.resolvePageByTitleURL(id: pageID) else { return }
+                                    let picker = NSSharingServicePicker(items: [url])
+                                    let mouseScreen = NSEvent.mouseLocation
+                                    guard let window = NSApplication.shared.keyWindow,
+                                          let contentView = window.contentView else { return }
+                                    let windowPoint = window.convertPoint(fromScreen: mouseScreen)
+                                    let viewPoint = contentView.convert(windowPoint, from: nil)
+                                    picker.show(
+                                        relativeTo: NSRect(origin: viewPoint,
+                                                           size: NSSize(width: 1, height: 1)),
+                                        of: contentView, preferredEdge: .minY)
+                                }
+                            }
+                        }
+                        if selectedPageIDs.count <= 1, fileProvider.path != nil {
+                            Button("Reveal in Finder", systemImage: "folder") {
+                                Task { await fileProvider.revealPageInFinder(id: pageID) }
+                            }
+                        }
+                        Divider()
+                        let isBatchLint = selectedPageIDs.count > 1 && selectedPageIDs.contains(summary.id)
+                        Button(isBatchLint ? "Lint \(selectedPageIDs.count) Pages" : "Lint Page",
+                               systemImage: "checkmark.seal") {
                             Task {
-                                await AgentOperationRunner.runLintPage(
-                                    pageID: summary.id, pageTitle: summary.title,
-                                    launcher: launcher, store: store,
-                                    manager: manager, fileProvider: fileProvider)
+                                if isBatchLint {
+                                    let pages = selectedPageIDs.compactMap { id -> (id: PageID, title: String)? in
+                                        guard let s = store.summaries.first(where: { $0.id == id }) else { return nil }
+                                        return (id: id, title: s.title)
+                                    }
+                                    await AgentOperationRunner.runLintPages(
+                                        pages: pages,
+                                        launcher: launcher, store: store,
+                                        manager: manager, fileProvider: fileProvider)
+                                } else {
+                                    await AgentOperationRunner.runLintPages(
+                                        pages: [(id: summary.id, title: summary.title)],
+                                        launcher: launcher, store: store,
+                                        manager: manager, fileProvider: fileProvider)
+                                }
                             }
                         }
                         .disabled(store.isAgentRunning)
-                        Divider()
-                        Button("Delete", role: .destructive) { store.delete(summary.id) }
+
+                        if selectedPageIDs.count <= 1 {
+                            Divider()
+                            Button("Rename", systemImage: "pencil") { beginRename(summary) }
+                        } else {
+                            Divider()
+                        }
+                        let isBatchDelete = selectedPageIDs.count > 1 && selectedPageIDs.contains(pageID)
+                        Button(isBatchDelete ? "Delete \(selectedPageIDs.count) Pages" : "Delete",
+                               systemImage: "trash", role: .destructive) {
+                            if isBatchDelete {
+                                for id in selectedPageIDs { store.delete(id) }
+                            } else {
+                                store.delete(pageID)
+                            }
+                        }
                     }
                     .swipeActions(edge: .trailing) {
                         Button("Delete", role: .destructive) { store.delete(summary.id) }

@@ -2,6 +2,453 @@
 
 Newest first. To get up to speed: read `PLAN.md` then this file.
 
+## 2026-06-29 — Embedding inference stopped blocking the main thread
+
+Clicking a page (and app startup) had a ~0.4–2 s stall introduced by the
+semantic-search work (PR #91). Root-caused via `ReaderTiming`/`DebugLog`
+instrumentation (subsystem `com.selfdrivingwiki.debug`, category `render`):
+
+- The **page-row context menu** in `SidebarView.pagesSectionRows` eagerly called
+  `store.searchSimilar(query:)` for every page row in its `.contextMenu` builder.
+  SwiftUI evaluates that builder on every sidebar layout pass, so a single page
+  selection ran `searchSimilar` (→ `NLEmbedding.vector(for:)` on the **main
+  thread**) for all ~232 rows — hundreds of inferences per render, freezing the
+  UI. (Sources were fast only because their rows lack that menu.)
+- Separately, at launch `backfill` called `EmbeddingService.isAvailable`, which
+  **loads the `NLEmbedding` model** (~0.3 s on the main thread) even when there
+  was zero missing work to embed.
+
+**Fixes (this branch):**
+- `WikiStoreModel.searchSimilar` / `searchSimilarSources` are **no-ops (`[]`)**
+  until NLEmbedding inference is moved off the main actor; the "Find Similar…"
+  context-menu item is removed.
+- `backfill` now short-circuits on empty work **before** touching the embedding
+  model, so a warm DB skips the model load at startup.
+- `EmbeddingService` is instrumented end-to-end (`embed.model LOAD`, `embed.isAvailable`,
+  `embed.chunked ENTER/EXIT`, `embed.call <ms> …`, `embed.STACK …`) so every hit
+  is visible via `log show`. Kept as witness marks.
+- Reader timing probes added: `click.to-startLoad`, `click.to-painted`,
+  `webview.main-hop`, `webview.task-start`, `webview.html-load`.
+
+**Follow-up (not done here):** move `NLEmbedding` inference off the main actor
+(the comment claims BNNS crashes off-main, but that's most likely a shared-model
+concurrency issue — serialize on a dedicated background thread) and restore
+"Find Similar" with a lazy, off-main search.
+
+## 2026-06-29 — File Provider extension no longer links AppKit/PDFKit (macOS 26 crash)
+
+The `WikiFSFileProvider` extension crashed at launch on macOS 26 inside
+`_EXRunningExtension._start` because its binary linked **AppKit** — forbidden
+for a `com.apple.fileprovider-nonui` extension.
+
+**Root cause.** `DisplayNameResolver` (in `WikiFSCore`) `import`s PDFKit, and
+PDFKit transitively links AppKit. The extension links `WikiFSCore` as its sole
+read-only dependency, so it inherited AppKit linkage even though it never runs
+the PDF-title path.
+
+**Fix (injectable seam).** PDF-title extraction is now injected:
+`DisplayNameResolver.pdfTitleExtractor` defaults to a `nil`-returning closure,
+keeping `WikiFSCore` — and therefore the extension — free of PDFKit/AppKit at
+link time. The real PDFKit implementation lives in the **app** target
+(`Sources/WikiFS/PDFTitleExtractor.swift`), which the extension does **not**
+link, and is installed at launch via `DisplayNameResolver.installPDFTitleExtractor()`
+(called from `WikiFSApp.init`). Non-app contexts (extension, `wikictl`, tests)
+keep the default and fall through to the filename.
+
+**MLX note.** This branch was originally built on top of a MiniLM/MLX embedding
+feature series; that MLX work was **dropped** (it was a separate concern and
+also pulled Metal/Accelerate/CoreML into the extension). The fix now stands on
+`main` alone, where isolating PDFKit is *sufficient* to remove AppKit from the
+extension. NL-based embeddings (PR #91) remain unaffected.
+
+**Evidence.** `swift build` clean; 1211 tests pass; `otool -L` on the rebuilt
+`WikiFSFileProvider` binary shows **no** AppKit/PDFKit/AVFoundation/Metal (only
+FileProvider/Foundation/NaturalLanguage/JavaScriptCore/CFNetwork/Security). The
+app binary still links PDFKit/AppKit, so PDF display-name resolution is
+preserved. See PR #93.
+
+## 2026-06-29 — Fresh-DB fast path (migration consolidation)
+
+The stepwise ladder (v0→v14) is correct but does heavy create→mutate→drop churn
+on a **fresh** DB: v7/v12 create single-row embeddings that v14 immediately
+drops; v2 creates `ingested_files` that v10 renames to `sources`; v8 creates
+`file_markdown_versions` that v10 renames; `source_links` is created (v10) then
+rebuilt for cascade (v11). ~40 DDL statements for a fresh DB.
+
+**Consolidation (safe):** added `createFreshSchemaV14()` — when `user_version ==
+0`, build the complete current schema in ONE block and jump to v14, skipping all
+the churn. The stepwise ladder is preserved verbatim as `migrate(from:)` for
+EXISTING dbs (version >= 1), which MUST keep their irreversible data migrations
+(renames, column adds, table rebuilds) — those cannot be collapsed without
+risking existing data. Legacy index names (`ingested_files_created`,
+`file_markdown_versions_file`) that survive the ladder's renames are reproduced
+verbatim in the fast path.
+
+**Parity guard:** `FreshSchemaParityTests` forces a fresh DB through the full
+ladder (via a test-only `forceLadderMigration` init flag) and asserts the two
+produce identical schemas (object inventory + per-table columns + FKs + version).
+`swift build` clean; **1211 tests pass**.
+
+## 2026-06-29 — v14 per-chunk RAG embeddings (fixed launch crash; async backfill)
+
+**Crash:** the app aborted at launch with an uncatchable C++ `std::bad_alloc`.
+Root cause (via `lldb` break on `__cxa_throw`): the open-time self-heal called
+`NLEmbedding.vector(for:)` on whole source bodies; above ~250k chars NLEmbedding
+throws `std::bad_alloc` (Swift can't catch C++ exceptions → terminate). It was
+never seen before because the embedding recompute only ran via the never-pressed
+"Reindex Search" button; the self-heal made it run at every launch. Measured:
+NLEmbedding ≈ 5 s / 100k chars and crashes ≥ ~250k.
+
+**Fix — per-chunk (RAG-style) embeddings, computed async:**
+- **`TextChunker`** (`Sources/WikiFSCore/TextChunker.swift`): pure-Swift port of
+  LangChain `RecursiveCharacterTextSplitter` / Chonkie `RecursiveChunker`
+  (separator hierarchy `\n\n → \n → space → char`, ~4k-char chunks + 10% overlap).
+  Research confirmed only Recursive/Sentence chunkers are portable to on-device
+  Swift; Late/Semantic/Neural need a transformer's token embeddings (NLEmbedding
+  is opaque). No mature Swift chunking library exists.
+- **`EmbeddingService.chunkedEmbeddings(for:maxChunks:)`**: chunks the text, embeds
+  each chunk (small → fast + crash-free), caps to 64 chunks (evenly sampled across
+  the doc so a deep passage is still represented). `embeddingBlob(for:)` kept for
+  short query strings.
+- **v14 migration:** `page_chunks` + `source_chunks` (one BLOB per text chunk,
+  FK ON DELETE CASCADE); drops the old one-row-per-doc `page_embeddings` /
+  `source_embeddings`. Semantic search now ranks by each doc's BEST-matching chunk
+  (`GROUP BY doc … MIN(vec_distance_cosine)`), so a query hits the specific passage.
+- **Async, not at launch:** embedding is too slow to run synchronously (full corpus
+  ≈ minutes). Removed from `init`; `WikiStoreModel.backfillMissingEmbeddings()`
+  (kicked off on wiki open) computes vectors OFF the main actor while all DB
+  reads/writes stay on main (single-connection store). Resumable/incremental — only
+  docs still missing chunks are embedded, so a killed run continues next launch. FTS
+  search works immediately; semantic search fills in as chunks land.
+- Protocol: `storePageEmbedding`/`storeSourceEmbedding` → `storePageChunks`/
+  `storeSourceChunks` (+ `missingPageEmbeddingWork`/`missingSourceEmbeddingWork`).
+  `PageUpsert.upsert` (wikictl) chunk-embeds pages too.
+
+**Verified:** `swift build` clean; **1209 tests pass** (incl. 7 new `TextChunkerTests`).
+Rebuilt the `.app` via `./build.sh debug` and launched against the live DB: no crash,
+v14 migration applied, background backfill streamed `backfill: page … ← N chunk(s)`.
+(source_chunks fills after pages; was killed mid-run at 73 page-chunks.)
+
+**Follow-up crash (SIGSEGV) + fix:** the first cut ran the backfill on a detached
+background queue. That crashed with `EXC_BAD_ACCESS` inside `BNNSFilterApplyBatch` —
+**NLEmbedding/CoreNLP inference is not safe off the main thread.** Moved the backfill
+onto the main actor, embedding chunk-by-chunk with `Task.yield()` between chunks so
+the UI stays responsive between the ~0.3 s NLEmbedding calls. Re-verified: app ran
+60 s through active backfill with no crash (newest `.ips` unchanged). Known minor
+warning (non-fatal): "reentrant operation in NSTableView delegate" during backfill
+writes — to revisit. The per-chunk main-actor jank is itself the strongest argument
+for the CoreML MiniLM move (ANE inference is safe off-main).
+
+**Deferred (recommended separately): CoreML all-MiniLM-L6-v2.** NLEmbedding is the
+bottleneck — ~5 s / 100k chars, so a full-corpus first backfill takes minutes.
+Research (see below) says CoreML MiniLM on the Neural Engine is ~5-15 ms/sentence
+(100-1000× faster), better quality, no crash, predictable 512-token truncation — at
+the cost of ~100 MB bundle + a tokenizer + Swift mean-pooling (~2-5 days). When
+adopted, swap it in behind `EmbeddingService` (chunk index + queries unchanged).
+
+## 2026-06-29 — Unified, self-healing hybrid search (removed manual Reindex)
+
+**Bug:** source search returned **no results** in the app. Root cause: the live
+DB (`01KVHRPBPRY368HJTZNSB75D7R`, 71 sources) had `source_search=0` and
+`source_embeddings=0` rows — both halves of the hybrid query came back empty.
+The only thing that populated these was the manual **"Reindex Search"** sidebar
+button (`rebuildFTS` + `recomputeMissing*`), which was never run against
+pre-existing sources. Verified via `DebugLog` + direct sqlite counts.
+
+**Fix — one search flow that self-heals on every writable open:**
+- **Unified the duplicated page/source search flow** into one generic
+  `hybridSearch(kind:query:limit:id:fts:semantic:)` (FTS5 bm25 always; +vec0
+  cosine fused via `RankFusion.rrf` when vec+model available; FTS-only fallback).
+  Both `searchSimilar` and `searchSimilarSources` route through it — the two can
+  no longer drift.
+- **Unified embedding store + maintenance:** `storePageEmbedding`/
+  `storeSourceEmbedding` → one generic `upsertEmbedding(table:idColumn:…)`; the
+  two `recomputeMissing*` → one shared `embedMissing(kind:rows:store:)`.
+- **Self-heal `ensureSearchIndexesPopulated()`** runs in `init(databaseURL:)`
+  (writable only; NOT the read-only File Provider). Idempotent, near-zero cost
+  when healthy: (1) seed native-markdown sources lacking a processed-markdown
+  version, (2) backfill `source_search`, (3) rebuild `pages_fts`/`sources_fts`
+  only when lagging, (4) `recomputeMissingEmbeddings` + `recomputeMissingSourceEmbeddings`.
+- **Removed the manual reindex:** the sidebar "Reindex Search" button, and
+  `recomputeMissingEmbeddings`/`recomputeMissingSourceEmbeddings`/`rebuildFTS`
+  from the `WikiStore` protocol + `WikiStoreModel`. (Kept on the concrete
+  `SQLiteWikiStore` — used by self-heal + tests.)
+
+**Verified:** `swift build` clean; **1202 tests pass**. Against a snapshot copy
+of the real DB, applying the FTS self-heal steps took `source_search` 0→71 and
+`sources_fts` 0→71, and the bm25 query returned relevant hits for "dissociation"
+and "hypnosis". (The embedding half can't run under raw sqlite3 — it needs
+`NLEmbedding` — but is the same path covered by unit tests; it populates on the
+app's next open.)
+
+**Known, out of scope:** `wikictl` resolves the app-group container to
+`group.org.sockpuppet.wiki` (empty) while the live data is in
+`group.com.willsargent.wiki`, so `wikictl source search` can't reach the live DB
+(`no wiki matching`). This is a pre-existing wikictl container mismatch, not a
+search bug.
+
+## 2026-06-29 — `WikiIdentifiers` reads `signing/local.config` (debug wikictl just works)
+
+The plain SwiftPM CLI (`.build/debug/wikictl`) resolved the **wrong** App Group
+(`group.org.sockpuppet.wiki`, empty) while the live data lived in
+`group.com.willsargent.wiki`: it has no Info.plist (so the `WIKIAppGroupID`
+lookup missed) and no `wiki-identifiers.env` sidecar, so it fell through to the
+compiled-in default. The GUI app was unaffected (it gets the value from its
+Info.plist via `build.sh`).
+
+**Fix:** added `signing/local.config` (the gitignored, per-developer file that
+`build.sh` already reads) as a resolution step in `WikiIdentifiers.resolve`,
+checked by walking UP from the executable until a repo root containing it is
+found. `appGroupID` ← `APP_GROUP`, `fileProviderID` ← `EXT_BUNDLE_ID`. New order:
+env → Info.plist → `wiki-identifiers.env` sidecar → `signing/local.config` →
+default. Refactored the shared `KEY=VALUE` parsing into `parseKV`.
+
+**Non-breaking:** no per-user value is committed. Fresh clones / CI without
+`signing/local.config` fall through to the default unchanged. Verified: `.build/debug/wikictl --wiki "My Wiki" source search --query dissociation` now
+returns real hits with NO env var; 1202 tests pass.
+
+## 2026-06-28 — FTS5/BM25 keyword search (v13); vec layer found broken
+
+Discovered the **semantic (vec) search never actually ran in the app**: macOS's
+system SQLite is built with `SQLITE_OMIT_LOAD_EXTENSION`, so
+`sqlite3_enable_load_extension`/`sqlite3_load_extension` don't exist as symbols
+→ `dlsym` returns NULL → `vec0.dylib` never loads → `isVecAvailable()` is always
+false → every search (pages AND sources) degraded to filename-only `LIKE`. The
+body was never indexed or searched. Confirmed via `DebugLog` instrumentation and
+`PRAGMA compile_options` (`OMIT_LOAD_EXTENSION`; `ENABLE_FTS5` present).
+See [`plans/search-fts5-hybrid.md`](plans/search-fts5-hybrid.md) (3-phase plan).
+
+**Phase 1 done — FTS5/BM25 backbone (always-on, fully unit-testable):**
+- **v12 → v13 migration:** `pages_fts` = external-content FTS5 over `pages`
+  (`title`, `body_markdown`) maintained by AFTER INSERT/UPDATE/DELETE triggers
+  (zero page-write Swift changes); `sources_fts` = external-content FTS5 over a
+  new `source_search(source_id PK → sources(id) ON DELETE CASCADE, title, body)`
+  sidecar (body is the HEAD of the version chain, not inline). Porter tokenizer
+  (stemming: `run`↔`running`, `car`↔`cars`). Existing content backfilled lazily
+  via `rebuildFTS()` (Reindex).
+- **Store methods:** `searchPagesFTS`/`searchSourcesFTS` (bm25, `ORDER BY rank`),
+  `upsertSourceSearch(sourceID:body:)` (resolves `display_name ?? filename`),
+  `rebuildFTS() -> (pages, sources)`. Added to the `WikiStore` protocol + model.
+- **Write hooks:** `addSource` (name-only), `appendProcessedMarkdown`,
+  `renameSource` now keep `source_search` fresh (triggers keep `*_fts` in sync).
+- **Search switch:** the `LIKE` fallback in `searchSimilar`/`searchSimilarSources`
+  is now **FTS5 bm25 over the full body** (kept as the path taken when vec is
+  unavailable — i.e. today, and in tests/`wikictl`).
+- **Tests:** new `FullTextSearchTests` (body search with zero filename overlap,
+  porter stemming, name-only, bm25 ranking, delete cascade, rebuild). All pass.
+  Existing source-search tests now exercise FTS and still pass.
+- **Phase 2 done — vec fixed via static amalgamation:** the loadable-`dylib` path
+  was impossible on macOS (`OMIT_LOAD_EXTENSION`). Vendored `sqlite-vec.c`
+  v0.1.9 into a new `CSqliteVec` SwiftPM C target (`Sources/CSqliteVec/`, +MIT
+  license + provenance README) compiled `-DSQLITE_CORE -DSQLITE_VEC_STATIC`,
+  linked against the **system** libsqlite3 (no second SQLite, no
+  `load_extension`). Registered per-connection via the sqlite-vec C/C++ guide's
+  "direct call" pattern — `sqlite3_vec_init(db, NULL, NULL)` — exposed as
+  `wikifs_vec_register` and called from both inits. Removed the dead
+  `dlopen`/`dlsym`/`load_extension` loader, the `vec0.dylib` copy in `build.sh`,
+  and `Resources/vec0.dylib` itself — `make`/`swift build` now Just Works for any
+  contributor (no dylib, no env vars). Proven by
+  `vecScalarIsRegisteredAfterStaticLink` (vec_distance_cosine registers under
+  `swift test` now); full suite green (1197 tests).
+- **Phase 3 done — RRF hybrid reranker:** `RankFusion.rrf` (pure Swift,
+  `Sources/WikiFSCore/RankFusion.swift`) fuses the semantic + FTS result lists by
+  Reciprocal Rank Fusion (`score = Σ 1/(60+rank)`). `searchSimilar` /
+  `searchSimilarSources` now always compute FTS5 (the lexical floor), and when vec
+  + the embedding model are available also run the cosine query and fuse — a doc
+  matching BOTH lexical + semantic outranks one matching only one. Degrades to
+  FTS-only when vec/the model is unavailable (tests, `wikictl`). Fully unit-tested
+  (`RankFusionTests`); full suite green (1202 tests). **Search now works end-to-end.**
+
+## 2026-06-28 — Semantic (vector) search for sources
+
+Added meaning-based search over sources, mirroring the existing page-embedding
+pipeline (sqlite-vec cosine + Apple `NLEmbedding`) verbatim on a new per-source
+embeddings table. Surfaced in the Sources sidebar search box and via a new
+`wikictl source search` command so the agent finds source material by meaning.
+See [`plans/source-semantic-search.md`](plans/source-semantic-search.md).
+
+**Phase 1 — storage & embeddings (`SQLiteWikiStore` / `WikiStore`):**
+- **v11 → v12 migration:** new `source_embeddings(source_id PK → sources(id) ON
+  DELETE CASCADE, embedding BLOB)` table, mirroring `page_embeddings` (v7).
+- `storeSourceEmbedding(id:blob:)`, `searchSimilarSources(query:limit:)`
+  (cosine ranking with a `LIKE` filename/display-name fallback), and
+  `recomputeMissingSourceEmbeddings() -> Int` (backfills gaps; embeds on
+  processed-markdown HEAD body + name, name-only when no markdown). All three
+  added to the `WikiStore` protocol (only `SQLiteWikiStore` conforms).
+- **Re-embed hooks** keep embeddings fresh: `reembedSource(sourceID:body:)` is
+  called from `appendProcessedMarkdown` (covers extraction seeding, raw-text
+  seeding, user edits, and revert) and `renameSource` (title changed).
+  Best-effort (`try?`); falls back to reindex backfill when vec is unavailable.
+- `searchSimilarSources` enumerates the 11 source columns explicitly — **never
+  `SELECT s.*`** (the physical `sources` table has a `content` BLOB between
+  `byte_size` and `created_at` that would shift `sourceSummary(from:)`'s indices).
+
+**Phase 2 — model & UI:** `WikiStoreModel` gained `sourceSearchQuery` +
+`sourceSearchResults` + a debounced (300 ms) `scheduleSourceSearch`. A Sources
+search bar (mirroring the Pages `searchBar`) sits between the filter picker and
+the rows, swapping to ranked results with a "No matching sources" empty state.
+`recomputeMissingSourceEmbeddings()` on the model first seeds markdown-native
+sources (so they get *content* embeddings) then calls the store recompute.
+"Reindex Search" now also runs the source recompute.
+
+**Phase 3 — agent CLI + system prompt:** `source search --query "…" [--limit N]`
+prints ranked `id<TAB>name` lines (display name, filename fallback), read-only
+(mirrors `PageCommand.search`). `--limit` validated 1–100 (default 10). Added to
+`ArgumentParser.usageText` and the `SystemPrompt.swift` tooling list, with a note
+that source *content* is searchable (complementing `sources.jsonl` metadata and
+`source cat` raw bytes).
+
+**Tests:** new `SourceEmbeddingSearchTests` (17 tests) covering the v12
+migration, the LIKE fallback (find/limit/display-name/empty/no-`SELECT *`
+regression), recompute/re-embed no-op behavior without vec, the `ON DELETE
+CASCADE`, and the CLI TSV output + arg validation. The model-gated cosine path
+cannot run under `swift test` (NLEmbedding is app-bundle-gated) — same limitation
+as page search; AC.1/AC.3/AC.6 validated manually in the running app. Updated
+schema-version assertions (11 → 12) across 6 existing tests. **1189 tests green.**
+
+Branch `feature/source-semantic-search`.
+
+## 2026-06-28 — Reveal in Finder for pages and sources
+
+Added a "Reveal in Finder" action on every page and source surface so users can
+locate the File Provider-mounted file in Finder (to drag to other apps, open in
+Terminal, etc.).
+
+**New methods on `FileProviderSpike`.**  `revealPageInFinder(id:)` and
+`revealSourceInFinder(id:)` resolve the item's user-visible URL via the daemon
+(reusing the existing `resolvePageByTitleURL` / `resolveSourceByNameURL` helpers)
+then call `NSWorkspace.shared.activateFileViewerSelecting([url])` — the same
+call used by `VerificationPopover` for the wiki root.
+
+**Surfaces:**
+- **Page sidebar context menu** — "Reveal in Finder" after Share, single-select
+  only (multi-select would open N Finder windows).
+- **Page detail view** — button in the view-mode header row, after Share.
+- **Source sidebar context menu** — wired via a new `onRevealInFinder` closure on
+  `SourceRow`; single-select only.
+- **Source detail view** — button in the view-mode header row, after Share.
+
+All surfaces are guarded by `fileProvider.path != nil` so the item is hidden
+until the domain is mounted. Branch `feature/add-reveal-in-finder`, PR #90.
+
+## 2026-06-28 — Dirty-editor protection and edit-mode persistence
+
+Three editor-UX gaps closed. See [`plans/dirty-editor-protection.md`](plans/dirty-editor-protection.md) for the design.
+
+**Outline button in edit mode.** Added the `sidebar.right` toggle to the
+edit-mode toolbar in both `PageDetailView` and `SourceDetailView` (it existed
+only in read mode before). State is shared via `@AppStorage("isOutlineExpanded")`
+so the panel's visible/hidden position persists across mode switches.
+
+**Per-tab edit-mode persistence.** `EditorTab` gained `isEditing: Bool`.
+`WikiStoreModel.setTabEditing(tabID:isEditing:)` persists the flag from the
+view. `PageDetailView` and `SourceDetailView` sync on every enter/exit-edit event
+and restore the flag when `store.activeTabID` changes. A `lastKnownActiveTabID`
+sentinel distinguishes tab switches (restore from tab flag) from in-tab
+navigation (reset to false). `SourceDetailView` adds a `shouldRestoreEditing`
+flag that defers the `editBuffer` repopulation until `headVersion` loads.
+
+**Close-tab confirmation.** `WikiStoreModel.closeTab(id:)` now defers when
+`tabs[index].isEditing && id == activeTabID`, setting `pendingCloseTabID`.
+`confirmCloseTab()` / `cancelCloseTab()` apply or abandon the deferred close.
+`ContentView` shows "Close Tab?" for page/other tabs (page drafts are saved
+automatically by `flushPendingSave` inside `setActiveTab`). `SourceDetailView`
+shows its own alert and calls `flushEditIfDirty()` before `confirmCloseTab()` so
+the save runs while `file.id` still refers to the closing tab's source.
+
+## 2026-06-28 — Page body contract: clean body in SQLite, decoration via file provider
+
+`body_markdown` in SQLite now stores only the prose body — no H1, no YAML
+frontmatter. The File Provider extension generates both on the fly when serving
+`.md` files to Finder and external tools. This fixes the outline-panel flicker
+and makes renames safe.
+
+**Root cause of the flicker.** `PageDetailView` had a `readerMarkdown` computed
+property that stripped the leading H1 from `draftBody` before passing it to
+`PageOutlineView`. Because `draftTitle` and `draftBody` are set sequentially in
+`loadDrafts`, there was a render window where the new title was live but the old
+body was still in place. The guard inside `readerMarkdown` failed to match,
+returning the full old body (H1 included), which briefly appeared in the outline.
+
+**New contract.** A shared `PageMarkdownFormat` enum in `WikiFSCore` owns both
+directions:
+- `stripped(body:title:)` — removes leading YAML frontmatter block, matching H1,
+  and the blank lines that separate them from the body. Used in `loadDrafts` and
+  `rename(_:to:)` so the editor and SQLite always hold clean body.
+- `fileContent(for:)` — generates `---\ntitle/date frontmatter---\n\n# Title\n\n
+  body` for the file provider. Calls `stripped` internally, so pages whose
+  `body_markdown` still has an embedded H1 (pre-migration) produce correct
+  single-title output without a DB migration.
+
+**`Projection` changes.** Both `pageFileNode` (reported `documentSize`) and
+`contents(for:)` call `PageMarkdownFormat.fileContent(for:)`, so the file size
+the daemon caches and the bytes it serves are always derived from the same
+formula. Frontmatter schema: `title` (double-quoted, `"` escaped) and `date`
+(local `YYYY-MM-DD` from `updatedAt`).
+
+**Editor warning.** `saveWarningBanner` in `PageDetailView` now shows an orange
+warning when `draftBody` starts with `---`, pointing the user to the title field
+above.
+
+**`readerMarkdown` deleted.** The three call sites in `PageDetailView` now
+reference `store.draftBody` directly; no stripping is needed because the body is
+always clean.
+
+**Migration.** Automatic and zero-downtime: stripping in `loadDrafts` is
+backwards-compatible; pages converge to the new format on first load + save.
+
+**Tests.** 12 new `PageMarkdownFormatTests` covering `stripped` (H1 match/miss,
+frontmatter only, frontmatter + H1, mismatch, empty) and `fileContent` (format,
+no-double-H1, empty body, title escaping). 1170 tests total, all passing.
+
+## 2026-06-28 — Clean up link context menus and sidebar context menus
+
+Removed redundant actions and reorganized the right-click link context menu
+and the sidebar context menus for pages and sources.
+
+**Link context menu (both page and source detail views):**
+- Removed "Copy File Path", "Download…", "Copy Link", and "Open in Browser"
+- WebKit's native "Open Link" covers browser-open; Share covers file-copy/download
+- "Open in Background Tab" inserted right after "Open Link" for wiki links
+- Share icon added to the custom Share item; resolves the canonical URL from
+  the daemon (`getUserVisibleURL`) for wiki links, passes the raw URL for
+  external links
+- Menu is now identical between Page and Source detail views
+
+**Page sidebar context menu:**
+- Added "Open" and "Open in Background" at the top
+- Added "Find Similar…" submenu (semantic search, excludes the current page)
+- Rename moved next to Delete at the bottom; Delete has a trash icon
+- Lint Page has a dedicated separator section
+
+**Source sidebar context menu:**
+- Added "Open in Background" below "Open"
+- Ingest Selected shows a confirmation dialog when re-ingesting
+- Share and Ingest grouped together (no divider); Rename/Delete below a separator
+- Rename and Delete match the page menu layout
+
+## 2026-06-28 — Share pages and sources
+
+Added Share to every page and source surface.  Single share resolves the
+canonical URL from the daemon via `getUserVisibleURL` (same mechanism as
+`openSource`); batch share resolves all selected item URLs in parallel via
+`withTaskGroup`.  Pages use the `page-by-title:<ulid>` identifier, sources use
+`source-by-name:<ulid>` — both produce human-readable filenames.
+
+**Surfaces:**
+- **Page detail** toolbar — Share button (replaces Copy Path)
+- **Page sidebar** context menu — single Share + batch "Share N Pages"
+- **Source detail** toolbar — Share button (left of Outline toggle)
+- **Source sidebar** context menu — single Share + batch "Share Selected"
+
+**Infrastructure** (landed first on `feature/fileprovider-schema-migration`):
+- Schema version migration: auto-tears-down domains when container names change
+- Cache warming: top-down directory enumeration after domain activation
+- `source-by-name:` identifier prefix shared across app and extension
+
+See `plans/share-pages-and-sources.md` and
+`plans/fileprovider-schema-migration-and-cache-warming.md`.
+
 ## 2026-06-27 — Better context menu for links in the reader
 
 Overhauled the right-click context menu for links in `WikiReaderView`. The old menu
@@ -10,7 +457,7 @@ linked file) and lacked useful tab/download actions. The new menu:
 
 * **Removed** non-functional WebKit items: "Open Link in New Window",
   "Download Linked File". Orphaned separators are collapsed automatically.
-* **Open in Background Tab** (wiki links) — opens the target page/source in a new
+* **Open in Background** (wiki links) — opens the target page/source in a new
   tab without leaving the current page. Backed by a new `openTabInBackground(_:)`
   method on `WikiStoreModel`.
 * **Download…** (wiki links) — copies the linked file from the File Provider mount
@@ -30,7 +477,7 @@ WebKit item surgery in `WikiReaderWebView.willOpenMenu`.
 
 ## 2026-06-27 — Outline Pane
 
-Added an outline pane for the page detail view that shows headers in the Markdown document in a tree.
+Added an outline pane for the detail views that shows headers in the Markdown document in a tree.
 Clicking on an element takes you to the position of the header in the document.
 
 ## 2026-06-27 — Hover tooltips for wiki links in the WKWebView reader

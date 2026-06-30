@@ -74,7 +74,7 @@ struct Projection {
         // Shared with the app (which resolves a per-file user-visible URL to open
         // it in the default app), so the two sides build the identical identifier.
         static let sourceByIDPrefix = WikiFSContainerID.sourceByIDPrefix
-        static let sourceByNamePrefix = "source-by-name:"
+        static let sourceByNamePrefix = WikiFSContainerID.sourceByNamePrefix
         static let sourceMarkdownByIDPrefix = "source-markdown-by-id:"
         static let sourceMarkdownByNamePrefix = "source-markdown-by-name:"
 
@@ -529,9 +529,9 @@ struct Projection {
             ? FilenameEscaping.byTitleFilename(title: page.title, pageID: page.id.rawValue)
             : FilenameEscaping.byIDFilename(pageID: page.id.rawValue)
         let parent = isByTitle ? Identity.pagesByTitle : Identity.pagesByID
-        let body = Data(page.bodyMarkdown.utf8)
+        let fileData = Data(PageMarkdownFormat.fileContent(for: page).utf8)
         return .file(
-            id: id, parent: parent, name: name, size: body.count,
+            id: id, parent: parent, name: name, size: fileData.count,
             version: Data(String(page.version).utf8),
             metadataVersion: Data(
                 "\(page.title)|\(page.updatedAt.timeIntervalSince1970)|\(page.version)".utf8),
@@ -698,7 +698,7 @@ struct Projection {
               let page = try? store.getPage(id: PageID(rawValue: ulid)) else {
             return nil
         }
-        return Data(page.bodyMarkdown.utf8)
+        return Data(PageMarkdownFormat.fileContent(for: page).utf8)
     }
 }
 

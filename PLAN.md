@@ -39,6 +39,7 @@ load-bearing for the app to function.
 | [`plans/INITIAL.md`](plans/INITIAL.md) | Original full product/architecture plan (milestones, schema, File Provider design, definition of done). Source of truth for *what we're building*. |
 | [`plans/llm-wiki.md`](plans/llm-wiki.md) | **Next major effort:** turning Self Driving Wiki into a self-maintaining LLM Wiki — **many** wikis (one SQLite DB + one File Provider domain each), with `claude -p` authoring/maintaining each one by writing via a new `wikictl` CLI (read via the mount, write via the CLI). Locked decisions, components, and the Phase 0 → A–D plan. Read before Phase 0. |
 | [`plans/page-reader-ui.md`](plans/page-reader-ui.md) | **Current UI direction:** page detail is reader-first because the agent should maintain wiki content; manual source editing is an explicit, rare mode. |
+| [`plans/page-body-contract.md`](plans/page-body-contract.md) | **Page body contract:** `body_markdown` in SQLite stores clean body only (no H1, no frontmatter); the file provider generates both on the fly via `PageMarkdownFormat`. Covers the outline-flicker fix, migration strategy, frontmatter schema, and editor warning. |
 | [`plans/query-conversation.md`](plans/query-conversation.md) | **Current Query direction:** a dedicated sidebar page with an interactive Claude session; output-first chat by default, hidden tool/internal rows behind a checkbox, and writes via `wikictl` only when the user asks to persist changes. |
 | [`plans/BRINGUP.md`](plans/BRINGUP.md) | The 4-phase bring-up plan from skeleton to v0 (groups INITIAL.md's M0–M6). Source of truth for *the order we build in*. |
 | [`plans/build-environment.md`](plans/build-environment.md) | How the app is built: SwiftPM + `build.sh` + `Makefile`, signing, icon generation, app-bundle layout. Source of truth for *how we build and run*. |
@@ -49,9 +50,13 @@ load-bearing for the app to function.
 | [`plans/pdf-extraction.md`](plans/pdf-extraction.md) | Add docling + granite-docling pipeline. A `pdf2md` CLI converts PDFs to markdown at ingest time; extracted markdown stored as a sibling `ingested_files` row, projected on the mount. Agent prefers `.md` siblings, falls back to `Read` on the original. |
 | [`plans/pdf-extraction-backends.md`](plans/pdf-extraction-backends.md) | **Pluggable extraction backends.** A `MarkdownExtractor` protocol + `ExtractionCoordinator` so PDF→Markdown can run via **local pdf2md** (default), **Claude** (Anthropic API), **Gemini** (Google AI), or a self-hosted **Docling Serve**. Backend-agnostic storage (no schema change), a Settings tab that shows only the selected backend's config + per-backend Test Connection, and config/Keychain/HTTP patterns mirroring Zotero. |
 | [`plans/semantic-search.md`](plans/semantic-search.md) | Semantic (meaning-based) search over pages using sqlite-vec + Apple NLEmbedding. Embedding at save time, cosine-similarity ranking inside SQLite, search bar in the sidebar, `wikictl search` for the agent. v7 migration. |
+| [`plans/source-semantic-search.md`](plans/source-semantic-search.md) | Semantic search over **sources** — mirrors the page pipeline (sqlite-vec cosine, `EmbeddingService`) on a new `source_embeddings` table (v11→v12). Re-embed hooks on `appendProcessedMarkdown`/`renameSource`, a Sources sidebar search box, and `wikictl source search` for the agent. Embeds processed-markdown body + filename; name-only fallback for un-extracted/binary sources. **Caveat (discovered):** the vec layer never loads on macOS (system SQLite = `OMIT_LOAD_EXTENSION`); see `search-fts5-hybrid.md`. |
+| [`plans/search-fts5-hybrid.md`](plans/search-fts5-hybrid.md) | **Done.** Fixes search end-to-end: (1) FTS5/BM25 backbone over the full body (always-on, testable — replaces the filename-only `LIKE` fallback), (2) fix the broken vec layer via a static `sqlite-vec.c` amalgamation (`-DSQLITE_CORE`, direct `sqlite3_vec_init`), (3) RRF hybrid reranker fusing BM25 + cosine. Pages use external-content FTS5 over `pages` (triggers, zero Swift change); sources use a `source_search` sidecar (versioned body). v13 migration. |
 | [`plans/markdown-folder-import.md`](plans/markdown-folder-import.md) | Import an entire folder of Markdown files (Obsidian vault, LogSeq graph, or any `.md` directory) as source material. Recursive walk, .md filter, filename dedup; lands files in `ingested_files` for the agent to curate via Ingest. |
 | [`plans/sources-redesign.md`](plans/sources-redesign.md) | **Design phase:** rebrand "ingested files" as first-class **sources** — `[[source:...]]` wikilinks, display-name editing, processed-markdown projection, full rename + v10 migration. |
 | [`plans/fix-phase-a-source-bugs.md`](plans/fix-phase-a-source-bugs.md) | **Blocks Phase B.** Fixes two bugs shipped in Phase A (PR #31): `source_links` FK missing `ON DELETE CASCADE` (v11 rebuild migration) and the File Provider still projecting `files.jsonl`/`files/` instead of `sources.jsonl`/`sources/`. |
+| [`plans/fileprovider-schema-migration-and-cache-warming.md`](plans/fileprovider-schema-migration-and-cache-warming.md) | **Infrastructure for source share.** Schema version migration (auto-tears-down domains on container renames like `files`→`sources`), top-down cache warming so the daemon enumerates `sources/by-name/` before the share sheet needs it, shared `source-by-name:` identifier prefix across app and extension. |
+| [`plans/share-pages-and-sources.md`](plans/share-pages-and-sources.md) | **Share pages and sources.** Share button on every page/source surface (detail toolbar + sidebar context menu). Daemon-resolved URLs via `getUserVisibleURL` — no path construction. Batch share resolves all selected item URLs in parallel via `withTaskGroup`. Single and multi-select for both pages and sources. |
 | [`plans/phase-b-source-wikilinks.md`](plans/phase-b-source-wikilinks.md) | **Phase B, re-grounded.** Implements `[[source:...]]` wiki links correctly, superseding the Phase B portion of `sources-redesign.md` wherever they conflict. Render source links as `wiki://source?title=` (mirror pages), shared normalizer + case-insensitive resolution, single-transaction `replaceLinks` over both link tables, unified `links.jsonl` with a `type` field. Depends on `fix-phase-a-source-bugs.md`. |
 | [`plans/content-type-over-extension.md`](plans/content-type-over-extension.md) | **Cross-cutting prerequisite.** Make the content-derived `mime_type` the behavioral authority: extract a `ContentSniff` helper, make `addSource` sniff bytes (not trust the extension), MIME-first `WikiFSItem.contentType`, Zotero filter, and a grep guard against new extension checks. Phase C depends on it. |
 | [`plans/phase-c-source-markdown-projection.md`](plans/phase-c-source-markdown-projection.md) | **Phase C, re-grounded.** Project a `.md` sibling (HEAD of `source_markdown_versions`) for sources with a conversion chain. Fixes the parent design's two false assumptions (the change bridge doesn't see chain edits; markdown sources don't get chains) and encodes the git-lite model: PDF-only chains, HEAD-only projection, revert/compare-ready. Depends on `content-type-over-extension.md`. |
@@ -62,6 +67,7 @@ load-bearing for the app to function.
 | [`plans/tab-context-menu-rebuild.md`](plans/tab-context-menu-rebuild.md) | Multi-tab editor space — design of record. `activeTabID: UUID?` source of truth (no index arithmetic), one-intent-per-method tab ops, tab reuse, native SwiftUI `.contextMenu` (Close / Close Others / Close Tabs After / Close All), opacity-fade close button, responsive shrink-to-fit strip with overflow menu. 43 `EditorTabTests` + 7 `TabBarLayoutTests`. |
 | [`plans/link-context-menus.md`](plans/link-context-menus.md) | **Implemented (`feature/link-context-menus`).** Right-click link context menus (Suggest for missing links, Find Similar for any link, Copy as wiki-link, Open in Browser + Copy Link) — right-click now selects the **whole link**, not the word under the cursor. Documents the Textual blocker (its `NSTextInteractionView` owns right-click + the menu internally; `model.url(for:)` hit-test is internal) and the decision to vendor Textual in-repo. Copy File Path + Edit Link are classified but deferred (see `PROGRESS.md`). |
 | [`plans/reader-editor-zoom.md`](plans/reader-editor-zoom.md) | Safari-style text zoom for the page reader and monospace editors. Pure `ZoomScale` model (0.5–3.0, ×/÷1.1 step, scroll-step accumulation); `@AppStorage` keys `reader.zoom` and `editor.zoom` (first in the app); ⌘+/⌘=/⌘−/⌘0 via `.opacity(0)` buttons (`ZoomShortcuts`) and ⌘+scroll (`ZoomScroll`) in `PageDetailView` and `SourceDetailView`. No menu item. 21 `ZoomScaleTests`. |
+| [`plans/dirty-editor-protection.md`](plans/dirty-editor-protection.md) | **Implemented (`feature/dirty-editor-protection`).** Three editor-UX fixes: outline toggle button added to the edit-mode toolbar in both `PageDetailView` and `SourceDetailView`; per-tab edit-mode persistence via `EditorTab.isEditing` (switching tabs and back restores edit mode); close-tab confirmation (`pendingCloseTabID` deferred close + "Close Tab?" alert) so ⌘W / × while editing cannot silently discard the edit session. Sources flush `editBuffer` before `confirmCloseTab()` to ensure `file.id` is still the closing tab's source. |
 | [`plans/quote-highlight-and-scroll.md`](plans/quote-highlight-and-scroll.md) | **Implemented (`main`).** Extends markdown-anchors' navigate-then-scroll with **highlight the exact quoted passage** and **work on PDF sources**. Markdown: `WikiLinkStylingParser.highlightQuote` + pure `quoteRange` whitespace-tolerant first-match → `.backgroundColor` (`NSColor.findHighlightColor`). PDF: `PDFKit.findString` → `currentSelection` → `scrollSelectionToVisible`. `pendingScrollAnchorVersion` counter for re-click reactivity. 17 new `QuoteHighlightTests` + 2 `AnchorBlockTests` regression; 911 total. |
 | [`plans/source-web-reader.md`](plans/source-web-reader.md) | **Implemented (`feat/source-web-reader`, PR #50).** WKWebView reader for large sources (500 KB+), where the native Textual reader freezes on whole-document layout (preprocess + parse is only ~260 ms on 513 KB — the freeze is layout). Size-gated (default 96 KB; native reader stays for small docs / pages), async load, shared `WikiFootnoteMarkdown` / `WikiLinkMarkdown` pre-pass, swift-markdown HTML render, external `#section` anchors + `[[source:Name#"quote"]]` highlight, app-matched theming. Sources don't reference each other via wiki links, so ghost-link coloring is N/A. ~130–280 ms appear-to-painted vs ~10 s native. |
 | [`plans/agent-command-settings.md`](plans/agent-command-settings.md) | **Removes the hardcoded `claude -p`.** A new Settings → Agent tab (structured fields, not a free-form string) lets the user set the executable (binary or wrapper script, e.g. `sandbox-exec`), prefix arguments, a model override, and extra environment variables. The app keeps owning the load-bearing flags (`-p`, `--output-format stream-json …`, `--append-system-prompt`, `--dangerously-skip-permissions`, `--agents`). New `AgentCommandConfig` mirrors `ZoteroConfig`; default reproduces today's run exactly. |
@@ -92,6 +98,13 @@ features below are merged to `main` (single-branch repo, ready for developer
 handoff). 341 tests green; clean signed bundle (app + appex + `wikictl`).**
 
 **Post-completion features (also on `main`):**
+- **Reveal in Finder** — "Reveal in Finder" action on every page and source surface
+  (sidebar context menu + detail view header). Calls
+  `NSWorkspace.shared.activateFileViewerSelecting` after resolving the item's
+  user-visible URL from the File Provider daemon (reuses `resolvePageByTitleURL` /
+  `resolveSourceByNameURL`). Available only when `fileProvider.path != nil`; shown for
+  single selection only (batch reveal deferred — would open N parallel Finder windows).
+  Branch `feature/add-reveal-in-finder`, PR #90.
 - **WikiLinkFixer + integrated page lint** — renamed `WikiLinkValidator` → `WikiLinkFixer` (it corrects, not merely validates). Added `WikiStoreModel.preflightLint` that applies `WikiLinkFixer.applyFixes()` and detects broken `[[page links]]` (targets with no matching wiki page). New `WikiOperation.lintPage` bakes those findings into the LLM prompt so the agent has concrete targets. "Lint" button (page detail toolbar) and "Lint Page" context menu (sidebar) now run both the regex pre-flight and the page-scoped LLM lint. The orange markdown-lint warning banner surfaces `\]]` issues; "Lint" is the cure.
 - **Agent seatbelt sandbox (write whitelist)** — opt-in (Settings → Agent → Sandbox)
   confines the spawned agent's filesystem WRITES to a strict allowlist via macOS's
@@ -146,6 +159,11 @@ handoff). 341 tests green; clean signed bundle (app + appex + `wikictl`).**
   `AgentSpawnSlotTests`.
 
 **Phase summary (newest first; see `PROGRESS.md` for each gate's evidence):**
+- **Page body contract** ✅ `body_markdown` in SQLite now stores clean body only
+  (no H1, no frontmatter); `PageMarkdownFormat` strips both on load/rename and
+  regenerates them in the file provider (`Projection`); outline flicker
+  eliminated; editor warns immediately when the user types frontmatter.
+  See `plans/page-body-contract.md`.
 - **Phase D — the schema** ✅ real maintainer `CLAUDE.md` schema (layout,
   conventions, `wikictl` reference, read-after-write rule, Ingest/Query/Lint
   playbooks); `-p` prompts slimmed to rely on it; new wikis seed it, existing
@@ -207,6 +225,20 @@ gate's evidence and the known v0 gaps.
 - **M4 — Path button** ✅ `Copy Unix Path`, verification commands in-app.
 - **M5 — Change signaling** ✅ edits increment version; Terminal reads see updates (no relaunch).
 - **M6 — Agent launch** ✅ spawn agent with `WIKI_ROOT` env pointing at the projection.
+
+### Target-linking constraint (File Provider extension)
+
+The `WikiFSFileProvider` extension is `com.apple.fileprovider-nonui` and
+**must not link AppKit** (or PDFKit/AVFoundation/Metal/Accelerate/CoreML) —
+macOS 26 asserts against it and the extension crashes on launch in
+`_EXRunningExtension._start`. The extension links `WikiFSCore` read-only as its
+sole dependency, so **`WikiFSCore` itself must stay free of those frameworks**.
+Anything framework-backed that `WikiFSCore` needs (currently PDF-title extraction
+via PDFKit) is exposed behind an injectable seam (`DisplayNameResolver.pdfTitle-
+Extractor`) whose default is framework-free; the real implementation lives in the
+**app** target (`Sources/WikiFS/`), which the extension does not link, and is
+installed at launch. Verified by `otool -L` on the built extension binary.
+See `plans/file-provider.md`.
 
 ## Build quick reference
 

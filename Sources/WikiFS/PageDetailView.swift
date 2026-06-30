@@ -11,6 +11,11 @@ struct PageDetailView: View {
     @Bindable var manager: WikiManager
     let fileProvider: FileProviderSpike
     @State private var isEditing = false
+    /// Tracks the active tab ID at the end of the last resolved update cycle.
+    /// Used to distinguish tab switches (activeTabID changes) from in-tab
+    /// navigation (activeTabID stays, selection changes) when deciding whether
+    /// to reset or restore edit mode.
+    @State private var lastKnownActiveTabID: UUID? = nil
     @AppStorage("editor.zoom") private var editorZoom = Double(ZoomScale.defaultScale)
     @AppStorage("reader.zoom") private var readerZoom = Double(ZoomScale.defaultScale)
     @AppStorage("isOutlineExpanded") private var isOutlineExpanded = false
@@ -48,9 +53,16 @@ struct PageDetailView: View {
                                   || store.draftBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                         Button("Cancel", systemImage: "xmark.circle") {
-                            isEditing = false
+                            cancelEdit()
                         }
                         .keyboardShortcut(.escape, modifiers: [])
+
+                        Button {
+                            isOutlineExpanded.toggle()
+                        } label: {
+                            Image(systemName: "sidebar.right")
+                        }
+                        .help("Toggle Outline")
                     } else {
                         Button(store.isAgentRunning ? "Agent updating wiki…" : "Edit",
                                systemImage: "pencil") { isEditing = true }
@@ -62,8 +74,8 @@ struct PageDetailView: View {
                             let pageTitle = store.summaries.first(where: { $0.id == id })?.title ?? ""
                             Button("Lint", systemImage: "checkmark.seal") {
                                 Task {
-                                    await AgentOperationRunner.runLintPage(
-                                        pageID: id, pageTitle: pageTitle,
+                                    await AgentOperationRunner.runLintPages(
+                                        pages: [(id: id, title: pageTitle)],
                                         launcher: launcher, store: store,
                                         manager: manager, fileProvider: fileProvider)
                                 }
@@ -71,14 +83,29 @@ struct PageDetailView: View {
                             .disabled(store.isAgentRunning)
                             .help("Fix [[wiki-link]] syntax and run LLM lint on this page")
                         }
-                        if let path = pageMountPath {
-                            Button("Copy Path", systemImage: "terminal") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(path, forType: .string)
+                        if fileProvider.path != nil, case .page(let pageID) = store.selection {
+                            Button("Share", systemImage: "square.and.arrow.up") {
+                                Task {
+                                    guard let url = await fileProvider.resolvePageByTitleURL(id: pageID) else { return }
+                                    let picker = NSSharingServicePicker(items: [url])
+                                    let mouseScreen = NSEvent.mouseLocation
+                                    guard let window = NSApplication.shared.keyWindow,
+                                          let contentView = window.contentView else { return }
+                                    let windowPoint = window.convertPoint(fromScreen: mouseScreen)
+                                    let viewPoint = contentView.convert(windowPoint, from: nil)
+                                    picker.show(
+                                        relativeTo: NSRect(origin: viewPoint,
+                                                           size: NSSize(width: 1, height: 1)),
+                                        of: contentView, preferredEdge: .minY)
+                                }
                             }
-                            .help("Copy the Unix path of this page on the mounted filesystem")
+                            .help("Share this page")
+                            Button("Reveal in Finder", systemImage: "folder") {
+                                Task { await fileProvider.revealPageInFinder(id: pageID) }
+                            }
+                            .help("Reveal this page file in Finder")
                         }
-                        
+
                         Button {
                             isOutlineExpanded.toggle()
                         } label: {
@@ -115,7 +142,7 @@ struct PageDetailView: View {
                             .zoomShortcuts($editorZoom)
                             .zoomScroll($editorZoom)
                     } else {
-                        WikiReaderView(markdown: readerMarkdown,
+                        WikiReaderView(markdown: store.draftBody,
                                         currentSelection: store.selection,
                                         store: store,
                                         fileProvider: fileProvider,
@@ -129,7 +156,7 @@ struct PageDetailView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 
                 if isOutlineExpanded {
-                    PageOutlineView(markdown: readerMarkdown) { slug in
+                    PageOutlineView(markdown: store.draftBody) { slug in
                         store.jumpToAnchorInCurrentSelection(slug)
                     }
                 }
@@ -137,8 +164,24 @@ struct PageDetailView: View {
         }
         .background(Color(nsColor: .textBackgroundColor))
         .frame(minWidth: PageEditorMetrics.detailMinWidth)
+        .onAppear { lastKnownActiveTabID = store.activeTabID }
         .onChange(of: store.selection) {
-            isEditing = false
+            // In-tab navigation (wiki-link click, sidebar navigation within the
+            // same tab): exit edit mode. Tab switches are detected below via
+            // activeTabID and restore per-tab state instead of always resetting.
+            if store.activeTabID == lastKnownActiveTabID {
+                isEditing = false
+            }
+        }
+        .onChange(of: store.activeTabID) { _, newID in
+            lastKnownActiveTabID = newID
+            let tab = store.tabs.first(where: { $0.id == newID })
+            isEditing = tab?.isEditing ?? false
+        }
+        .onChange(of: isEditing) { _, newValue in
+            if let id = store.activeTabID {
+                store.setTabEditing(tabID: id, isEditing: newValue)
+            }
         }
         .onChange(of: store.isAgentRunning) { _, isRunning in
             if isRunning { isEditing = false }
@@ -146,13 +189,13 @@ struct PageDetailView: View {
         .background { findShortcutButton }
         .overlay(alignment: .top) { findBarOverlay }
         .onChange(of: store.selection) { findModel.dismiss() }
-        .onChange(of: readerMarkdown) { _, newMarkdown in
+        .onChange(of: store.draftBody) { _, newMarkdown in
             findModel.content = newMarkdown
             findModel.search()
         }
         .onChange(of: findModel.isShowing) { _, showing in
             if showing {
-                findModel.content = readerMarkdown
+                findModel.content = store.draftBody
                 findModel.search()
             }
         }
@@ -202,39 +245,22 @@ struct PageDetailView: View {
             ? "Untitled" : store.draftTitle
     }
 
-    private var readerMarkdown: String {
-        let trimmedTitle = displayTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lines = store.draftBody.split(separator: "\n", omittingEmptySubsequences: false)
-        guard let firstLine = lines.first else { return store.draftBody }
-        let firstHeading = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard firstHeading == "# \(trimmedTitle)" else { return store.draftBody }
-        let remainingLines = lines.dropFirst()
-        let withoutDuplicateHeading = remainingLines
-            .drop(while: { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
-            .joined(separator: "\n")
-        return withoutDuplicateHeading
-    }
-
     private var pageUpdatedAt: Date? {
         guard let selection = store.selection,
               case .page(let id) = selection else { return nil }
         return store.summaries.first(where: { $0.id == id })?.updatedAt
     }
 
-    private var pageMountPath: String? {
-        guard let selection = store.selection,
-              case .page(let id) = selection else { return nil }
-        guard let title = store.summaries.first(where: { $0.id == id })?.title,
-              let root = fileProvider.path else { return nil }
-        let leaf = FilenameEscaping.byTitleFilename(title: title, pageID: id.rawValue)
-        return "\(root)/pages/by-title/\(leaf)"
-    }
-
     // MARK: - Subviews
 
     @ViewBuilder private var saveWarningBanner: some View {
-        if store.mermaidSaveWarning != nil || store.markdownSaveWarning != nil {
+        let hasFrontmatter = store.draftBody.hasPrefix("---")
+        if store.mermaidSaveWarning != nil || store.markdownSaveWarning != nil || hasFrontmatter {
             VStack(alignment: .leading, spacing: 6) {
+                if hasFrontmatter {
+                    Text("Frontmatter (---) is generated automatically and will be stripped from this field on next load. Set the title using the field above.")
+                        .foregroundStyle(.orange)
+                }
                 if let mermaid = store.mermaidSaveWarning {
                     Text(mermaid)
                         .foregroundStyle(.orange)
@@ -273,6 +299,13 @@ struct PageDetailView: View {
 
     private func commitEdit() {
         store.flushPendingSave()
+        isEditing = false
+    }
+
+    private func cancelEdit() {
+        if let id = store.activeTabID {
+            store.discardPendingDraft(tabID: id)
+        }
         isEditing = false
     }
 

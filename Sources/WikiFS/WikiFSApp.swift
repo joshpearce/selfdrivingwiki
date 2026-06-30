@@ -33,6 +33,13 @@ struct WikiFSApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        // Install the app-only PDFKit title extractor into Core's injectable
+        // seam. Core must not import PDFKit (it pulls AppKit into the File
+        // Provider extension on macOS 26), so the real implementation lives in
+        // this app target and is injected here. Non-app contexts (the
+        // extension, wikictl, tests) keep the nil-returning default.
+        DisplayNameResolver.installPDFTitleExtractor()
+
         let warning = LaunchLocationWarning.current()
         launchLocationWarning = warning
         _showingLaunchLocationWarning = State(initialValue: warning != nil)
@@ -51,16 +58,16 @@ struct WikiFSApp: App {
         }
         containerDirectory = directory
         _manager = State(initialValue: WikiManager(containerDirectory: directory))
-        _extractionCoordinator = State(
-            initialValue: ExtractionCoordinator(containerDirectory: directory))
+        let coordinator = ExtractionCoordinator(containerDirectory: directory)
+        _extractionCoordinator = State(initialValue: coordinator)
         // All three launchers share one GenerationGate so ingest, ask-turn, and
         // edit-turn generations contend on the same FIFO queue — only one active
         // generation at a time. Interactive sessions' processes coexist freely;
         // only one GENERATES at a time (per-turn gate).
         let generationGate = GenerationGate()
-        _agentLauncher = State(initialValue: AgentLauncher(generationGate: generationGate))
-        _askLauncher   = State(initialValue: AgentLauncher(generationGate: generationGate))
-        _editLauncher  = State(initialValue: AgentLauncher(generationGate: generationGate))
+        _agentLauncher = State(initialValue: AgentLauncher(generationGate: generationGate, extractionCoordinator: coordinator))
+        _askLauncher   = State(initialValue: AgentLauncher(generationGate: generationGate, extractionCoordinator: coordinator))
+        _editLauncher  = State(initialValue: AgentLauncher(generationGate: generationGate, extractionCoordinator: coordinator))
     }
 
     var body: some Scene {
@@ -106,6 +113,8 @@ struct WikiFSApp: App {
                     // injects domain registration/removal + per-store signaling.
                     fileProvider.wire(into: manager)
                     manager.bootstrap()
+                    await fileProvider.migrateDomainsIfNeeded(
+                        wikiIDs: manager.wikis.map(\.id))
                     await manager.registerAllDomains()
                     if let active = manager.activeWikiID,
                        let descriptor = manager.wikis.first(where: { $0.id == active }) {

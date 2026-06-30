@@ -32,14 +32,23 @@ struct SourceDetailView: View {
     /// Resolves the selected extraction backend (local pdf2md / Claude / Docling
     /// Serve) for the standalone Extract button.
     let extractionCoordinator: ExtractionCoordinator
+    let fileProvider: FileProviderSpike
     @Bindable var store: WikiStoreModel
 
     @AppStorage("editor.zoom") private var editorZoom = Double(ZoomScale.defaultScale)
     @AppStorage("reader.zoom") private var readerZoom = Double(ZoomScale.defaultScale)
+    @AppStorage("isOutlineExpanded") private var isOutlineExpanded = false
     @State private var headVersion: SourceMarkdownVersion?
     @State private var isEditing = false
     @State private var editBuffer = ""
     @State private var isExtracting = false
+    /// Tracks the active tab ID as of the last resolved update cycle — used to
+    /// distinguish tab switches from in-tab file navigation.
+    @State private var lastKnownActiveTabID: UUID? = nil
+    /// Set when a tab switch targets a tab that was in edit mode but whose
+    /// headVersion has not yet loaded. Cleared once headVersion arrives or
+    /// the user navigates to a different file.
+    @State private var shouldRestoreEditing = false
     /// Raised when the user taps Ingest on a document that has already been
     /// ingested — prompts before re-ingesting, since that may create duplicate
     /// pages. (Replaces the old always-on "already ingested" warning banner.)
@@ -77,7 +86,8 @@ struct SourceDetailView: View {
     }
 
     private var displayName: String {
-        file.displayName ?? (file.filename.isEmpty ? "Untitled" : file.filename)
+        let name = file.effectiveName
+        return name.isEmpty ? "Untitled" : name
     }
 
     /// The markdown content currently shown (from processed head or native
@@ -114,11 +124,21 @@ struct SourceDetailView: View {
                 tabPicker
             }
             Divider().opacity(PageEditorMetrics.dividerOpacity)
-            contentArea
+            HStack(spacing: 0) {
+                contentArea
+                if isOutlineExpanded, let markdown = currentMarkdownContent {
+                    PageOutlineView(markdown: markdown) { slug in
+                        store.jumpToAnchorInCurrentSelection(slug)
+                    }
+                }
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .textBackgroundColor))
-        .onAppear { headVersion = store.processedMarkdownHead(for: file) }
+        .onAppear {
+            headVersion = store.processedMarkdownHead(for: file)
+            lastKnownActiveTabID = store.activeTabID
+        }
         .onChange(of: file.id) {
             // Navigating between ingested files REUSES this view instance (same
             // type/position), so SwiftUI preserves `@State` across the switch.
@@ -133,6 +153,9 @@ struct SourceDetailView: View {
             headVersion = nil
             selectedTab = .markdown
             pdfQuote = nil
+            // Cancel any pending edit-mode restoration so it doesn't apply to
+            // the new file when its headVersion loads.
+            shouldRestoreEditing = false
         }
         .task(id: file.id) { headVersion = store.processedMarkdownHead(for: file) }
         .task(id: PDFTaskKey(sourceID: file.id, anchorVersion: store.pendingScrollAnchorVersion)) {
@@ -164,6 +187,35 @@ struct SourceDetailView: View {
         .onChange(of: findModel.currentMatchIndex) { _, _ in
             guard findModel.currentMatchIndex > 0 else { return }
             findVersion &+= 1
+        }
+        .onChange(of: store.activeTabID) { _, newID in
+            lastKnownActiveTabID = newID
+            let tab = store.tabs.first(where: { $0.id == newID })
+            guard tab?.isEditing == true else {
+                shouldRestoreEditing = false
+                return
+            }
+            // Restore edit mode for the returning tab. If headVersion is already
+            // loaded (same file, different tab), restore immediately; otherwise
+            // defer until the async load completes.
+            if let content = headVersion?.content {
+                editBuffer = content
+                isEditing = true
+            } else {
+                shouldRestoreEditing = true
+            }
+        }
+        .onChange(of: headVersion) { _, newVersion in
+            guard shouldRestoreEditing, let content = newVersion?.content else { return }
+            editBuffer = content
+            isEditing = true
+            shouldRestoreEditing = false
+        }
+        .onChange(of: isEditing) { _, newValue in
+            if let id = store.activeTabID {
+                store.setTabEditing(tabID: id, isEditing: newValue)
+            }
+            if !newValue { shouldRestoreEditing = false }
         }
     }
 
@@ -210,6 +262,13 @@ struct SourceDetailView: View {
                         isEditing = false
                     }
                     .keyboardShortcut(.escape, modifiers: [])
+
+                    Button {
+                        isOutlineExpanded.toggle()
+                    } label: {
+                        Image(systemName: "sidebar.right")
+                    }
+                    .help("Toggle Outline")
                 } else {
                     Button(isIngesting ? "Ingesting…" : "Ingest into Wiki",
                            systemImage: "text.badge.plus") {
@@ -259,6 +318,41 @@ struct SourceDetailView: View {
                         }
                         .keyboardShortcut("e", modifiers: .command)
                         .disabled(isRunning)
+                    }
+                    // Share — to the left of the Outline toggle.  Resolves the
+                    // canonical URL from the daemon (like openSource) so the
+                    // filename is human-readable and the URL is guaranteed
+                    // to resolve.
+                    if fileProvider.path != nil {
+                        Button("Share", systemImage: "square.and.arrow.up") {
+                            Task {
+                                guard let url = await fileProvider.resolveSourceByNameURL(id: file.id) else { return }
+                                DebugLog.fileprovider("Share source detail: \(url.lastPathComponent)")
+                                let picker = NSSharingServicePicker(items: [url])
+                                let mouseScreen = NSEvent.mouseLocation
+                                guard let window = NSApplication.shared.keyWindow,
+                                      let contentView = window.contentView else { return }
+                                let windowPoint = window.convertPoint(fromScreen: mouseScreen)
+                                let viewPoint = contentView.convert(windowPoint, from: nil)
+                                picker.show(
+                                    relativeTo: NSRect(origin: viewPoint,
+                                                       size: NSSize(width: 1, height: 1)),
+                                    of: contentView, preferredEdge: .minY)
+                            }
+                        }
+                        .help("Share this source file")
+                        Button("Reveal in Finder", systemImage: "folder") {
+                            Task { await fileProvider.revealSourceInFinder(id: file.id) }
+                        }
+                        .help("Reveal this source file in Finder")
+                    }
+                    if isMarkdownEditable {
+                        Button {
+                            isOutlineExpanded.toggle()
+                        } label: {
+                            Image(systemName: "sidebar.right")
+                        }
+                        .help("Toggle Outline")
                     }
                 }
             }
