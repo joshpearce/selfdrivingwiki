@@ -128,10 +128,18 @@ if [[ "$DEST" == *:* || "$DEST" == *@* ]]; then
   # Remote: <user@host>. Target path is relative to the remote home dir.
   REMOTE_HOST="${DEST%%:*}"
   REMOTE_DIR="Library/Group Containers/$DEST_GROUP_ID/"
+  # The path has a space ("Group Containers"). rsync hands the remote path to
+  # ssh as one argument, but ssh re-joins its args into a single string that the
+  # REMOTE shell word-splits — so an unescaped space becomes two arguments
+  # ("server receiver mode requires two argument"). Backslash-escaping survives
+  # into the remote command string, where the remote shell reads "\ " as a
+  # literal space. (openrsync has no --protect-args.) The ssh mkdir below keeps
+  # the UNescaped form — it is already inside double quotes for the remote shell.
+  REMOTE_DIR_ESC="${REMOTE_DIR// /\\ }"
   echo "Ensuring remote directory exists…"
   [[ "$DRY_RUN" == 1 ]] || ssh "$REMOTE_HOST" "mkdir -p \"$REMOTE_DIR\""
   echo "rsync → $REMOTE_HOST:$REMOTE_DIR"
-  rsync "${RSYNC_OPTS[@]}" "$SRC/" "$REMOTE_HOST:$REMOTE_DIR"
+  rsync "${RSYNC_OPTS[@]}" "$SRC/" "$REMOTE_HOST:$REMOTE_DIR_ESC"
 else
   # Local path / mounted drive.
   mkdir -p "$DEST"
