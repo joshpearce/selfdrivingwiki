@@ -108,7 +108,7 @@ still pass.
 |---|---|---|---|---|---|
 | `pdf` | `application/pdf` | ✅ | ✅ | `.pdfBackend` | pdf2md / ACP / Anthropic / Gemini / Docling |
 | `html` | `text/html`, `application/xhtml+xml`, `.html`/`.htm`/`.xhtml` | ✅ | ✅ | `.htmlToMarkdown` | defuddle / tag-based |
-| `markdown` | `text/markdown`, `text/x-markdown`, `text/mermaid` | ❌ | ✅ | — | already markdown; native |
+| `markdown` | `text/markdown`, `text/x-markdown` | ❌ | ✅ | — | already markdown; native |
 | `text` | `text/plain`, `text/csv`, other `text/*` | ❌ | ✅ | — | native text, staged raw (no extraction needed) |
 | `podcastTranscript` | provider `.applePodcast` / `.podcast` | ✅ | ✅ | `.podcastTranscript` | TTML / `<podcast:transcript>` pipeline |
 | `youtubeTranscript` | provider `.youtube` | ✅ | ✅ | `.youtubeTranscript` | caption-track scrape |
@@ -118,6 +118,16 @@ still pass.
 | `remoteMediaNoMarkdown` | provider `.remoteMedia` (real `audio/mpeg` etc.) | ❌ | ❌ | — | raw stream, no transcript, no markdown |
 | `binary` | `application/xml`, `application/json`, `application/zip`, `application/epub+zip`, `octet-stream`, **`text/xml` (operator-decided, §11-C3)**, … | ❌ | ❌ | — | no extractor; the PNG/XML bug class |
 | `unknown` | mime nil + provider nil | ❌ | ❌ | — | can't classify — fail safe (no ingest) |
+
+### 5.0.1 Renderer-owned source formats (revision 6 update)
+
+Renderer packages now declare their source formats. A `text/mermaid`
+row classifies as generic `text` without a package claim. With an
+active claim, ingest stores the package canonical MIME
+(`text/vnd.mermaid`); `ContentKind` still classifies that value as
+generic `text`. Catalog-aware presentation, transclusion, and
+provenance labels treat the row as readable package-owned text. See
+[`plans/package-declared-source-types.md`](package-declared-source-types.md).
 
 ### 5.1 `BackgroundIngestCoordinator.scanWiki` — THE BUG FIX (site #2)
 

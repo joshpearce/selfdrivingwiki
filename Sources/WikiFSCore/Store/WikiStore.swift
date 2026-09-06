@@ -100,6 +100,18 @@ public enum MIMERepairNullState: String, Codable, Equatable, Sendable {
     case sourceOnly
     case activeVersionOnly
     case both
+    /// Neither stored MIME value is NULL: both mirrors carry a value.
+    case neither
+}
+
+public enum MIMERepairStatus: String, Codable, Equatable, Sendable {
+    case detectorRepair
+    case packageAliasNormalization
+    case canonicalNoOp
+    case conflict
+    case ambiguity
+    case byteless
+    case inconclusive
 }
 
 public struct MIMERepairItem: Codable, Equatable, Sendable {
@@ -111,6 +123,7 @@ public struct MIMERepairItem: Codable, Equatable, Sendable {
     public let oldVersionMIMEType: String?
     public let newMIMEType: String?
     public let detection: ContentTypeDetectionResult
+    public let status: MIMERepairStatus
     public let updated: Bool
 
     public init(
@@ -122,6 +135,7 @@ public struct MIMERepairItem: Codable, Equatable, Sendable {
         oldVersionMIMEType: String?,
         newMIMEType: String?,
         detection: ContentTypeDetectionResult,
+        status: MIMERepairStatus? = nil,
         updated: Bool
     ) {
         self.sourceID = sourceID
@@ -132,6 +146,7 @@ public struct MIMERepairItem: Codable, Equatable, Sendable {
         self.oldVersionMIMEType = oldVersionMIMEType
         self.newMIMEType = newMIMEType
         self.detection = detection
+        self.status = status ?? (newMIMEType == nil ? .inconclusive : .detectorRepair)
         self.updated = updated
     }
 }
@@ -239,6 +254,12 @@ public protocol WikiStore: AnyObject, Sendable {
     /// `.docx` IS a zip) stores its registered type at ingestion instead of
     /// the sniff's `application/zip`. `.none` keeps sniff-only behavior.
     var registeredExtractionInputs: RegisteredExtractionInputs { get set }
+
+    /// Source-format claims from the active, validated renderer catalog.
+    /// This is separate from extractor registrations and carries no ingestion
+    /// policy. `.none` keeps renderer-aware consumers unavailable when a host
+    /// does not compose renderer services.
+    var registeredRendererSourceTypes: RegisteredRendererSourceTypes { get set }
 
     /// Page summaries ordered by the given sort criterion.
     func listPages(sortBy: PageSortOrder) throws -> [WikiPageSummary]
