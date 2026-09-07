@@ -885,9 +885,9 @@ struct RendererModelTests {
             ("RendererPackages/Excalidraw/manifest.json", "1.1.0",
              "713d4d9e0c36e0b996f37b56099081160f4542f92a4fece56cb1af90362b91d6"),
             ("RendererPackages/Mermaid/manifest.json", "1.1.0",
-             "bdee86bee55e2dde187d8fe378c6267ded3b3ce5f2a51c0d98ea5554b04dd81b"),
+             "93cbd039a633d9a628e67ef162bb385239ba011c8d0e063db9d5e04fac8742cf"),
             ("RendererPackages/SVG/manifest.json", "1.1.0",
-             "9b9ab53a45377cb9f6579d01220f29096080c6bb7a148a3c364fdf3ec7f00d05"),
+             "d0f52f26a3914c18d957a756d6426a9905a9e958d339d0855831ff39ad32887a"),
             ("RendererPackages/JSONCanvas/manifest.json", "1.2.0",
              "8bad166255e12ec34a6581eae0d4f457cb0f1a9ad8da55bab2a94398ab4daae0"),
         ]
