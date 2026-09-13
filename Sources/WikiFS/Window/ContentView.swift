@@ -122,7 +122,7 @@ struct ContentView: View {
             case .page, .source, .chat:
                 break
             case .none, .newChat, .changeLog, .bookmark:
-                rightInspector.updateRegistration(nil)
+                rightInspector.clearRegistration()
             }
         }
         // Package-declared rich fences: thread the registry state into the
@@ -297,6 +297,12 @@ struct ContentView: View {
             if rightInspector.isPresented, let registration = rightInspector.registration {
                 Divider()
                 RightSidebarHostView(registration: registration)
+                    // Every detail kind supplies the same generic host shape,
+                    // but its outline closure and bindings belong to one
+                    // subject. Force a new subtree at the selection boundary so
+                    // page/source/chat switches cannot retain the outgoing
+                    // inspector's captured content for an initial blank frame.
+                    .id(registration.subject)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
@@ -679,10 +685,9 @@ private struct RightSidebarHostView: View {
             openMetadataLink: { target in
                 do { try registration.metadataRouter.route(link: target) }
                 catch { DebugLog.tabs("Metadata link failed: \(error.localizedDescription)") }
-            }
-        ) {
-            registration.outline()
-        }
+            },
+            outline: registration.outline,
+            onOutlineSelect: registration.onOutlineSelect)
     }
 }
 

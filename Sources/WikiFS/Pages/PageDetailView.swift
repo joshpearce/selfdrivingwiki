@@ -189,9 +189,15 @@ struct PageDetailView: View {
             guard findModel.currentMatchIndex > 0 else { return }
             findVersion &+= 1
         }
-        .onChange(of: store.draftBody) { _, _ in
-            updateRightSidebarRegistration()
-        }
+        // Draft edits and caret moves re-register through the payload observer
+        // below, not a direct onChange: the payload only changes when the rows
+        // or the highlight bucket change, so equal-payload keystrokes publish
+        // nothing. Provenance and metadata changes still re-register directly
+        // — they live in the registration but not in the payload.
+        .modifier(SidebarRegistrationRefresh(
+            outlinePayload: outlinePayload,
+            onRefresh: { updateRightSidebarRegistration() }
+        ))
         .onChange(of: provenanceOrigin) { _, _ in
             updateRightSidebarRegistration()
         }
@@ -202,7 +208,6 @@ struct PageDetailView: View {
             guard let pageID = currentPageID else {
                 provenanceOrigin = nil
                 provenanceHistory = []
-                rightInspector.updateRegistration(nil)
                 return
             }
             provenanceOrigin = store.pageOrigin(for: pageID)
@@ -396,9 +401,25 @@ struct PageDetailView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
+    /// The outline payload for the current page, derived in the body so caret
+    /// moves and draft edits re-derive it; `SidebarRegistrationRefresh`
+    /// observes it and re-registers on change. When no page is active the
+    /// payload is empty and never reaches the controller — registration is
+    /// gated on `currentPageID`.
+    private var outlinePayload: InspectorOutlinePayload {
+        let headings = OutlineParser.headings(in: store.draftBody)
+        return InspectorOutlinePayload(
+            subject: currentPageID.map(WikiSelection.page) ?? .changeLog,
+            content: .headings(headings),
+            highlightedItemID: OutlineParser.activeHeadingID(
+                caretUTF16Offset: caretCharIndex ?? -1, headings: headings))
+    }
+
     private func updateRightSidebarRegistration() {
+        guard let pageID = currentPageID else { return }
         rightInspector.updateRegistration(
             RightSidebarRegistration(
+                subject: .page(pageID),
                 inspectorTab: $inspectorTab,
                 outlineWidth: $outlineWidth,
                 availableTabs: InspectorTab.pageAvailableTabs,
@@ -416,21 +437,19 @@ struct PageDetailView: View {
                     compareSourceExtractions: { _ in false },
                     copy: MetadataActionRouter.systemClipboardCopy,
                     openURL: { NSWorkspace.shared.open($0) }),
-                outline: {
-                    AnyView(
-                        PageOutlineView(markdown: store.draftBody,
-                                        caretCharIndex: caretCharIndex) { heading in
-                            if isEditing {
-                                editorScrollRequest = EditorScrollRequest(
-                                    charOffset: heading.charOffset,
-                                    version: (editorScrollRequest?.version ?? 0) + 1)
-                            } else {
-                                store.jumpToAnchorInCurrentSelection(heading.id)
-                            }
-                        }
-                    )
+                outline: outlinePayload,
+                onOutlineSelect: { selection in
+                    guard case .heading(let heading) = selection else { return }
+                    if isEditing {
+                        editorScrollRequest = EditorScrollRequest(
+                            charOffset: heading.charOffset,
+                            version: (editorScrollRequest?.version ?? 0) + 1)
+                    } else {
+                        store.jumpToAnchorInCurrentSelection(heading.id)
+                    }
                 }
-            )
+            ),
+            activeSelection: store.selection
         )
     }
 
@@ -696,176 +715,4 @@ struct PageDetailView: View {
         store.rename(id, to: newTitle)
     }
 
-}
-struct HeadingItem: Identifiable, Hashable {
-    let id: String // The anchor slug
-    let text: String
-    let level: Int
-    /// NSString (UTF-16) character offset of this heading's line start within
-    /// the source markdown. Used by the editor to scroll to this heading
-    /// (issue #268) and by the outline to determine which heading the caret
-    /// is currently inside.
-    let charOffset: Int
-}
-
-struct PageOutlineView: View {
-    let markdown: String
-    /// The caret's character index within the source text, or `nil` when not
-    /// editing. When non-nil, the heading containing the caret is highlighted
-    /// and the outline scrolls to keep it visible (issue #268).
-    var caretCharIndex: Int? = nil
-    let onSelect: (HeadingItem) -> Void
-    
-    @State private var headings: [HeadingItem] = []
-    /// Tracks which heading the outline last scrolled itself to, so we only
-    /// auto-scroll when the active heading actually changes (not on every
-    /// keystroke that stays within the same heading).
-    @State private var scrolledToHeadingID: String? = nil
-    
-    /// The id of the heading whose `charOffset` is closest to (but not after)
-    /// the caret, or `nil` if there is no caret or no preceding heading.
-    private var activeHeadingID: String? {
-        guard let caret = caretCharIndex, !headings.isEmpty else { return nil }
-        var active: HeadingItem?
-        for heading in headings {
-            if heading.charOffset <= caret {
-                active = heading
-            } else {
-                break
-            }
-        }
-        return active?.id
-    }
-    
-    var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 6) {
-                    ForEach(headings) { heading in
-                        let isActive = heading.id == activeHeadingID
-                        Button(action: {
-                            onSelect(heading)
-                        }) {
-                            Text(heading.text)
-                                .font(.system(size: 13))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                                .padding(.leading, CGFloat((heading.level - 1) * 12))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(isActive ? .primary : .secondary)
-                        .background(
-                            isActive
-                                ? Color.accentColor.opacity(0.12)
-                                : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 4)
-                        )
-                        .id(heading.id)
-                        .onHover { isHovering in
-                            if isHovering {
-                                NSCursor.pointingHand.push()
-                            } else {
-                                NSCursor.pop()
-                            }
-                        }
-                    }
-                }
-                .padding()
-            }
-            .onChange(of: caretCharIndex) { _, _ in
-                let target = activeHeadingID
-                guard target != scrolledToHeadingID else { return }
-                scrolledToHeadingID = target
-                if let target {
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        proxy.scrollTo(target, anchor: .center)
-                    }
-                }
-            }
-        }
-        .onAppear {
-            parseHeadings()
-        }
-        .onChange(of: markdown) { _, _ in
-            parseHeadings()
-        }
-    }
-    
-    private func parseHeadings() {
-        var items: [HeadingItem] = []
-        var slugCounts: [String: Int] = [:]
-        var inFence = false
-        
-        // charOffset tracks the NSString (UTF-16) character offset of each
-        // line's start — the same coordinate space NSTextView uses for ranges.
-        var charOffset = 0
-        
-        for line in markdown.components(separatedBy: .newlines) {
-            let lineUTF16Length = (line as NSString).length
-            defer { charOffset += lineUTF16Length + 1 } // +1 for the \n
-            
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("```") {
-                inFence.toggle()
-                continue
-            }
-            guard !inFence else { continue }
-            
-            if trimmed.hasPrefix("#") {
-                let level = trimmed.prefix(while: { $0 == "#" }).count
-                guard level > 0 && level <= 6 else { continue }
-                
-                let afterPounds = trimmed.dropFirst(level)
-                guard afterPounds.first?.isWhitespace == true else { continue }
-                
-                let rawText = afterPounds.trimmingCharacters(in: .whitespaces)
-                guard !rawText.isEmpty else { continue }
-
-                // Strip inline markdown (links, code spans, emphasis) so the
-                // outline shows plain text — matching the HTML renderer's
-                // heading anchor IDs (which use Swift-Markdown's plainText).
-                let text = Self.stripInlineMarkup(rawText)
-                guard !text.isEmpty else { continue }
-
-                let slug = AnchorBlock.makeSlug(text, counts: &slugCounts)
-                items.append(HeadingItem(id: slug, text: text, level: level,
-                                         charOffset: charOffset))
-            }
-        }
-        
-        headings = items
-    }
-
-    // MARK: - Inline markup stripping
-
-    /// Strip inline markdown so heading text reads as plain text in the
-    /// outline. Handles the cases most likely in headings: links
-    /// (`[text](url)` → `text`), code spans (`` `text` `` → `text`), and
-    /// emphasis (`**bold**`, `*italic*`, `__bold__`, `_italic_` → `text`).
-    /// This mirrors what Swift-Markdown's `plainText` does in the HTML
-    /// renderer, keeping the outline's display + slug in sync with the
-    /// rendered anchor IDs.
-    private static let linkAndCodeRegexes: [NSRegularExpression] = {
-        [
-            DebugLog.trying("compile link regex", operation: { try NSRegularExpression(pattern: #"\[([^\]]*)\]\([^)]*\)"#) }),  // links
-            DebugLog.trying("compile code span regex", operation: { try NSRegularExpression(pattern: #"`([^`]*)`"#) }),              // code spans
-        ].compactMap { $0 }
-    }()
-
-    static func stripInlineMarkup(_ text: String) -> String {
-        var result = text
-        for regex in linkAndCodeRegexes {
-            result = regex.stringByReplacingMatches(
-                in: result, range: NSRange(result.startIndex..., in: result),
-                withTemplate: "$1")
-        }
-        // Emphasis markers — strip ** before *, __ before _ to avoid
-        // mismatched pairs. Use simple replacement (safe in headings where
-        // these are virtually always emphasis, not literal characters).
-        result = result.replacingOccurrences(of: "**", with: "")
-        result = result.replacingOccurrences(of: "__", with: "")
-        return result
-    }
 }

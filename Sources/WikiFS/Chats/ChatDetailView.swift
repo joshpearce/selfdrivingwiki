@@ -21,7 +21,7 @@ struct ChatDetailView: View {
 
     @State private var showsInternals = false
     @State private var composerHeight: CGFloat = ComposerTextView.oneLineHeight(for: ChatMetrics.composerFont)
-    @State private var persistedTranscriptItems: [PersistedChatTranscriptItem] = []
+    @State private var persistedTranscriptState = PersistedChatTranscriptState.loading
     @State private var attachments: [ChatAttachment] = []
     @AppStorage("chat.zoom") private var chatZoom = Double(ZoomScale.defaultScale)
     @AppStorage("chatInspectorTab") private var inspectorTab: InspectorTab = .metadata
@@ -71,7 +71,17 @@ struct ChatDetailView: View {
     /// Turn identities already rendered by authoritative data: the session's
     /// committed rows, overlay, active and queued turns, plus the persisted
     /// transcript. An outgoing echo retires the moment its turn appears here.
+    private var persistedTranscriptItems: [PersistedChatTranscriptItem] {
+        persistedTranscriptState.items
+    }
+
     private var authoritativeTurnIDs: Set<ChatTurnID> {
+        authoritativeTurnIDs(persistedTranscriptItems: persistedTranscriptItems)
+    }
+
+    private func authoritativeTurnIDs(
+        persistedTranscriptItems: [PersistedChatTranscriptItem]
+    ) -> Set<ChatTurnID> {
         remoteSession.knownTurnIDs.union(
             persistedTranscriptItems.compactMap { $0.item.turnID }
         )
@@ -89,6 +99,24 @@ struct ChatDetailView: View {
     }
 
     private var presentation: ChatDetailPresentation {
+        makePresentation(persistedTranscriptItems: persistedTranscriptItems)
+    }
+
+    /// The outline payload for the current chat, derived in the body so
+    /// transcript growth and rehydration re-derive it;
+    /// `SidebarRegistrationRefresh` observes it and re-registers on change.
+    /// The subject fallback (`newChat`, the no-persisted-id state) never
+    /// reaches the controller — registration is gated on `chatID`.
+    private var outlinePayload: InspectorOutlinePayload {
+        InspectorOutlinePayload(
+            subject: chatID.map(WikiSelection.chat) ?? .newChat,
+            content: .chatTurns(presentation.outlineEntries),
+            highlightedItemID: nil)
+    }
+
+    private func makePresentation(
+        persistedTranscriptItems: [PersistedChatTranscriptItem]
+    ) -> ChatDetailPresentation {
         ChatDetailPresentation.make(
             chatID: chatID,
             chatResolution: chatResolution,
@@ -96,7 +124,9 @@ struct ChatDetailView: View {
             remoteSession: remotePresentationState,
             persistedTranscriptItems: persistedTranscriptItems,
             pendingOutgoing: outgoing.pendingOutgoing,
-            authoritativeTurnIDs: authoritativeTurnIDs,
+            authoritativeTurnIDs: authoritativeTurnIDs(
+                persistedTranscriptItems: persistedTranscriptItems
+            ),
             queuedMessages: queuedMessages,
             hasDraftText: hasDraftText,
             isChatOperationConfigured: isChatOperationConfigured,
@@ -203,7 +233,7 @@ struct ChatDetailView: View {
                 }
                 await coordinator.rehydrate(wikiID: session.wikiID, chatID: chatID)
             } else {
-                persistedTranscriptItems = []
+                persistedTranscriptState = .loaded([])
             }
             // The omnibox "Ask" pre-fill (#288) is consumed on the FIRST frame
             // of either surface: a durable new chat opens straight to
@@ -232,13 +262,13 @@ struct ChatDetailView: View {
             installOutgoingEnvironment()
             updateRightSidebarRegistration()
         }
-        // The right sidebar renders the outline as a captured snapshot: it
-        // re-renders only when a NEW registration arrives (see
-        // SidebarRegistrationRefresh below for why BOTH triggers matter).
+        // The right sidebar renders the last accepted registration's payload
+        // value. The payload now carries the outline entries themselves, so
+        // observing it is the single invalidation path for transcript growth
+        // and rehydration (see SidebarRegistrationRefresh).
         .modifier(SidebarRegistrationRefresh(
-            projectionInput: remoteSession.displayProjectionInput,
-            outlineEntries: presentation.outlineEntries,
-            onRefresh: updateRightSidebarRegistration
+            outlinePayload: outlinePayload,
+            onRefresh: { updateRightSidebarRegistration() }
         ))
         .onChange(of: remoteSession.runState) { _, _ in
             if let chatID, !isLiveChat {
@@ -499,13 +529,15 @@ struct ChatDetailView: View {
         )
     }
 
-    private func updateRightSidebarRegistration() {
-        guard chatID != nil else {
-            rightInspector.updateRegistration(nil)
-            return
-        }
+    private func updateRightSidebarRegistration(
+        presentation registrationPresentation: ChatDetailPresentation? = nil
+    ) {
+        guard let chatID else { return }
+        guard persistedTranscriptState.isLoaded else { return }
+        let registrationPresentation = registrationPresentation ?? presentation
         rightInspector.updateRegistration(
             RightSidebarRegistration(
+                subject: .chat(chatID),
                 inspectorTab: $inspectorTab,
                 outlineWidth: $outlineWidth,
                 availableTabs: InspectorTab.persistedChatAvailableTabs,
@@ -523,17 +555,18 @@ struct ChatDetailView: View {
                     compareSourceExtractions: { _ in false },
                     copy: MetadataActionRouter.systemClipboardCopy,
                     openURL: { NSWorkspace.shared.open($0) }),
-                outline: {
-                    AnyView(
-                        ChatInspectorOutlineView(entries: presentation.outlineEntries) { target in
-                            outlineScroll = ChatScrollRequest(
-                                version: (outlineScroll?.version ?? 0) + 1,
-                                target: target
-                            )
-                        }
-                    )
+                outline: InspectorOutlinePayload(
+                    subject: .chat(chatID),
+                    content: .chatTurns(registrationPresentation.outlineEntries),
+                    highlightedItemID: nil),
+                onOutlineSelect: { selection in
+                    guard case .chatTurn(let target) = selection else { return }
+                    outlineScroll = ChatScrollRequest(
+                        version: (outlineScroll?.version ?? 0) + 1,
+                        target: target)
                 }
-            )
+            ),
+            activeSelection: store.selection
         )
     }
 
@@ -937,32 +970,9 @@ struct ChatDetailView: View {
                   nextCursor != cursor else { break }
             cursor = nextCursor
         }
-        persistedTranscriptItems = items
-        updateRightSidebarRegistration()
-    }
-}
-
-/// Sidebar invalidation for the chat surface. The right sidebar renders the
-/// outline as a captured snapshot and re-renders only when a new registration
-/// object arrives, so every input the outline depends on must be enumerated
-/// here and force a re-registration:
-///
-/// - `projectionInput`: session rehydration transiently empties it (daemon
-///   attaching, history not yet mirrored) and live turns grow it per delta.
-///   Without this trigger the sidebar freezes whichever frame was current —
-///   an outline rendered blank for a chat whose transcript was fully visible.
-/// - `outlineEntries`: covers projection changes that alter the entry list
-///   without changing the input shape.
-@MainActor
-private struct SidebarRegistrationRefresh: ViewModifier {
-    let projectionInput: TranscriptProjectionInput
-    let outlineEntries: [ChatOutlineEntry]
-    let onRefresh: () -> Void
-
-    func body(content: Content) -> some View {
-        content
-            .onChange(of: projectionInput) { _, _ in onRefresh() }
-            .onChange(of: outlineEntries) { _, _ in onRefresh() }
+        let loadedPresentation = makePresentation(persistedTranscriptItems: items)
+        persistedTranscriptState = .loaded(items)
+        updateRightSidebarRegistration(presentation: loadedPresentation)
     }
 }
 
@@ -1073,6 +1083,21 @@ private struct ChatResolutionTaskKey: Hashable {
 private struct ChatHydrationTaskKey: Hashable {
     let chatID: ChatID?
     let sessionID: UUID
+}
+
+private enum PersistedChatTranscriptState {
+    case loading
+    case loaded([PersistedChatTranscriptItem])
+
+    var items: [PersistedChatTranscriptItem] {
+        guard case .loaded(let items) = self else { return [] }
+        return items
+    }
+
+    var isLoaded: Bool {
+        if case .loaded = self { return true }
+        return false
+    }
 }
 
 enum ChatMetrics {
