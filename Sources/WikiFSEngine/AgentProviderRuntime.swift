@@ -419,6 +419,10 @@ public actor AgentProviderRuntime: AgentProviderPrivateServices {
     private let makeBackend: BackendFactory
     private let probeCatalog: CatalogProbe
     private let sandboxUsable: SandboxUsabilityCheck
+    /// Test seam (issue #1276): when non-nil, summarizer scratch worlds are
+    /// created under this root instead of the shared temporary directory, so
+    /// a test can assert scratch cleanup on a root it owns exclusively.
+    private let summarizerScratchParent: URL?
     private var snapshots: [UUID: Snapshot] = [:]
     private var tokens: [UUID: TokenRecord] = [:]
     private var cachedBackends: [String: any AgentBackend] = [:]
@@ -435,6 +439,15 @@ public actor AgentProviderRuntime: AgentProviderPrivateServices {
         true
         #endif
     }
+
+    /// The strict summarizer sandbox tier is default-on; setting
+    /// `WIKIFS_SUMMARIZER_STRICT=0` disables it without a rebuild. The
+    /// escape hatch exists because an unknown adapter could fail to launch
+    /// under the strict denies — and when it does, summarization degrades to
+    /// default truncation (never silently disappears; see the model-summary
+    /// call sites).
+    public static let strictSummarizerEnabled: Bool =
+        ProcessInfo.processInfo.environment["WIKIFS_SUMMARIZER_STRICT"] != "0"
 
     public init(
         readConfiguration: @escaping ConfigurationReader,
@@ -455,7 +468,8 @@ public actor AgentProviderRuntime: AgentProviderPrivateServices {
                 apiKey: apiKey)
                 .discoverObservation()
         },
-        sandboxUsability: @escaping SandboxUsabilityCheck = AgentProviderRuntime.defaultSandboxUsability
+        sandboxUsability: @escaping SandboxUsabilityCheck = AgentProviderRuntime.defaultSandboxUsability,
+        summarizerScratchParent: URL? = nil
     ) {
         self.readConfiguration = readConfiguration
         self.resolveCommand = resolveCommand
@@ -465,6 +479,7 @@ public actor AgentProviderRuntime: AgentProviderPrivateServices {
         self.makeBackend = makeBackend
         self.probeCatalog = probeCatalog
         self.sandboxUsable = sandboxUsability
+        self.summarizerScratchParent = summarizerScratchParent
     }
 
     public func prepareInteractive(
@@ -543,7 +558,13 @@ public actor AgentProviderRuntime: AgentProviderPrivateServices {
         // sandbox) for their full lifetime; `release`/`dispose` remove it only
         // after the leases drain and the backends terminate. A scratch
         // allocation failure throws — summarization never runs unsandboxed.
-        let scratch = try LLMSandboxScratch.make(namePrefix: "summarizer")
+        // The summarizer runs the STRICT profile tier (W^X scratch/temp, macOS
+        // pivot exec denies, credential read denies): a one-shot LLM call with
+        // no file-tool needs is the most fenceable spawn in the app.
+        let scratch = try LLMSandboxScratch.make(
+            under: summarizerScratchParent,
+            namePrefix: "summarizer",
+            strict: Self.strictSummarizerEnabled)
         let snapshotID = UUID()
         let policy = AgentOperationPolicy(
             kind: .interactive,
