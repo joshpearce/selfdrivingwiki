@@ -194,16 +194,41 @@ public enum KeychainSecretStore {
         let group = accessGroup
         guard !group.isEmpty else { return }
 
-        guard let legacy = enumerateLegacyGenericPasswords() else {
-            return  // file keychain empty / unreadable
+        let enumerated = enumerateLegacyGenericPasswords()
+        guard enumerated.status == errSecSuccess, !enumerated.items.isEmpty else {
+            // Was silent: a failed bulk enumeration (e.g. errSecAuthFailed when
+            // one item's data is not readable by this process) is
+            // indistinguishable from an empty legacy keychain without the
+            // status, which hid stranded legacy items (the zotero API key
+            // stayed file-based while reads went to DataProtection+group).
+            DebugLog.config(
+                "Keychain migration: legacy enumeration returned nothing (status \(enumerated.status)); no items considered")
+            return
         }
+        let legacy = enumerated.items
         // Scope to THIS app's own items (by service-prefix convention) so
-        // unrelated file-keychain items the process can see are left untouched.
+        // unrelated file-keychain items the process can see are left untouched,
+        // then drop items that already live in the shared DataProtection group:
+        // the one-store enumeration surfaces those too, and "migrating" one
+        // erases it (see isMigrationCandidate).
         let ownItems = legacy.filter { $0.service.hasPrefix(migrationServicePrefix) }
-        guard !ownItems.isEmpty else { return }
+        guard !ownItems.isEmpty else {
+            DebugLog.config(
+                "Keychain migration: legacy keychain held \(legacy.count) item(s), none with prefix \(migrationServicePrefix)")
+            return
+        }
+        let strays = ownItems.filter {
+            isMigrationCandidate(
+                service: $0.service, accessGroup: $0.accessGroup, sharedGroup: group)
+        }
+        if strays.count != ownItems.count {
+            DebugLog.config(
+                "Keychain migration: skipped \(ownItems.count - strays.count) item(s) already in the shared DataProtection group")
+        }
+        guard !strays.isEmpty else { return }
 
         var migrated = 0
-        for item in ownItems {
+        for item in strays {
             guard let value = String(data: item.data, encoding: .utf8) else { continue }
             // Write to the DP keychain under the shared group. If this fails
             // (e.g. errSecMissingEntitlement on an un-entitled build, or a
@@ -215,10 +240,14 @@ public enum KeychainSecretStore {
                 DebugLog.config("Keychain migration: skipped \(item.account) (service \(item.service)): \(error)")
                 continue
             }
-            // Now delete the legacy file-keychain original.
+            // Now delete the legacy original — scoped to the legacy copy's OWN
+            // access group. An unscoped delete was matching the DataProtection
+            // copy too (the file and DataProtection keychains are one store on
+            // modern macOS), so every launch deleted the key the previous
+            // session had just saved.
             do {
                 try write(service: item.service, account: item.account, value: nil,
-                          useDP: false, accessGroup: "", error: migrationError)
+                          useDP: false, accessGroup: item.accessGroup ?? "", error: migrationError)
             } catch {
                 DebugLog.config("Keychain migration: failed to delete legacy \(item.account) (service \(item.service)): \(error)")
             }
@@ -234,12 +263,32 @@ public enum KeychainSecretStore {
     /// the migration to this app's own items only.
     private static let migrationServicePrefix = "org.sockpuppet.WikiFS."
 
+    /// Whether an enumerated legacy-keychain item is a true legacy stray worth
+    /// migrating. Items whose access group is already the shared group are
+    /// DataProtection items: the legacy enumeration (no
+    /// `kSecUseDataProtectionKeychain` flag) still matches them, because the
+    /// file and DataProtection keychains are one store on modern macOS.
+    /// "Migrating" one re-writes it in place and then deletes the "legacy
+    /// original" scoped to its own access group — which IS the shared group —
+    /// erasing the item. That deleted a freshly saved Zotero API key 30
+    /// seconds after the user stored it (2026-09-21). A true stray carries a
+    /// different access group or none.
+    static func isMigrationCandidate(
+        service: String, accessGroup: String?, sharedGroup: String
+    ) -> Bool {
+        guard service.hasPrefix(migrationServicePrefix) else { return false }
+        return accessGroup != sharedGroup
+    }
+
     /// Enumerate every generic-password item in the LEGACY file-based keychain
-    /// (no `kSecUseDataProtectionKeychain` flag), returning `(service, account,
-    /// data)` tuples. Returns nil if the file keychain is empty / unreadable
-    /// (`errSecItemNotFound`). The caller filters to its own service prefix.
+    /// (no `kSecUseDataProtectionKeychain` flag), returning the items it could
+    /// read — service, account, data, and the item's own access group (used to
+    /// scope the post-migration delete to the legacy copy) — plus the raw
+    /// `OSStatus` (so a failed bulk read is diagnosable, not silent). Returns
+    /// an empty list with the status on failure (`errSecItemNotFound` when the
+    /// file keychain is empty). The caller filters to its own service prefix.
     private static func enumerateLegacyGenericPasswords()
-    -> [(service: String, account: String, data: Data)]? {
+    -> (items: [(service: String, account: String, data: Data, accessGroup: String?)], status: OSStatus) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecMatchLimit as String: kSecMatchLimitAll,
@@ -248,13 +297,17 @@ public enum KeychainSecretStore {
         ]
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let items = result as? [[String: Any]] else { return nil }
-        return items.compactMap { dict in
+        guard status == errSecSuccess, let items = result as? [[String: Any]] else {
+            return ([], status)
+        }
+        let read: [(service: String, account: String, data: Data, accessGroup: String?)] = items.compactMap { dict in
             guard let service = dict[kSecAttrService as String] as? String,
                   let account = dict[kSecAttrAccount as String] as? String,
                   let data = dict[kSecValueData as String] as? Data else { return nil }
-            return (service, account, data)
+            let accessGroup = dict[kSecAttrAccessGroup as String] as? String
+            return (service, account, data, accessGroup)
         }
+        return (read, status)
     }
 
     /// Minimal error factory for the migration's best-effort writes — the actual
