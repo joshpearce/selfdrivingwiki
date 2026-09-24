@@ -1,3 +1,5 @@
+// pattern: Imperative Shell
+
 import AppKit
 import WikiFSEngine
 import SwiftUI
@@ -75,6 +77,140 @@ enum TranscriptID: Hashable, Sendable {
     case queueItem(QueueItem.ID)
 }
 
+/// Chat transcript web view with native macOS actions for resolved wiki links
+/// (issue #1315). WebKit does not expose the hovered URL to `willOpenMenu`, so
+/// the coordinator keeps `hoveredLinkHref` current through the reader's
+/// injected hover-listener script + message bridge (same document contract,
+/// separate web view → no interference).
+///
+/// The view only emits typed intents (the URL under the cursor) and carries
+/// host-supplied ``WikiLinkMenuCapabilities`` — opaque closures, never the
+/// store. It holds no navigation authority of its own: plain clicks and
+/// ⌘-clicks keep flowing through `decidePolicyFor` unchanged, and a capability
+/// the host does not supply means the corresponding menu item is omitted.
+@MainActor
+final class ChatTranscriptWebView: WKWebView {
+    /// The href under the cursor, kept current by the injected
+    /// `mouseover`/`mouseenter` listener. Read synchronously in `willOpenMenu`.
+    var hoveredLinkHref: String?
+    /// Open the hovered link in a new foreground tab (⌘-click parity). The
+    /// representable wires this to `.openWikiLink(url, inNewTab: true)`.
+    var onOpenInNewTab: (@MainActor (URL) -> Void)?
+    /// Open the hovered link in a background tab. The representable wires
+    /// this to `.openWikiLinkInBackground(url)`.
+    var onOpenInBackgroundTab: (@MainActor (URL) -> Void)?
+    /// Reader-parity actions for the link menu, supplied by the host and
+    /// REFRESHED on every `updateNSView` — the Activity window's store appears
+    /// and disappears as wiki windows open and close, so a value captured at
+    /// `makeNSView` would freeze menus against a dead store. `.none` keeps
+    /// only the URL-only tab actions.
+    var linkMenuCapabilities: WikiLinkMenuCapabilities = .none
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+
+        // Same WebKit built-ins the reader removes: new-window navigation is
+        // unsupported (the app uses tabs), and Download/Copy no-op or expose a
+        // raw `wiki://` URL for our custom schemes. Remove before inserting so
+        // the menu is clean regardless of what WebKit shipped this release.
+        // WebKit's own Share menu stays: chat external links keep the native
+        // Share (the reader replaces it with a File-Provider-backed one).
+        let removeIDs: Set<String> = [
+            "WKMenuItemIdentifierOpenLinkInNewWindow",
+            "WKMenuItemIdentifierDownloadLinkedFile",
+            "WKMenuItemIdentifierCopyLink",
+        ]
+        menu.items.removeAll { removeIDs.contains($0.identifier?.rawValue ?? "") }
+        collapseMenuSeparators(menu)
+
+        guard let href = hoveredLinkHref, !href.isEmpty,
+              let url = URL(string: href)
+        else { return }
+        // Same-page anchors scroll the reader document, not a transcript —
+        // WebKit's plain menu is right for them.
+        guard !WikiLinkMarkdown.isSamePageAnchor(url) else { return }
+
+        let resolvedKind = WikiLinkMarkdown.resolvedKind(from: url)
+        let isExternalHTTP = url.scheme == "http" || url.scheme == "https"
+        // A composed link menu is built for three kinds, each gated on the
+        // capabilities the host supplies: resolved wiki links (tab actions +
+        // Add Bookmark… / Find Similar…), unresolved links (Suggest…), and
+        // external http(s) links (Add as Source). Anything else — mailto:,
+        // anchors — keeps the plain WebKit menu.
+        guard resolvedKind != nil || isExternalHTTP
+                || url.scheme == WikiLinkMarkdown.scheme
+        else { return }
+
+        if resolvedKind != nil {
+            // Insert directly after WebKit's "Open Link" (which routes the
+            // plain click), mirroring where the reader places its custom
+            // items. A trailing separator groups them apart from the rest.
+            let insertionIndex = menu.items.firstIndex {
+                $0.identifier?.rawValue == "WKMenuItemIdentifierOpenLink"
+            }.map { $0 + 1 } ?? 0
+
+            let newTab = NSMenuItem.wikiItem("Open in New Tab") { [weak self] in
+                self?.onOpenInNewTab?(url)
+            }
+            newTab.image = NSImage(systemSymbolName: "plus.rectangle.on.rectangle",
+                                   accessibilityDescription: "Open in New Tab")
+            let background = NSMenuItem.wikiItem("Open in Background") { [weak self] in
+                self?.onOpenInBackgroundTab?(url)
+            }
+            background.image = NSImage(systemSymbolName: "dock.arrow.down.rectangle",
+                                       accessibilityDescription: "Open in Background")
+            menu.insertItem(newTab, at: insertionIndex)
+            menu.insertItem(background, at: insertionIndex + 1)
+            menu.insertItem(NSMenuItem.separator(), at: insertionIndex + 2)
+
+            // Bottom group (Share…, Find Similar…) INSIDE the custom group —
+            // inserted at the separator's index so the separator trails the
+            // whole group, exactly the reader's topology:
+            // … Open in Background → Share… → — → Find Similar… → — → WebKit.
+            // Inserting after the separator would leave Find Similar… bare
+            // against WebKit's own items.
+            let clickPoint = convert(event.locationInWindow, from: nil)
+            let bottom = WikiLinkMenuNSItems.items(
+                for: url, actions: WikiLinkMenuBuilder.bottomActions(for: url),
+                capabilities: linkMenuCapabilities,
+                anchorView: self,
+                anchorRect: NSRect(x: clickPoint.x, y: clickPoint.y, width: 1, height: 1))
+            for item in bottom.reversed() { menu.insertItem(item, at: insertionIndex + 2) }
+        }
+
+        // Reader-parity actions from the capability seam, prepended above
+        // WebKit's items with a trailing separator — the reader's convention
+        // for its custom group. Missing capabilities yield no items here, so
+        // a degraded host's menu is exactly the URL-only one.
+        let parity = WikiLinkMenuNSItems.items(for: url, capabilities: linkMenuCapabilities)
+        if !parity.isEmpty {
+            menu.insertItem(NSMenuItem.separator(), at: 0)
+            for item in parity.reversed() { menu.insertItem(item, at: 0) }
+        }
+    }
+
+    /// Remove leading, trailing, and consecutive separators from `menu` so the
+    /// built-in removals above never leave an orphaned divider. (Same cleanup
+    /// as `WikiReaderWebView`.)
+    private func collapseMenuSeparators(_ menu: NSMenu) {
+        var lastWasSeparator = true // treat start-of-menu as "after separator"
+        var i = 0
+        while i < menu.items.count {
+            let item = menu.items[i]
+            if item.isSeparatorItem {
+                if lastWasSeparator {
+                    menu.removeItem(at: i)
+                    continue
+                }
+                lastWasSeparator = true
+            } else {
+                lastWasSeparator = false
+            }
+            i += 1
+        }
+    }
+}
+
 struct ChatWebView: NSViewRepresentable {
     let chatRows: [ChatDisplayRow]
     /// A stable typed transcript identity prevents mutations for one chat or
@@ -112,6 +248,12 @@ struct ChatWebView: NSViewRepresentable {
     var quoteAnchor: ChatHighlightRequest? = nil
 
     var onChatIntent: ((ChatTranscriptIntent) -> Void)? = nil
+    /// Reader-parity link-menu actions the host can supply, carried as opaque
+    /// closures (see ``WikiLinkMenuCapabilities``). Refreshed on every
+    /// `updateNSView` — like `blobStore`, it goes stale when a wiki window
+    /// opens or closes under an Activity-window row. Defaults to `.none`,
+    /// which keeps only the URL-only tab actions.
+    var linkMenuCapabilities: WikiLinkMenuCapabilities = .none
 
     /// Name of the `WKScriptMessage` channel the per-bubble "Copy" button posts
     /// to (issue #285). The JS click listener calls
@@ -128,7 +270,8 @@ struct ChatWebView: NSViewRepresentable {
         blobStore: WikiStoreModel? = nil,
         zoom: Double = Double(ZoomScale.defaultScale),
         scrollRequest: ChatWebScrollRequest? = nil,
-        quoteAnchor: ChatHighlightRequest? = nil
+        quoteAnchor: ChatHighlightRequest? = nil,
+        linkMenuCapabilities: WikiLinkMenuCapabilities = .none
     ) {
         self.chatRows = chatRows
         self.transcriptID = transcriptID
@@ -138,6 +281,7 @@ struct ChatWebView: NSViewRepresentable {
         self.scrollRequest = scrollRequest
         self.quoteAnchor = quoteAnchor
         self.onChatIntent = onChatIntent
+        self.linkMenuCapabilities = linkMenuCapabilities
     }
 
     func makeNSView(context: Context) -> WKWebView {
@@ -154,10 +298,20 @@ struct ChatWebView: NSViewRepresentable {
         let cc = WKUserContentController()
         cc.add(context.coordinator, name: Self.copyMessageName)
         cc.add(context.coordinator, name: Self.followMessageName)
+        // Hover bridge for the link context menu (#1315): the reader's proven
+        // hover-listener script posts the `<a>` href under the cursor to the
+        // `linkHover` channel. Each web view has its own content controller,
+        // so reusing the reader's script + name here cannot collide — and a
+        // fix to the shared script benefits both surfaces.
+        cc.add(context.coordinator, name: WikiReaderWebView.linkHoverName)
+        cc.addUserScript(WKUserScript(
+            source: WikiReaderWebView.hoverListenerJS,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true))
         config.userContentController = cc
         let blobHandler = BlobSchemeHandler(store: blobStore)
         config.setURLSchemeHandler(blobHandler, forURLScheme: BlobSchemeHandler.scheme)
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = ChatTranscriptWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.underPageBackgroundColor = .clear
@@ -165,6 +319,9 @@ struct ChatWebView: NSViewRepresentable {
         webView.allowsBackForwardNavigationGestures = false
         context.coordinator.webView = webView
         context.coordinator.onChatIntent = onChatIntent
+        webView.onOpenInNewTab = { url in onChatIntent?(.openWikiLink(url, inNewTab: true)) }
+        webView.onOpenInBackgroundTab = { url in onChatIntent?(.openWikiLinkInBackground(url)) }
+        webView.linkMenuCapabilities = linkMenuCapabilities
         context.coordinator.renderContext = renderContext
         context.coordinator.reload(chatRows: chatRows, transcriptID: transcriptID)
         return webView
@@ -174,6 +331,14 @@ struct ChatWebView: NSViewRepresentable {
         webView.pageZoom = zoom
         context.coordinator.onChatIntent = onChatIntent
         context.coordinator.renderContext = renderContext
+        if let transcriptWebView = webView as? ChatTranscriptWebView {
+            transcriptWebView.onOpenInNewTab = { url in onChatIntent?(.openWikiLink(url, inNewTab: true)) }
+            transcriptWebView.onOpenInBackgroundTab = { url in onChatIntent?(.openWikiLinkInBackground(url)) }
+            // Refresh per update: an Activity-window row's store appears and
+            // disappears with its wiki window, and a value frozen at
+            // makeNSView would keep right-clicking the dead store.
+            transcriptWebView.linkMenuCapabilities = linkMenuCapabilities
+        }
         // Keep the blob handler's store fresh (a wiki switch swaps the store).
         if let handler = webView.configuration.urlSchemeHandler(forURLScheme: BlobSchemeHandler.scheme) as? BlobSchemeHandler {
             handler.store = blobStore
@@ -486,6 +651,10 @@ struct ChatWebView: NSViewRepresentable {
             _ userContentController: WKUserContentController,
             didReceive message: WKScriptMessage
         ) {
+            if message.name == WikiReaderWebView.linkHoverName {
+                (webView as? ChatTranscriptWebView)?.hoveredLinkHref = message.body as? String
+                return
+            }
             guard message.name == ChatWebView.copyMessageName,
                   let text = message.body as? String
             else {

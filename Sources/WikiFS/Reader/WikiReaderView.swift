@@ -948,23 +948,28 @@ final class WikiReaderWebView: WKWebView {
 
         DebugLog.reader("willOpenMenu: building custom items for url=\(url.absoluteString)")
 
-        let custom = WikiLinkMenuNSItems.items(for: url, store: store, fileProvider: fileProvider, addURL: addURLHandler, addBookmark: addBookmarkHandler)
+        // One capabilities value per right-click: `.full` is the only place the
+        // store meets menu construction; the builder downstream sees closures.
+        let capabilities = WikiLinkMenuCapabilities.full(
+            store: store,
+            fileProvider: fileProvider,
+            addURL: addURLHandler,
+            addBookmark: addBookmarkHandler)
+
+        let custom = WikiLinkMenuNSItems.items(for: url, capabilities: capabilities)
 
         // Insert "Open in Background" right after WebKit's "Open Link"
         // for resolved wiki links, so it's the second item in the menu.
+        // Presence is decided now (a link that resolves to nothing is
+        // omitted); the action RE-RESOLVES at click time through the
+        // capabilities, so a target deleted between right-click and click
+        // no-ops instead of opening a dead tab.
         if let openLinkIdx = menu.items.firstIndex(where: { $0.identifier?.rawValue == "WKMenuItemIdentifierOpenLink" }),
-           WikiLinkMarkdown.resolvedKind(from: url) != nil {
-            let target = WikiLinkMarkdown.target(from: url) ?? ""
+           capabilities.selection?(url) != nil,
+           capabilities.openInBackground != nil {
             let bgItem = NSMenuItem.wikiItem("Open in Background") {
-                switch WikiLinkMarkdown.resolvedKind(from: url) {
-                case .page:
-                    if let id = store.pageID(forTitle: target) { store.openTabInBackground(.page(id)) }
-                case .source:
-                    if let id = store.sourceID(forDisplayName: target) { store.openTabInBackground(.source(id)) }
-                case .chat:
-                    if let id = store.chatID(forTitle: target) { store.openTabInBackground(.chat(id)) }
-                case nil: break
-                }
+                guard let selection = capabilities.selection?(url) else { return }
+                capabilities.openInBackground?(selection)
             }
             bgItem.image = NSImage(systemSymbolName: "dock.arrow.down.rectangle",
                                    accessibilityDescription: "Open in Background")
@@ -992,51 +997,24 @@ final class WikiReaderWebView: WKWebView {
             menu.removeItem(at: webKitShareIdx)
         }
 
-        // Build Share + bottom items for wiki links.
-        if url.scheme == WikiLinkMarkdown.scheme, let fp = fileProvider {
-            let shareWebView = self
-            let viewPoint = convert(event.locationInWindow, from: nil)
-
-            let shareURLTask: Task<URL?, Never>?
-            switch WikiLinkMarkdown.resolvedKind(from: url) {
-            case .page?:
-                let target = WikiLinkMarkdown.target(from: url) ?? ""
-                if let id = store.pageID(forTitle: target) {
-                    shareURLTask = Task { await fp.resolvePageByTitleURL(id: id) }
-                } else { shareURLTask = nil }
-            case .source?:
-                let target = WikiLinkMarkdown.target(from: url) ?? ""
-                if let id = store.sourceID(forDisplayName: target) {
-                    shareURLTask = Task { await fp.resolveSourceByNameURL(id: id) }
-                } else { shareURLTask = nil }
-            case .chat?:
-                // Chat sharing via File Provider URL is not yet wired — no-op.
-                shareURLTask = nil
-            case nil:
-                shareURLTask = nil
-            }
-
-            let customShare = NSMenuItem.wikiItem("Share…") {
-                Task { @MainActor in
-                    guard let fileURL = await shareURLTask?.value as? URL else { return }
-                    let picker = NSSharingServicePicker(items: [fileURL])
-                    let rect = NSRect(x: viewPoint.x, y: viewPoint.y, width: 1, height: 1)
-                    picker.show(relativeTo: rect, of: shareWebView, preferredEdge: .minY)
-                }
-            }
-            customShare.image = NSImage(systemSymbolName: "square.and.arrow.up",
-                                        accessibilityDescription: "Share")
-
+        // Build Share + bottom items for wiki links through the shared
+        // builder. The builder emits Share… only when the capabilities carry a
+        // presenter (a reader without a facade omits it — its File Provider
+        // resolution runs at CLICK time, not on every right-click), and
+        // unresolved links get neither Share… nor Find Similar…, so no
+        // action-less item is built (the old code inserted a dead Share… whose
+        // task resolved nil on `wiki://missing` and anchors).
+        if url.scheme == WikiLinkMarkdown.scheme {
             let bottomActions = WikiLinkMenuBuilder.bottomActions(for: url)
+            let clickPoint = convert(event.locationInWindow, from: nil)
             let bottomItems = WikiLinkMenuNSItems.items(
-                for: url, actions: bottomActions, store: store, fileProvider: fileProvider,
-                addURL: addURLHandler, addBookmark: addBookmarkHandler)
+                for: url, actions: bottomActions, capabilities: capabilities,
+                anchorView: self,
+                anchorRect: NSRect(x: clickPoint.x, y: clickPoint.y, width: 1, height: 1))
 
             // Insert at insertIdx in reverse so they appear in order.
             for item in bottomItems.reversed() { menu.insertItem(item, at: insertIdx) }
-            if !bottomItems.isEmpty { menu.insertItem(NSMenuItem.separator(), at: insertIdx) }
-            menu.insertItem(customShare, at: insertIdx)
-            collapseMenuSeparators(menu)
+            if !bottomItems.isEmpty { collapseMenuSeparators(menu) }
         } else {
             // External link: Share the URL directly.
             let shareWebView = self
