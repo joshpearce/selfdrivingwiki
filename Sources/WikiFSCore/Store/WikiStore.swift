@@ -501,6 +501,37 @@ public protocol WikiStore: AnyObject, Sendable {
         provenance: SourceProvenance?
     ) throws -> SourceVersion
 
+    /// Attach acquired bytes to an existing (byteless) source — the
+    /// attachment drain's one store write for any acquisition package. Creates
+    /// the content version (blob, hash, declared MIME, ext derived from the
+    /// MIME), refreshes the denormalized mirror (byte size, ext, MIME), and
+    /// populates the retained external-provenance columns plus the display
+    /// name in ONE transaction. Re-syncing identical bytes updates the
+    /// provenance columns but never creates a duplicate version (hash-diff,
+    /// the normal versioning path). `displayName` replaces the display name
+    /// only when non-nil.
+    @discardableResult
+    func attachAcquiredBytes(
+        sourceID: SourceID,
+        bytes: Data,
+        mimeType: String,
+        externalItemKey: String?,
+        externalItemTitle: String?,
+        displayName: String?
+    ) throws -> SourceVersion
+
+    /// Populate the retained external-provenance columns (and optionally the
+    /// display name) for a source whose product arrived as a Markdown
+    /// version instead of a blob. Each non-nil argument replaces; nil keeps
+    /// the stored value. The columns themselves keep their historical names
+    /// (compat contract); only the operation seam is acquisition-neutral.
+    func setAcquisitionProvenance(
+        sourceID: SourceID,
+        externalItemKey: String?,
+        externalItemTitle: String?,
+        displayName: String?
+    ) throws
+
     /// The latest (HEAD) version of the processed markdown for a source, or nil
     /// when no version exists yet (not yet seeded/extracted).
     func processedMarkdownHead(sourceID: SourceID) throws -> SourceMarkdownVersion?

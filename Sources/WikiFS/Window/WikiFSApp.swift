@@ -80,7 +80,7 @@ struct WikiFSApp: App {
     private var queueStoreError: String? { localQueueRuntimeController.startupError }
     /// Drives the Settings TabView selection so the activity windows can open
     /// Settings on the relevant tab (gear button → extraction/agents config).
-    @AppStorage("settings.selectedTab") private var settingsSelectedTabRaw = SettingsTab.zotero.rawValue
+    @AppStorage("settings.selectedTab") private var settingsSelectedTabRaw = SettingsTab.extraction.rawValue
     /// Per-app appearance override (Light / Dark / System). Shared key with
     /// `AppearanceSettingsView`. Applied via `.preferredColorScheme` on every
     /// scene + `NSApp.appearance` for AppKit surfaces (NSAlert, menu bar).
@@ -214,10 +214,11 @@ struct WikiFSApp: App {
         let processComposition = AppProcessPluginCatalog(
             containerDirectory: directory,
             transportBridge: transportBridge,
-            extractionProvider: { services in
+            extractionProvider: { services, queueDBURL in
                 AppQueueExtractionProvider(
                     extractionServices: services,
-                    sessionBox: sessionBox)
+                    sessionBox: sessionBox,
+                    queueDatabaseURL: queueDBURL)
             },
             makeIngestionProvider: { store, providerServices in
                 AppQueueIngestionProvider(
@@ -234,7 +235,10 @@ struct WikiFSApp: App {
         _extractionCoordinator = State(initialValue: coordinator)
         let extractionProvider = AppQueueExtractionProvider(
             extractionServices: extractionServices,
-            sessionBox: sessionBox)
+            sessionBox: sessionBox,
+            queueDatabaseURL: DebugLog.trying(
+                "resolve queue database URL",
+                operation: { try DatabaseLocation.queueDatabaseURL() }))
         let runtimeController = processComposition.queueController
         let transportOwner = processComposition.transportOwner
         let rendererOwner = processComposition.rendererOwner
@@ -833,9 +837,6 @@ struct WikiFSApp: App {
 
         Settings {
             TabView(selection: settingsSelectedTab) {
-                ZoteroSettingsView(containerDirectory: containerDirectory)
-                    .tag(SettingsTab.zotero)
-                    .tabItem { Label("Zotero", systemImage: "books.vertical") }
                 ExtractionSettingsView(
                     containerDirectory: containerDirectory,
                     launcher: settingsLauncher,
@@ -888,8 +889,12 @@ struct WikiFSApp: App {
                             guard let reference = ExtractorCredentialSettingsSupport
                                 .bindingReference(for: summary)
                             else {
+                                DebugLog.extraction(
+                                    "credentials: authorize closure found NO binding reference for \(summary.packageID)/\(summary.requirementID)")
                                 return .failed("This requirement could not be authorized.")
                             }
+                            DebugLog.extraction(
+                                "credentials: authorize closure granting \(summary.packageID)/\(summary.requirementID) → \(reference.rawValue)")
                             let requirement = try ExtractorCredentialRequirement(
                                 id: ExtractorCredentialRequirementID(
                                     validating: summary.requirementID),
@@ -897,7 +902,7 @@ struct WikiFSApp: App {
                                 isOptional: summary.isOptional,
                                 label: summary.label,
                                 purpose: summary.purpose)
-                            _ = try await writer.grant(
+                            let snapshot = try await writer.grant(
                                 packageID: ExtractorPackageID(
                                     validating: summary.packageID),
                                 registrationID: ExtractorRegistrationID(
@@ -906,8 +911,12 @@ struct WikiFSApp: App {
                                 mimeTypes: summary.mimeTypes,
                                 requirement: requirement,
                                 credentialReference: reference)
+                            DebugLog.extraction(
+                                "credentials: grant written generation=\(snapshot.generation) records=\(snapshot.records.count)")
                             return .succeeded(nil)
                         } catch {
+                            DebugLog.extraction(
+                                "credentials: authorize closure FAILED for \(summary.packageID)/\(summary.requirementID): \(ExtractorPackageMutationMessage.describe(error))")
                             return .failed(ExtractorPackageMutationMessage.describe(error))
                         }
                     },
@@ -917,13 +926,19 @@ struct WikiFSApp: App {
                                 layout: ExtractorCredentialAuthorizationStoreLayout(
                                     appGroupContainerRoot: containerDirectory),
                                 processRole: .app)
-                            _ = try await writer.revoke(
+                            DebugLog.extraction(
+                                "credentials: revoke closure revoking \(summary.packageID)/\(summary.requirementID)")
+                            let snapshot = try await writer.revoke(
                                 packageID: ExtractorPackageID(
                                     validating: summary.packageID),
                                 requirementID: ExtractorCredentialRequirementID(
                                     validating: summary.requirementID))
+                            DebugLog.extraction(
+                                "credentials: revoke written generation=\(snapshot.generation) records=\(snapshot.records.count)")
                             return .succeeded(nil)
                         } catch {
+                            DebugLog.extraction(
+                                "credentials: revoke closure FAILED for \(summary.packageID)/\(summary.requirementID): \(ExtractorPackageMutationMessage.describe(error))")
                             return .failed(ExtractorPackageMutationMessage.describe(error))
                         }
                     },
@@ -1015,8 +1030,9 @@ struct WikiFSApp: App {
     }
 
     /// Settings tab tags used by the TabView selection and `@AppStorage`.
+    /// Zotero account setup lives inside the Extraction tab (the reviewed
+    /// zotero package's pane), not as its own tab.
     enum SettingsTab: String {
-        case zotero
         case extraction
         case agents
         case operations
@@ -1025,13 +1041,14 @@ struct WikiFSApp: App {
     }
 
     /// Binding that bridges `@AppStorage(String)` → `SettingsTab` for the
-    /// Settings `TabView(selection:)`. Falls back to `.zotero` (the new
+    /// Settings `TabView(selection:)`. Falls back to `.extraction` (the
     /// first tab) when the stored raw value is missing or references a
-    /// removed tab (e.g. `.about` / `.general` from before the About and
+    /// removed tab (e.g. `.zotero`, folded into the Extraction tab's
+    /// account pane; or `.about` / `.general` from before the About and
     /// General tabs were removed).
     private var settingsSelectedTab: Binding<SettingsTab> {
         Binding(
-            get: { SettingsTab(rawValue: settingsSelectedTabRaw) ?? .zotero },
+            get: { SettingsTab(rawValue: settingsSelectedTabRaw) ?? .extraction },
             set: { settingsSelectedTabRaw = $0.rawValue }
         )
     }

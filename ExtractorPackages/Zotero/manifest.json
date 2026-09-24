@@ -1,0 +1,61 @@
+{
+  "capabilities": [
+    "network",
+    "shared-runtime-cache"
+  ],
+  "displayName": "Zotero Attachment",
+  "entryPoint": "bin/zotero-extractor",
+  "files": [
+    {
+      "digest": "07d23e9ba3748d9454cd77daaa01201bfd62785960fa9f20d995da95f820d075",
+      "path": "PROVENANCE.md"
+    },
+    {
+      "digest": "3f3707e0f7fda78dc24d44cfe269e156a2e00031b427e870f93ae77e75831160",
+      "path": "bin/zotero"
+    },
+    {
+      "digest": "2d79916a205fc2483080ab0956bdfc45d1b6b82d9bbce940346ac16cd0d7edfc",
+      "path": "bin/zotero-extractor"
+    }
+  ],
+  "launch": {
+    "arguments": [
+      "run",
+      "--script"
+    ],
+    "command": "uv",
+    "mode": "runtime"
+  },
+  "limits": {
+    "maximumDurationMilliseconds": 600000,
+    "maximumInputByteCount": 1048576,
+    "maximumMarkdownOutputByteCount": 134217728,
+    "maximumProgressEventCount": 64
+  },
+  "manifestRevision": 2,
+  "packageID": "org.selfdrivingwiki.zotero",
+  "protocolRevision": 4,
+  "registrations": [
+    {
+      "credentialRequirements": [
+        {
+          "id": "zotero-api-key",
+          "kind": "secret",
+          "label": "Zotero API Key",
+          "optional": false,
+          "purpose": "Read your Zotero library and download attachment files."
+        }
+      ],
+      "displayName": "Zotero Attachment",
+      "id": "attachment",
+      "kinds": [
+        "zotero"
+      ],
+      "mimeTypes": [
+        "application/zotero"
+      ]
+    }
+  ],
+  "version": "1.0.1"
+}

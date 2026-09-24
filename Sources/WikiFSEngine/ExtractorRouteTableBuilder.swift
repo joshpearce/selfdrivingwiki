@@ -55,9 +55,11 @@ public enum ExtractorRouteTableBuilder {
     }
 
     public static func build(_ input: Input) -> [ExtractorRouteSettingsRow] {
-        let routes = descriptors(for: input).map(\.route)
-        return routes.map { route in
-            buildRow(route: route, input: input)
+        // The descriptor list is the single source of route identity and
+        // display names: rows carry the descriptor they were built from and
+        // never re-derive one, so the list and the rows cannot disagree.
+        descriptors(for: input).map { descriptor in
+            buildRow(descriptor: descriptor, input: input)
         }
     }
 
@@ -143,17 +145,23 @@ public enum ExtractorRouteTableBuilder {
             extra.append(record.route)
         }
         // Deterministic: typed route order (kind raw value, then MIME raw value).
-        descriptors.append(contentsOf: extra.sorted().map(ExtractorRouteHostCatalog.genericDescriptor(for:)))
+        descriptors.append(contentsOf: extra.sorted().map { route in
+            ExtractorRouteDescriptor(
+                route: route,
+                displayName: registrationDisplayName(for: route, in: input.availableRegistrations)
+                    ?? route.mimeType.rawValue,
+                systemImage: nil)
+        })
         return descriptors
     }
 
     // MARK: - Row construction
 
     private static func buildRow(
-        route: ExtractorRouteID,
+        descriptor: ExtractorRouteDescriptor,
         input: Input
     ) -> ExtractorRouteSettingsRow {
-        let descriptor = descriptor(for: route, input: input)
+        let route = descriptor.route
         let savedSelection = input.configuration.extractorSelection(for: route)
         let choices = buildChoices(route: route, input: input, savedSelection: savedSelection)
         // Resolver compatibility is route-scoped: only registrations declaring
@@ -177,9 +185,28 @@ public enum ExtractorRouteTableBuilder {
             status: status)
     }
 
-    private static func descriptor(for route: ExtractorRouteID, input: Input) -> ExtractorRouteDescriptor {
-        ExtractorRouteHostCatalog.descriptors.first { $0.route == route }
-            ?? ExtractorRouteHostCatalog.genericDescriptor(for: route)
+    /// The display name package data gives one route: the lexicographically
+    /// smallest registration displayName among the registrations whose
+    /// declared kinds × MIME types cover the route, so the result never
+    /// depends on snapshot order. Blank names are treated as absent — the
+    /// manifest gate rejects them, but a snapshot built any other way
+    /// degrades to the MIME fallback instead of tripping the descriptor's
+    /// precondition in a settings render path.
+    private static func registrationDisplayName(
+        for route: ExtractorRouteID,
+        in registrations: [ExtractorRouteRegistrationSnapshot]
+    ) -> String? {
+        registrations
+            .filter { snapshot in
+                snapshot.kinds.contains { kind in
+                    snapshot.mimeTypes.contains { mimeType in
+                        ExtractorRouteID(kind: kind, mimeType: mimeType) == route
+                    }
+                }
+            }
+            .map(\.displayName)
+            .filter { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }
+            .min()
     }
 
     private static func buildChoices(

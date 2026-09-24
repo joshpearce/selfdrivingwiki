@@ -220,6 +220,10 @@ func execute(
                 store: store))
     case .admin(let action):
         return try AdminCommand.run(action, in: store)
+    case .extractor(.sync(let package, let force)):
+        return try await runExtractorSync(
+            package: package, force: force, in: store,
+            wikiID: wikiID, containerDirectory: containerDirectory)
     case .chat(let action):
         return try await runChatCommand(
             action,
@@ -242,6 +246,40 @@ func execute(
         // Phase C: handled before wiki resolution in `run()` — unreachable here.
         return SourceCommand.Result(payload: .text(""), didCommit: false)
     }
+}
+
+/// `wikictl extractor sync <package>` dispatch: enqueue-only queue wiring.
+/// The closure writes the durable `.extraction` item through
+/// `QueueStore.enqueue` — the same immediate durable store write
+/// `QueueEngine.enqueue` performs — WITHOUT constructing a `QueueEngine`
+/// (that needs a worker factory whose provider implementations live in
+/// targets `WikiCtlCore` cannot link) and WITHOUT waiting for completion
+/// (waiters are per-engine in-memory; a daemon-side completion could never
+/// resume a CLI waiter — it would hang). The app or the wikid daemon
+/// rehydrates and drains the persisted items on its next dispatch scan /
+/// launch.
+private func runExtractorSync(
+    package: ExtractorSyncCommand.Package,
+    force: Bool,
+    in store: GRDBWikiStore,
+    wikiID: WikiID,
+    containerDirectory: URL
+) async throws -> SourceCommand.Result {
+    let queueStore = try QueueStore(
+        databaseURL: try DatabaseLocation.queueDatabaseURL())
+    defer { queueStore.close() }
+    let output = try await ExtractorSyncCommand.run(
+        package: package,
+        force: force,
+        in: store,
+        containerDirectory: containerDirectory,
+        enqueue: { sourceID in
+            _ = try queueStore.enqueue(QueueItemRequest(
+                queue: .extraction,
+                wikiID: wikiID,
+                payload: QueueItemPayload(sourceIDs: [sourceID])))
+        })
+    return SourceCommand.Result(payload: .text(output), didCommit: true)
 }
 
 /// #637: split-out dispatch for the `wikictl chat …` subcommands. Resolves

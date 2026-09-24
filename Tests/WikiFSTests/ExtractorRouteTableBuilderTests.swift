@@ -137,10 +137,31 @@ struct ExtractorRouteTableBuilderTests {
             Issue.record("Expected a row for the registration-declared MIME type")
             return
         }
-        #expect(extra.descriptor.displayName == "application/vnd.exam+x")
+        #expect(extra.descriptor.displayName == "X Tracts")
         #expect(extra.descriptor.systemImage == nil)
         #expect(extra.choices.count == 1)
         #expect(extra.choices[0].displayName == "X Tracts")
+    }
+
+    /// A registration snapshot whose displayName is blank (possible only
+    /// outside manifest validation) must not produce a blank row label: the
+    /// name is treated as absent and the route falls back to its MIME type.
+    @Test func blankRegistrationNameFallsBackToTheMIMELabel() throws {
+        let input = ExtractorRouteTableBuilder.Input(
+            configuration: ExtractionConfig(),
+            registrations: [
+                try snapshot(
+                    packageID: "org.example.blank",
+                    version: "1.0.0",
+                    digestHex: digest(5),
+                    displayName: "   ",
+                    kinds: [.pdf],
+                    mimeTypes: ["application/vnd.blank+x"]),
+            ])
+        let rows = ExtractorRouteTableBuilder.build(input)
+        let extra = try #require(
+            rows.first { $0.route.mimeType.rawValue == "application/vnd.blank+x" })
+        #expect(extra.descriptor.displayName == "application/vnd.blank+x")
     }
 
     // MARK: - AC.7: exact version deduplication
