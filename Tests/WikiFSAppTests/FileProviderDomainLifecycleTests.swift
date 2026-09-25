@@ -213,5 +213,76 @@ struct FileProviderDomainLifecycleTests {
         #expect(service.removals.allSatisfy { $0.reason == .schemaMigration })
         #expect(Set(service.removals.map(\.id)) == [Self.wikiID, other])
     }
+
+    // MARK: - Registry wiring
+
+    /// A registry in a temp container with `names` created BEFORE any facade is
+    /// wired, so creating them makes no domain calls.
+    private func makeRegistry(wikiNames names: [String]) async -> (WikiRegistryClient, [WikiDescriptor]) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fp-wiring-\(UUID().uuidString)", isDirectory: true)
+        DebugLog.trying("create wiring test container", operation: {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        })
+        let registry = WikiRegistryClient(containerDirectory: directory)
+        registry.bootstrap(activateNow: false)
+        var created: [WikiDescriptor] = []
+        for name in names {
+            created.append(await registry.createWiki(displayName: name))
+        }
+        return (registry, created)
+    }
+
+    /// Wires a facade into `registry` and returns only a weak handle to it, so
+    /// the registry is the facade's sole owner, as it was at app launch.
+    private func wireFacadeOwnedOnlyByRegistry(
+        _ registry: WikiRegistryClient, service: FakeDomainService
+    ) -> () -> FileProviderFacade? {
+        let facade = FileProviderFacade(domainService: service)
+        facade.wire(into: registry)
+        return { [weak facade] in facade }
+    }
+
+    private func addedIDs(_ service: FakeDomainService) -> Set<String> {
+        Set(service.calls.compactMap { if case let .add(id, _) = $0 { id } else { nil } })
+    }
+
+    /// The launch bug, stated directly. The app wired a facade that nothing
+    /// else held, and `[weak self]` closures then made `registerAllDomains`
+    /// skip every wiki without a log line. A wired facade must stay usable
+    /// for as long as the registry holds its closures.
+    @Test func registerAllDomainsReachesAFacadeOnlyTheRegistryHolds() async {
+        settled()
+        let (registry, wikis) = await makeRegistry(wikiNames: ["One", "Two"])
+        let service = FakeDomainService()
+        let facade = wireFacadeOwnedOnlyByRegistry(registry, service: service)
+
+        await registry.registerAllDomains()
+
+        #expect(facade() != nil, "the registry's closures must keep the wired facade alive")
+        // `bootstrap` seeds a default wiki too, so compare with the full list.
+        #expect(addedIDs(service) == Set(registry.wikis.map(\.id.rawValue)))
+        #expect(addedIDs(service).isSuperset(of: wikis.map(\.id.rawValue)))
+    }
+
+    /// Delete and rename went through the same dead closures: a deleted
+    /// wiki kept its domain and a renamed one kept its old mount name.
+    @Test func renameAndDeleteReachAFacadeOnlyTheRegistryHolds() async throws {
+        settled()
+        let (registry, wikis) = await makeRegistry(wikiNames: ["Keep", "Drop"])
+        let keep = try #require(wikis.first)
+        let drop = try #require(wikis.last)
+        let service = FakeDomainService(registered: [
+            keep.id.rawValue: keep.displayName, drop.id.rawValue: drop.displayName,
+        ])
+        _ = wireFacadeOwnedOnlyByRegistry(registry, service: service)
+
+        await registry.renameWiki(id: keep.id, to: "Kept")
+        await registry.deleteWiki(id: drop.id)
+
+        #expect(service.name(of: keep.id.rawValue) == "Kept")
+        #expect(service.removals.map(\.id) == [drop.id.rawValue])
+        #expect(service.removals.map(\.reason) == [.wikiDeleted])
+    }
 }
 #endif

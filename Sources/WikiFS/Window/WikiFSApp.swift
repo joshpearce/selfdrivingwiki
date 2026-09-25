@@ -1405,16 +1405,21 @@ extension FileProviderFacade {
     /// domains. The FP bus subscription to each active session's store is wired
     /// separately in `RootScene.resolveSession(for:)` (per-window, via the
     /// `SessionManager`).
+    ///
+    /// The closures hold the facade strongly. With `[weak self]`, a facade
+    /// that only the registry still referenced was freed, and every later
+    /// register, remove, and rename became a silent no-op. There is no
+    /// retain cycle to avoid: the facade does not reference the registry.
     @MainActor
     func wire(into registry: WikiRegistryClient) {
-        registry.registerDomain = { [weak self] id, name in
-            await self?.registerDomain(id: id, displayName: name)
+        registry.registerDomain = { [self] id, name in
+            await registerDomain(id: id, displayName: name)
         }
-        registry.removeDomain = { [weak self] id in
-            await self?.removeDomain(id: id)
+        registry.removeDomain = { [self] id in
+            await removeDomain(id: id)
         }
-        registry.renameDomain = { [weak self] id, name in
-            await self?.renameDomain(id: id, displayName: name)
+        registry.renameDomain = { [self] id, name in
+            await renameDomain(id: id, displayName: name)
         }
     }
 }
