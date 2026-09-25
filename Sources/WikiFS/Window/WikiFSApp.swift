@@ -466,14 +466,23 @@ struct WikiFSApp: App {
         appDelegate.operationNotifier = notifier
 
         // File Provider setup + change bridge (async).
+        // Each step logs, because every one of them can finish or stall
+        // silently, and domain registration (with the WIKIFS_REENUMERATE
+        // reset) only happens at the end.
         Task {
+            DebugLog.fileprovider("launch setup: started")
             if let warning = await FileProviderSetupVerifier.verifyAndRepairInstalledProvider() {
+                DebugLog.fileprovider("launch setup: provider check warning — \(warning.reason)")
                 fileProviderSetupWarning = warning
                 showingFileProviderSetupWarning = true
+            } else {
+                DebugLog.fileprovider("launch setup: provider check OK")
             }
             await fileProvider.migrateDomainsIfNeeded(
                 wikiIDs: registry.wikis.map(\.id))
+            DebugLog.fileprovider("launch setup: schema migration check done")
             await registry.registerAllDomains()
+            DebugLog.fileprovider("launch setup: domain registration done")
 
             let bridge = WikiChangeBridge(registry: registry, fileProvider: fileProvider)
             bridge.sessionLookup = { [sessionManager] wikiID in

@@ -143,11 +143,14 @@ enum FileProviderSetupVerifier {
             arguments: arguments,
             outputMode: .combined)
 
+        DebugLog.fileprovider("provider check: pluginkit \(arguments.joined(separator: " "))")
         do {
             let result = try await runCommand(request)
             let text = String(data: result.combinedData, encoding: .utf8) ?? ""
+            DebugLog.fileprovider("provider check: pluginkit exited \(result.terminationStatus)")
             return ProcessResult(exitCode: result.terminationStatus, output: text)
         } catch {
+            DebugLog.fileprovider("provider check: pluginkit failed — \(error.localizedDescription)")
             return ProcessResult(exitCode: 1, output: error.localizedDescription)
         }
     }
