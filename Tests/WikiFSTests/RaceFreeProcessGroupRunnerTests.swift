@@ -91,22 +91,12 @@ struct RaceFreeProcessGroupRunnerTests {
         #expect(await processIsGone(childPID))
     }
 
+    /// Finds the fixture in either SwiftPM build layout: the native
+    /// `.build/<triple>/debug/` and Swift Build's `.build/out/Products/Debug/`.
     private func fixtureExecutable() throws -> URL {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let buildRoot = root.appendingPathComponent(".build", isDirectory: true)
-        let candidates = try FileManager.default.contentsOfDirectory(
-            at: buildRoot,
-            includingPropertiesForKeys: [.isDirectoryKey])
-            .map { $0.appendingPathComponent("debug/ExtractorProcessFixture") }
-        guard let executable = candidates.first(where: {
-            FileManager.default.isExecutableFile(atPath: $0.path)
-        }) else {
-            throw TestFailure("fixture executable is missing below \(buildRoot.path)")
-        }
-        return executable
+        try ManagedExtractorFixtureLocator.locate(
+            name: "ExtractorProcessFixture",
+            repositoryRootFilePath: #filePath)
     }
 
     private func childPID(from stream: AsyncStream<Data>) async throws -> Int32 {
