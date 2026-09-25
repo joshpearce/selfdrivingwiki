@@ -30,7 +30,18 @@ struct WikiFSApp: App {
     /// `RootScene` calls `sessionManager.session(for:descriptor:)` to resolve
     /// its session. Replaces the former `@State session` + `SessionRef`.
     @State private var sessionManager: SessionManager
-    @State private var fileProvider = FileProviderFacade()
+    /// The one File Provider facade for this process.
+    ///
+    /// The `@State` default used to be `FileProviderFacade()`, which runs
+    /// once per `WikiFSApp` value. Launch code reads `fileProvider` from
+    /// `init` and from closures that capture `self` before SwiftUI installs
+    /// its state, so different call sites got different facades. The one
+    /// `wire(into:)` handed to the registry was freed soon after, and its
+    /// `[weak self]` closures then skipped every domain register, remove, and
+    /// rename without a word (so `WIKIFS_REENUMERATE` never reset anything).
+    /// A static instance makes every read return the same object.
+    private static let sharedFileProvider = FileProviderFacade()
+    @State private var fileProvider = WikiFSApp.sharedFileProvider
     @State private var installedRendererHost: InstalledRendererHost
     /// Stable provider facade resolved by the app process profile.
     @State private var agentProviderServices: MutableAgentProviderServices
