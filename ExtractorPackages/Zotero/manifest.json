@@ -1,0 +1,81 @@
+{
+  "capabilities": [
+    "network",
+    "shared-runtime-cache"
+  ],
+  "displayName": "Zotero Attachment",
+  "entryPoint": "bin/zotero-extractor",
+  "files": [
+    {
+      "digest": "322147fa4e1a9c918e2517be2f1bda452f86a5e87488edabba94e6310144ed1c",
+      "path": "PROVENANCE.md"
+    },
+    {
+      "digest": "3f3707e0f7fda78dc24d44cfe269e156a2e00031b427e870f93ae77e75831160",
+      "path": "bin/zotero"
+    },
+    {
+      "digest": "2d79916a205fc2483080ab0956bdfc45d1b6b82d9bbce940346ac16cd0d7edfc",
+      "path": "bin/zotero-extractor"
+    }
+  ],
+  "launch": {
+    "arguments": [
+      "run",
+      "--script"
+    ],
+    "command": "uv",
+    "mode": "runtime"
+  },
+  "limits": {
+    "maximumDurationMilliseconds": 600000,
+    "maximumInputByteCount": 1048576,
+    "maximumMarkdownOutputByteCount": 134217728,
+    "maximumProgressEventCount": 64
+  },
+  "manifestRevision": 3,
+  "packageID": "org.selfdrivingwiki.zotero",
+  "protocolRevision": 4,
+  "registrations": [
+    {
+      "credentialRequirements": [
+        {
+          "id": "zotero-api-key",
+          "kind": "secret",
+          "label": "Zotero API Key",
+          "optional": false,
+          "purpose": "Read your Zotero library and download attachment files."
+        }
+      ],
+      "displayName": "Zotero Attachment",
+      "id": "attachment",
+      "kinds": [
+        "zotero"
+      ],
+      "mimeTypes": [
+        "application/zotero"
+      ],
+      "sync": {
+        "configFileName": "zotero-config.json",
+        "fields": [
+          {
+            "name": "libraryID",
+            "required": true
+          },
+          {
+            "isList": true,
+            "name": "attachments",
+            "required": true
+          }
+        ],
+        "itemValidation": {
+          "alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+          "maximumLength": 8,
+          "minimumLength": 8
+        },
+        "urlTemplate": "https://api.zotero.org/users/{libraryID}/items/{itemKey}/file"
+      }
+    }
+  ],
+  "version": "1.0.2"
+}

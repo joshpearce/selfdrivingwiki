@@ -6,6 +6,29 @@ public enum ExtractorKind: String, Codable, CaseIterable, Hashable, Sendable {
     case pdf
     case html
     case docx
+    /// URL-backed podcast transcript conversion. The source input is a
+    /// normalized HTTP or HTTPS URL carried by the request, never staged
+    /// bytes (`podcast-transcript` on the wire).
+    case podcastTranscript = "podcast-transcript"
+    /// Apple Podcasts episode TTML transcript conversion. Same `remote-url`
+    /// request shape as `podcastTranscript`, a separate operation family:
+    /// the package may run the Apple AMP + TTML workflow through staged
+    /// host support, or fall back to the RSS transcript algorithm
+    /// (`apple-podcast-transcript` on the wire).
+    case applePodcastTranscript = "apple-podcast-transcript"
+    /// URL-backed YouTube caption conversion. Same `remote-url` request
+    /// shape as the podcast transcript kinds, a separate operation family:
+    /// the package fetches only the captions YouTube exposes for the video
+    /// and never downloads media or runs speech-to-text
+    /// (`youtube-transcript` on the wire).
+    case youtubeTranscript = "youtube-transcript"
+    /// Zotero attachment acquisition. Same `remote-url` request shape as
+    /// the transcript kinds, a separate operation family: the package
+    /// downloads one attachment file plus its item metadata from the Zotero
+    /// Web API and never converts formats. Markdown attachments are the
+    /// result itself; PDF/HTML attachments ride the revision-4 bytes result
+    /// (`zotero` on the wire).
+    case zotero
 }
 
 public enum ExtractorLaunchMode: String, Codable, CaseIterable, Hashable, Sendable {
@@ -21,6 +44,9 @@ public enum ExtractorCapability: String, Codable, CaseIterable, Hashable, Sendab
 
 public enum ExtractorInputTransport: String, Codable, CaseIterable, Hashable, Sendable {
     case operationFile = "operation-file"
+    /// Protocol revision 3: the request carries one normalized HTTP or HTTPS
+    /// source URL in `remoteURL` instead of a staged input file.
+    case remoteURL = "remote-url"
 }
 
 public enum ExtractorEventKind: String, Codable, CaseIterable, Hashable, Sendable {

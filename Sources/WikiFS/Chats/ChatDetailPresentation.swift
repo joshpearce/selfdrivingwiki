@@ -19,10 +19,7 @@ struct ChatDetailPresentation {
         let runningKind: WikiOperation.Kind?
         let preflightError: String?
         let pendingPermissions: [PendingPermission]
-        let runStartedAt: Date?
-        let transcript: ChatDisplayTranscript
-        let exitStatus: Int32?
-
+        let projectionInput: TranscriptProjectionInput
     }
 
     struct Controls {
@@ -52,7 +49,6 @@ struct ChatDetailPresentation {
     let preflightBannerMessage: String?
     let showsThinkingIndicator: Bool
     let outlineEntries: [ChatOutlineEntry]
-    let chatInspectorAvailable: Bool
 
     static func make(
         chatID: ChatID?,
@@ -60,19 +56,46 @@ struct ChatDetailPresentation {
         showsInternals: Bool,
         remoteSession: RemoteState,
         persistedTranscriptItems: [PersistedChatTranscriptItem],
+        pendingOutgoing: [PendingOutgoingMessage] = [],
+        authoritativeTurnIDs: Set<ChatTurnID> = [],
         queuedMessages: [PendingQueuedMessage],
         hasDraftText: Bool,
-        isChatOperationConfigured: Bool
+        isChatOperationConfigured: Bool,
+        toolCallDisplayMode: ChatToolCallDisplayMode = .summary
     ) -> Self {
         let isLiveChat = chatID.map {
             remoteSession.sessionChatID == $0 && remoteSession.runState.isLive
         } ?? false
-        let displayTranscript = isLiveChat
-            ? remoteSession.transcript
-            : ChatDisplayProjection.project(
-                items: persistedTranscriptItems.map(\.item),
-                activeContentBlock: nil
-            ).transcript
+        // An echo retires the moment authoritative data carries its turn —
+        // the session overlay, the persisted transcript, or both.
+        let visiblePendingOutgoing = pendingOutgoing
+            .filter { authoritativeTurnIDs.contains($0.id) == false }
+        let echoItems = outgoingEchoItems(from: visiblePendingOutgoing)
+        // A matching live session normally owns the transcript. During
+        // rehydration, however, liveness can arrive before its history mirror.
+        // Keep the populated durable snapshot until the live projection has at
+        // least one item; otherwise the visible transcript and outline briefly
+        // collapse to empty. A genuinely new chat has no durable items, so its
+        // empty live projection remains authoritative.
+        let usesLiveTranscript = isLiveChat
+            && (!remoteSession.projectionInput.items.isEmpty || persistedTranscriptItems.isEmpty)
+        let transcriptItems = usesLiveTranscript
+            ? remoteSession.projectionInput.items
+            : persistedTranscriptItems.map(\.item)
+        let activeContentBlock = usesLiveTranscript
+            ? remoteSession.projectionInput.activeContentBlock
+            : nil
+        // Canonical first (one row per durable item — what Activity renders),
+        // then the human-facing presentation projection for this surface.
+        let canonicalTranscript = ChatDisplayProjection.project(
+            items: transcriptItems + echoItems,
+            activeContentBlock: activeContentBlock
+        ).transcript
+        let displayTranscript = ChatTranscriptPresentationProjection.project(
+            transcript: canonicalTranscript,
+            toolCallDisplayMode: toolCallDisplayMode
+        )
+        let isDraftSubmitPending = chatID == nil && pendingOutgoing.contains { $0.isSubmitting }
         let controls = Controls(
             showsDebugControls: showsDebugControls(
                 runState: remoteSession.runState,
@@ -90,17 +113,37 @@ struct ChatDetailPresentation {
             isChatOperationConfigured: isChatOperationConfigured
         )
         let canSend = canSendPredicate(
-            hasMount: true,
             runState: remoteSession.runState,
             hasDraftText: hasDraftText,
-            isChatOperationConfigured: isChatOperationConfigured
+            isChatOperationConfigured: isChatOperationConfigured,
+            isDraftSubmitPending: isDraftSubmitPending
         )
-        let outlineEntries = buildOutlineEntries(
+        let projectedOutlineEntries = buildOutlineEntries(
             displayTranscript: displayTranscript,
-            cachedResponseSummaries: isLiveChat
+            responseSummaries: usesLiveTranscript
                 ? [:]
-                : cachedResponseSummaries(from: persistedTranscriptItems)
+                : responseSummaries(from: persistedTranscriptItems)
         )
+        let outlineEntries: [ChatOutlineEntry]
+        if isLiveChat, projectedOutlineEntries.isEmpty, !persistedTranscriptItems.isEmpty {
+            // The live projection may become nonempty before its committed
+            // history contains a prompt-bearing turn. Keep the last complete
+            // durable outline through that partial rehydration frame while the
+            // transcript itself remains live-authoritative.
+            let persistedDisplayTranscript = ChatTranscriptPresentationProjection.project(
+                transcript: ChatDisplayProjection.project(
+                    items: persistedTranscriptItems.map(\.item),
+                    activeContentBlock: nil
+                ).transcript,
+                toolCallDisplayMode: toolCallDisplayMode
+            )
+            outlineEntries = buildOutlineEntries(
+                displayTranscript: persistedDisplayTranscript,
+                responseSummaries: responseSummaries(from: persistedTranscriptItems)
+            )
+        } else {
+            outlineEntries = projectedOutlineEntries
+        }
         let contentState: ContentState
         if showsInternals && controls.showsDebugControls {
             contentState = .internals
@@ -131,9 +174,9 @@ struct ChatDetailPresentation {
                 isEnabled: composerEnabled,
                 caption: composerCaptionText(
                     runState: remoteSession.runState,
-                    hasChatID: chatID != nil,
                     isLiveChat: isLiveChat,
-                    isChatOperationConfigured: isChatOperationConfigured
+                    isChatOperationConfigured: isChatOperationConfigured,
+                    isDraftSubmitPending: isDraftSubmitPending
                 ),
                 canSend: canSend,
                 sendButtonTitle: sendButtonTitle(
@@ -160,8 +203,7 @@ struct ChatDetailPresentation {
                 isLiveChat: isLiveChat
             ),
             showsThinkingIndicator: transcriptIsAnswering,
-            outlineEntries: outlineEntries,
-            chatInspectorAvailable: !outlineEntries.isEmpty
+            outlineEntries: outlineEntries
         )
     }
 
@@ -170,6 +212,39 @@ struct ChatDetailPresentation {
             return "Ask a question, or ask the Agent to update the wiki…"
         }
         return isLiveChat ? "Ask a question to start a chat." : "No messages were persisted for this chat."
+    }
+
+    /// Transcript items for view-local outgoing echoes. Identity follows the
+    /// reducer's optimistic convention (`ChatClientSync.optimisticSubmit`): one
+    /// user message named `optimistic-<turnID>`, plus — once the send has
+    /// failed — a typed transport-failure row for the same turn. The failure
+    /// row uses the same durable vocabulary failed agent turns use, so the
+    /// renderer needs no echo-specific production change.
+    static func outgoingEchoItems(from pending: [PendingOutgoingMessage]) -> [ChatTranscriptItem] {
+        pending.flatMap { message -> [ChatTranscriptItem] in
+            let echoMessage = ChatTranscriptItem.message(
+                ChatTranscriptMessageItem(
+                    messageID: ChatMessageID(rawValue: "optimistic-\(message.id.rawValue)"),
+                    turnID: message.id,
+                    role: .user,
+                    text: message.wireMessage,
+                    createdAt: message.submittedAt
+                )
+            )
+            guard case .failed(let failureMessage) = message.status else {
+                return [echoMessage]
+            }
+            return [
+                echoMessage,
+                .turnFailure(ChatTranscriptTurnFailureItem(
+                    failureID: ChatTranscriptFailureID(rawValue: "send-failed-\(message.id.rawValue)"),
+                    turnID: message.id,
+                    category: .transportError,
+                    message: failureMessage,
+                    createdAt: message.submittedAt
+                )),
+            ]
+        }
     }
 
     static func transcriptIsAnswering(isLiveChat: Bool, runState: ChatRunState) -> Bool {
@@ -193,22 +268,31 @@ struct ChatDetailPresentation {
 
     static func buildOutlineEntries(
         displayTranscript: ChatDisplayTranscript,
-        cachedResponseSummaries: [ChatMessageID: String] = [:]
+        responseSummaries: [ChatMessageID: String] = [:]
     ) -> [ChatOutlineEntry] {
         displayTranscript.sections.compactMap { section -> ChatOutlineEntry? in
             guard case .turn(let turn) = section,
                   let prompt = turn.prompt else { return nil }
-            let response = turn.rows.first { row in
+            // The turn's LAST assistant block is the answer (earlier blocks
+            // are interim notes in Summary mode), so the outline excerpts
+            // the answer, not a progress note.
+            let response = turn.rows.last { row in
                 if case .assistantMessage = row { return true }
                 return false
             }
-            let cachedSummary: String?
+            // v54 (#1266): the cached summary lives on the durable transcript
+            // row and was stripped of preamble at derivation time — no
+            // display-time preamble compensation. Absent summaries fall back
+            // to on-the-fly extraction from the (already cleaned) assistant
+            // row text.
+            let responseSummary: String?
             if case .assistantMessage(let responseID, _, _, _, _) = response {
-                cachedSummary = cachedResponseSummaries[responseID]
+                responseSummary = responseSummaries[responseID]
+                    .flatMap { $0.isEmpty ? nil : $0 }
             } else {
-                cachedSummary = nil
+                responseSummary = nil
             }
-            let summary = cachedSummary ?? response.map {
+            let summary = responseSummary ?? response.map {
                 ChatSummary.summaryExtract(from: $0.textForSearch, maxLength: 200)
             }
             return ChatOutlineEntry(
@@ -221,16 +305,15 @@ struct ChatDetailPresentation {
         }
     }
 
-    /// Summary cache and display row identity meet only at the persisted
-    /// transcript boundary. `cachedResponseSummary` was joined by cursor/seq;
-    /// this extracts the transcript message ID from that same row rather than
-    /// converting the unrelated compatibility `chat_messages.id` namespace.
-    private static func cachedResponseSummaries(
+    /// Summary and display row identity meet only at the persisted transcript
+    /// boundary. Since v54 (#1266) the summary lives on the transcript item
+    /// itself; this keys it by the transcript message ID the display row uses.
+    private static func responseSummaries(
         from persistedItems: [PersistedChatTranscriptItem]
     ) -> [ChatMessageID: String] {
         var summaries: [ChatMessageID: String] = [:]
         for persistedItem in persistedItems {
-            guard let summary = persistedItem.cachedResponseSummary,
+            guard let summary = persistedItem.summary,
                   case .message(let message) = persistedItem.item,
                   message.role == .assistant
             else { continue }
@@ -252,13 +335,15 @@ struct ChatDetailPresentation {
 
     static func composerCaptionText(
         runState: ChatRunState,
-        hasChatID: Bool,
         isLiveChat: Bool,
-        isChatOperationConfigured: Bool
+        isChatOperationConfigured: Bool,
+        isDraftSubmitPending: Bool = false
     ) -> String? {
-        _ = hasChatID
         if isChatOperationConfigured == false {
             return "Configure an enabled provider and model in Settings → Providers before sending."
+        }
+        if isDraftSubmitPending {
+            return "Starting chat…"
         }
         if runState == .queued {
             return "Waiting for the other session to finish before sending…"
@@ -272,16 +357,16 @@ struct ChatDetailPresentation {
     }
 
     static func canSendPredicate(
-        hasMount: Bool,
         runState: ChatRunState,
         hasDraftText: Bool,
-        isChatOperationConfigured: Bool
+        isChatOperationConfigured: Bool,
+        isDraftSubmitPending: Bool = false
     ) -> Bool {
-        _ = hasMount
         return isChatOperationConfigured
             && !runState.isAnswering
             && runState != .queued
             && hasDraftText
+            && isDraftSubmitPending == false
     }
 
     private static func showsStopButton(

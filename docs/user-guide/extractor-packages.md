@@ -1,8 +1,8 @@
 # Extractor packages
 
-An extractor package converts one source format to Markdown. The app uses extractor packages when it converts a PDF, HTML, or Word source and produces a Markdown page. A package is one folder that contains `manifest.json` and the files the manifest declares.
+An extractor package converts one source format to Markdown. The app uses extractor packages when it converts a PDF, HTML, or Word source, transcribes a podcast feed, and produces a Markdown page. A package is one folder that contains `manifest.json` and the files the manifest declares.
 
-This Mac ships with four reviewed packages:
+This Mac ships with five reviewed packages:
 
 | Package | Format | What it does | Runtime it needs |
 | --- | --- | --- | --- |
@@ -10,6 +10,65 @@ This Mac ships with four reviewed packages:
 | pdf2md | PDF | Converts a PDF to Markdown. It can download its model. | [uv](https://docs.astral.sh/uv/) |
 | Docling Serve | PDF | Sends the PDF to your self-hosted [Docling Serve](https://github.com/DS4SD/docling-serve) and stores the Markdown it returns. Optional API token; endpoint and timeout are set in Settings. | [`python3`](https://www.python.org) |
 | docx2md | Word (.docx) | Converts a Word document to Markdown offline at import. **Extract** retries a failed conversion. | [Bun](https://bun.sh) |
+| Podcast Transcript | Podcast feed | Fetches the feed and converts the published `<podcast:transcript>` attachment to Markdown. Network access only. | [uv](https://docs.astral.sh/uv/) |
+
+### Podcast feed transcripts
+
+Add a podcast feed URL and the source stays byteless until you transcribe.
+The Transcribe action enqueues the job through the extraction queue, and the
+reviewed Podcast Transcript package fetches the feed, selects the published
+`<podcast:transcript>` attachment, and converts VTT, SRT, HTML, or plain
+text to Markdown.
+
+- The package needs [uv](https://docs.astral.sh/uv/). If uv is missing, the
+  job fails with setup guidance instead of running something else.
+- The route is a standard row in Settings → Extraction → Default Extractors.
+  The choice "No default (disable podcast transcripts)" turns RSS podcast
+  transcription off; it does not fall back to another extractor.
+- The transcript is stored as an alternative with the exact package version
+  in its provenance, linked to the source's first version. Re-transcribing
+  appends a new alternative; earlier ones are kept.
+- A failed fetch (no transcript published, network error, timeout) writes
+  nothing and reports a short cause.
+- Apple Podcasts episodes have their own reviewed package. It converts
+  Apple's TTML transcript when the signed helper is available, and it falls
+  back to the RSS transcript algorithm when it is not. A missing helper is
+  a supported state, not an error: the package keeps working through RSS.
+
+### Apple Podcasts episodes
+
+Ingest an `podcasts.apple.com` episode link and the source stays byteless
+until you transcribe, exactly like a podcast feed.
+
+- The reviewed `apple-podcast-transcript` package serves the route. When the
+  host has staged the signed token helper for it (developer builds), the
+  package fetches Apple's transcript (bearer token → metadata → TTML) and
+  converts it to Markdown.
+- When no helper is staged (for example an App Store build), the package
+  uses the RSS transcript algorithm instead. If the feed publishes no
+  transcript, the fetch fails with a short cause and nothing is written.
+- The choice "No default (disable Apple Podcasts transcripts)" turns Apple
+  transcription off; the Transcribe action then reports a typed failure.
+
+### YouTube videos
+
+Paste a YouTube watch, `youtu.be`, Shorts, or embed link and the source
+stays byteless until you transcribe.
+
+- The reviewed `youtube-transcript` package serves the route. It fetches the
+  captions YouTube exposes through the `youtube-transcript-api` library and
+  converts them to Markdown.
+- The package prefers manually created captions over auto-generated ones.
+  If the preferred language has no captions, it uses the first available
+  track.
+- Some videos have no captions, disable them, or block requests. YouTube
+  uses an undocumented interface that can change, and it can block
+  requests. Each of these cases is a short typed failure; nothing is
+  written.
+- The package never downloads video and never runs speech-to-text. A video
+  without captions cannot be transcribed by this route.
+- The choice "No default (disable YouTube transcripts)" turns YouTube
+  transcription off; the Transcribe action then reports a typed failure.
 
 ### Word documents (.docx)
 
@@ -32,6 +91,91 @@ sources.
 - A `.docx` source is not staged to agents until it has a Markdown version.
   The raw bytes are a binary zip with no value as agent context.
 
+### Zotero attachments
+
+Zotero acquisition runs through the reviewed `zotero` package. You name the
+attachment keys; the package downloads the files from your Zotero library
+through the Zotero Web API and never converts formats.
+
+Configure two things:
+
+1. **API key** — **Settings → Extraction → Packages**, then **Configure…** on
+   the Zotero Attachment row. Paste the key into the **Zotero API Key** value
+   row. The key lives in your Keychain. It is resolved per download through
+   the seeded authorization; it is never written to a config file, a queue
+   item, or a log.
+2. **Library ID + attachment keys** — `zotero-config.json` in the App Group
+   container:
+
+   ```json
+   {
+     "libraryID": "12345",
+     "attachments": ["ABCD1234", "WXYZ9876"]
+   }
+   ```
+
+   Each entry is one Zotero ATTACHMENT item key (8 characters, uppercase
+   letters and digits). An old `zoteroDirOverride` key in the file is
+   ignored and never written again.
+
+Zotero is not special-cased for this: packages declare their sync config.
+The file name above, the URL shape, and the key rules all come from the
+package's manifest (`sync` on the registration, manifest revision 3), so a
+second syncable package works through the same command with no host
+changes. The command discovers syncable packages from the machine catalog
+and lists them when you name one it does not know.
+
+Then run `wikictl extractor sync zotero`:
+
+- Every configured key becomes one byteless `.zotero` source whose URL is
+  the Zotero file endpoint. The command writes a durable extraction job for
+  each new source and prints that job's stable ID. The app or the wikid
+  daemon drains the job on its next dispatch scan — the CLI does not wait,
+  and "request accepted" never means the extraction has finished.
+- A key that already has a source is skipped, and the output says whether
+  that source's extraction has completed. A zero-byte placeholder with no
+  Markdown reports `source exists; extraction not completed` — not "already
+  synced". `--force` re-enqueues the extraction instead (for example after
+  you changed the file in Zotero).
+- An unconfigured library ID, an empty attachment list, or a missing API
+  key exits nonzero with a typed message. If the queue rejects a request
+  before it becomes a job, the message names the source and the `--force`
+  retry that enqueues it.
+
+## Inspecting extraction jobs
+
+`wikictl job list` prints every queue job for the selected wiki, newest
+first, including finished and failed ones. `wikictl job get --id <job-id>`
+prints one job. Both accept `--json` for stable machine-readable fields:
+
+- `id` — the job ID that `extractor sync` printed when it enqueued.
+- `queue` — the queue kind, for example `extraction`.
+- `state` — `queued`, `running`, `completed`, `failed`, or `cancelled`.
+- `sourceIDs` — the sources the job processes.
+- `attempt` — the attempt count.
+- `failureReason` — the recorded error, or null.
+- `extractionCompleted` — true when every source of an extraction job has
+  a processed Markdown version. A completed job implies it; a source can
+  also be complete without any job (for example, extracted in the app).
+
+Both commands are read-only: they never create, migrate, or checkpoint the
+queue database, so they are safe while the app runs and after it quits.
+
+What a download produces:
+
+- `text/markdown` or `text/plain` attachments (or a `.md` file) become the
+  source's Markdown version directly.
+- `application/pdf` and `text/html` attachments (or `.pdf` / `.html` files)
+  are stored as the source's bytes, and the app runs your normal PDF or
+  HTML route on them — the same pdf2md / Docling / Defuddle selection as any
+  other file. The Markdown appears as a derived version.
+- The parent item's key and title are kept on the source, so the "From
+  Zotero" provenance and the `zotero://` deep link work as before.
+- `linked_file` and `linked_url` attachments are typed failures: Zotero
+  does not serve files for links.
+- Re-syncing changed bytes creates a new content version. Identical bytes
+  never duplicate a version.
+
 The app installs the packages into a machine catalog the first time it runs. You do not enable a package for each wiki. Every compatible installed package is available to every wiki on this Mac.
 
 ## Trust
@@ -47,7 +191,7 @@ The capability list in a manifest (network, shared caches, model download) is a 
 
 ## Selection and route status
 
-Open **Settings** → **Extraction** and use the **Default Extractors** section. The table has one row for each extraction route. The current routes are PDF, HTML, and Word (.docx). A registration can add a row for a new format without an app update. Formats without a route do not have an extraction adapter yet.
+Open **Settings** → **Extraction** and use the **Default Extractors** section. The table has one row for each extraction route. The current routes are PDF, HTML, Word (.docx), and Podcast transcript. A registration can add a row for a new format without an app update. Formats without a route do not have an extraction adapter yet.
 
 Each row has four columns:
 

@@ -67,13 +67,29 @@ struct ExtractorRouteTableBuilderTests {
                     mimeTypes: ["text/html"]),
             ])
         let rows = ExtractorRouteTableBuilder.build(input)
-        // Host PDF + HTML + DOCX, plus the saved future route. The HTML
-        // registration covers the canonical HTML route and adds no new row.
-        #expect(rows.count == 4)
-        #expect(rows.map(\.route) == [.canonicalPDF, .canonicalHTML, .canonicalDOCX, futureRoute])
-        #expect(rows[3].savedSelection == ExtractorRouteHostCatalog.acpReference)
+        // Host PDF + HTML + DOCX + all three transcript routes, plus the
+        // saved future route. The HTML registration covers the canonical HTML
+        // route and adds no new row. The Apple and YouTube route rows come
+        // from the bundled default-route records (the reviewed
+        // apple-podcast-transcript and youtube-transcript lineages), saved as
+        // unavailable when no registration is active.
+        #expect(rows.count == 7)
+        #expect(rows.map(\.route) == [
+            .canonicalPDF, .canonicalHTML, .canonicalDOCX, .canonicalPodcastTranscript,
+            .canonicalApplePodcastTranscript, .canonicalYouTubeTranscript,
+            futureRoute,
+        ])
+        let appleRow = try #require(
+            rows.first { $0.route == .canonicalApplePodcastTranscript })
+        #expect(appleRow.savedSelection == nil)
+        let youtubeRow = try #require(
+            rows.first { $0.route == .canonicalYouTubeTranscript })
+        #expect(youtubeRow.savedSelection == nil)
+        let futureRow = try #require(rows.first { $0.route == futureRoute })
+        // The saved future route keeps its host (ACP) selection identity.
+        #expect(futureRow.savedSelection == ExtractorRouteHostCatalog.acpReference)
         // No host execution exists for a future route.
-        #expect(rows[3].resolvedSelection == nil)
+        #expect(futureRow.resolvedSelection == nil)
     }
 
     @Test func rowsSortDeterministically() throws {
@@ -96,8 +112,12 @@ struct ExtractorRouteTableBuilderTests {
         // typed route order; identical inputs produce identical rows.
         #expect(first.map(\.route) == second.map(\.route))
         #expect(first == second)
-        #expect(first.map(\.route).prefix(3) == [.canonicalPDF, .canonicalHTML, .canonicalDOCX])
-        #expect(first.dropFirst(3).map(\.route) == first.dropFirst(3).map(\.route).sorted())
+        #expect(first.map(\.route).prefix(6)
+            == [
+                .canonicalPDF, .canonicalHTML, .canonicalDOCX, .canonicalPodcastTranscript,
+                .canonicalApplePodcastTranscript, .canonicalYouTubeTranscript,
+            ])
+        #expect(first.dropFirst(6).map(\.route) == first.dropFirst(6).map(\.route).sorted())
     }
 
     @Test func unknownMIMEUsesStableGenericLabel() throws {
@@ -117,10 +137,31 @@ struct ExtractorRouteTableBuilderTests {
             Issue.record("Expected a row for the registration-declared MIME type")
             return
         }
-        #expect(extra.descriptor.displayName == "application/vnd.exam+x")
+        #expect(extra.descriptor.displayName == "X Tracts")
         #expect(extra.descriptor.systemImage == nil)
         #expect(extra.choices.count == 1)
         #expect(extra.choices[0].displayName == "X Tracts")
+    }
+
+    /// A registration snapshot whose displayName is blank (possible only
+    /// outside manifest validation) must not produce a blank row label: the
+    /// name is treated as absent and the route falls back to its MIME type.
+    @Test func blankRegistrationNameFallsBackToTheMIMELabel() throws {
+        let input = ExtractorRouteTableBuilder.Input(
+            configuration: ExtractionConfig(),
+            registrations: [
+                try snapshot(
+                    packageID: "org.example.blank",
+                    version: "1.0.0",
+                    digestHex: digest(5),
+                    displayName: "   ",
+                    kinds: [.pdf],
+                    mimeTypes: ["application/vnd.blank+x"]),
+            ])
+        let rows = ExtractorRouteTableBuilder.build(input)
+        let extra = try #require(
+            rows.first { $0.route.mimeType.rawValue == "application/vnd.blank+x" })
+        #expect(extra.descriptor.displayName == "application/vnd.blank+x")
     }
 
     // MARK: - AC.7: exact version deduplication

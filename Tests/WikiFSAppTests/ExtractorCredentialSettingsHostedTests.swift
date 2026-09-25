@@ -104,6 +104,57 @@ struct ExtractorCredentialSettingsHostedTests {
         #expect(docling == doclingToken)
     }
 
+    /// Regression (the zotero authorize loop): the reviewed Zotero lineage
+    /// must bind to the legacy Zotero API-key credential — the same
+    /// reference publish-time seeding grants and the Zotero account pane
+    /// writes. The authorize action once fell through to the hashed
+    /// package-scoped reference, re-pointing seeded grants at an empty
+    /// location and leaving the route "not authorized" no matter how often
+    /// the user clicked Authorize.
+    @Test func zoteroBindingUsesTheReviewedZoteroCredential() throws {
+        let zoteroSummary = ExtractorCredentialRequirementSummary(
+            packageID: ReviewedExtractorPackages.zotero.packageID.rawValue,
+            packageName: "Zotero",
+            packageVersion: "1.0.0",
+            registrationID: "attachment",
+            requirementID: "zotero-api-key",
+            label: "Zotero API Key",
+            purpose: "Read your Zotero library and download attachment files.",
+            isOptional: false,
+            isConfigured: true,
+            sourceName: "Keychain",
+            authorizationState: .needsAuthorization,
+            kinds: ["zotero"],
+            mimeTypes: ["application/zotero"])
+        let bound = try #require(
+            ExtractorCredentialSettingsSupport.bindingReference(for: zoteroSummary))
+        #expect(bound == .zoteroAPIKey())
+    }
+
+    /// Security review HIGH-1 (zotero leg): an impostor package declaring
+    /// `zotero-api-key` gets a package-scoped reference — never the reserved
+    /// Zotero credential.
+    @Test func zoteroCredentialIsReservedForTheReviewedLineage() throws {
+        let impostor = ExtractorCredentialRequirementSummary(
+            packageID: "com.attacker.tools",
+            packageName: "Attacker Tools",
+            packageVersion: "1.0.0",
+            registrationID: "attachment",
+            requirementID: "zotero-api-key",
+            label: "Zotero API Key",
+            purpose: "Read your Zotero library.",
+            isOptional: false,
+            isConfigured: true,
+            sourceName: "Keychain",
+            authorizationState: .needsAuthorization,
+            kinds: ["zotero"],
+            mimeTypes: ["application/zotero"])
+        let bound = try #require(
+            ExtractorCredentialSettingsSupport.bindingReference(for: impostor))
+        #expect(bound != .zoteroAPIKey())
+        #expect(bound != CredentialReference.extraction(.doclingServeToken))
+    }
+
     /// Security review L-9: distinct package IDs never collide on one
     /// package-scoped reference (the old dot-flattening made
     /// `org.evil.foo` and `org-evil.foo` share a reference).
@@ -212,9 +263,17 @@ struct ExtractorCredentialSettingsHostedTests {
             digestPrefix: String(doclingRevision.digest.hex.prefix(12)),
             registrationID: "document",
             revision: doclingRevision)
+        // Docling Serve configures through the package table now: its row
+        // yields the candidate whose Configure… opens the service dialog.
         #expect(ExtractionSettingsView.packageConfigurationID(
             for: doclingRow,
-            requirements: [doclingRequirement]) == nil)
+            requirements: [doclingRequirement]) == ExtractionSettingsView.ExtractorPackageConfigurationID(
+                packageID: doclingRevision.packageID.rawValue,
+                version: doclingRevision.version.rawValue,
+                registrationID: "document"))
+        #expect(ExtractionSettingsView.packageConfigurationID(
+            for: doclingRow,
+            requirements: []) == nil)
     }
 
     @Test func removedTopLevelCredentialSectionDoesNotReturn() throws {
@@ -249,6 +308,38 @@ struct ExtractorCredentialSettingsHostedTests {
                 "Sources/WikiFS/Sources/ExtractorCredentialSettingsSupport.swift"),
             encoding: .utf8)
         #expect(supportSource.contains("ExtractorCredentialAuthorizationWriter(") == false)
+    }
+
+    /// Source contract: the per-package credential VALUE surface is generic
+    /// and write-only. It binds through the same `bindingReference` policy
+    /// the authorize action uses, writes normalized values only, and never
+    /// resolves one; and no extractor kind keeps a host-owned account pane.
+    @Test func packageCredentialValueSurfaceStaysGenericAndWriteOnly() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let viewSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/WikiFS/Sources/ExtractionSettingsView.swift"),
+            encoding: .utf8)
+
+        // The generic, manifest-driven value rows exist and route through
+        // the shared binding policy.
+        #expect(viewSource.contains("PackageCredentialValuesSection"))
+        #expect(viewSource.contains("PackageCredentialValueRow"))
+        #expect(viewSource.contains("ExtractorCredentialSettingsSupport.bindingReference(for:"))
+        #expect(viewSource.contains("CredentialValue.normalized"))
+        #expect(viewSource.contains("credentials.set(value, for: reference)"))
+        #expect(viewSource.contains("credentials.unset(reference)"))
+
+        // Write-only: describe and write, never resolve a value into the UI.
+        #expect(viewSource.contains("credentials.resolve") == false)
+
+        // Kind neutrality: no host-owned account pane survives for any one
+        // extractor kind.
+        #expect(viewSource.contains("ZoteroSettingsView") == false)
+        #expect(viewSource.contains("case .zotero:") == false)
     }
 }
 #endif

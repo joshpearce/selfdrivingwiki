@@ -1,3 +1,5 @@
+// pattern: Imperative Shell
+
 import AppKit
 import WikiFSEngine
 import SwiftUI
@@ -6,11 +8,14 @@ import WikiFSCore
 
 extension ChatDisplayRowID {
     /// Prefixes make the DOM namespace explicit even where raw durable IDs
-    /// happen to share the same string representation.
+    /// happen to share the same string representation. The group prefix is
+    /// distinct from the single-tool prefix, so `toolgroup-x` and `tool-x`
+    /// can never alias the same element.
     var domValue: String {
         switch self {
         case .message(let id): "message-\(id.rawValue)"
         case .toolCall(let id): "tool-\(id.rawValue)"
+        case .toolCallGroup(let id): "toolgroup-\(id.rawValue)"
         case .notice(let id): "notice-\(id.rawValue)"
         case .failure(let id): "failure-\(id.rawValue)"
         }
@@ -19,6 +24,10 @@ extension ChatDisplayRowID {
     init?(domValue: String) {
         if domValue.hasPrefix("message-") {
             self = .message(ChatMessageID(rawValue: String(domValue.dropFirst("message-".count))))
+        } else if domValue.hasPrefix("toolgroup-") {
+            self = .toolCallGroup(ChatToolCallGroupID(
+                rawValue: String(domValue.dropFirst("toolgroup-".count))
+            ))
         } else if domValue.hasPrefix("tool-") {
             self = .toolCall(ToolCallID(rawValue: String(domValue.dropFirst("tool-".count))))
         } else if domValue.hasPrefix("notice-") {
@@ -68,6 +77,140 @@ enum TranscriptID: Hashable, Sendable {
     case queueItem(QueueItem.ID)
 }
 
+/// Chat transcript web view with native macOS actions for resolved wiki links
+/// (issue #1315). WebKit does not expose the hovered URL to `willOpenMenu`, so
+/// the coordinator keeps `hoveredLinkHref` current through the reader's
+/// injected hover-listener script + message bridge (same document contract,
+/// separate web view → no interference).
+///
+/// The view only emits typed intents (the URL under the cursor) and carries
+/// host-supplied ``WikiLinkMenuCapabilities`` — opaque closures, never the
+/// store. It holds no navigation authority of its own: plain clicks and
+/// ⌘-clicks keep flowing through `decidePolicyFor` unchanged, and a capability
+/// the host does not supply means the corresponding menu item is omitted.
+@MainActor
+final class ChatTranscriptWebView: WKWebView {
+    /// The href under the cursor, kept current by the injected
+    /// `mouseover`/`mouseenter` listener. Read synchronously in `willOpenMenu`.
+    var hoveredLinkHref: String?
+    /// Open the hovered link in a new foreground tab (⌘-click parity). The
+    /// representable wires this to `.openWikiLink(url, inNewTab: true)`.
+    var onOpenInNewTab: (@MainActor (URL) -> Void)?
+    /// Open the hovered link in a background tab. The representable wires
+    /// this to `.openWikiLinkInBackground(url)`.
+    var onOpenInBackgroundTab: (@MainActor (URL) -> Void)?
+    /// Reader-parity actions for the link menu, supplied by the host and
+    /// REFRESHED on every `updateNSView` — the Activity window's store appears
+    /// and disappears as wiki windows open and close, so a value captured at
+    /// `makeNSView` would freeze menus against a dead store. `.none` keeps
+    /// only the URL-only tab actions.
+    var linkMenuCapabilities: WikiLinkMenuCapabilities = .none
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+
+        // Same WebKit built-ins the reader removes: new-window navigation is
+        // unsupported (the app uses tabs), and Download/Copy no-op or expose a
+        // raw `wiki://` URL for our custom schemes. Remove before inserting so
+        // the menu is clean regardless of what WebKit shipped this release.
+        // WebKit's own Share menu stays: chat external links keep the native
+        // Share (the reader replaces it with a File-Provider-backed one).
+        let removeIDs: Set<String> = [
+            "WKMenuItemIdentifierOpenLinkInNewWindow",
+            "WKMenuItemIdentifierDownloadLinkedFile",
+            "WKMenuItemIdentifierCopyLink",
+        ]
+        menu.items.removeAll { removeIDs.contains($0.identifier?.rawValue ?? "") }
+        collapseMenuSeparators(menu)
+
+        guard let href = hoveredLinkHref, !href.isEmpty,
+              let url = URL(string: href)
+        else { return }
+        // Same-page anchors scroll the reader document, not a transcript —
+        // WebKit's plain menu is right for them.
+        guard !WikiLinkMarkdown.isSamePageAnchor(url) else { return }
+
+        let resolvedKind = WikiLinkMarkdown.resolvedKind(from: url)
+        let isExternalHTTP = url.scheme == "http" || url.scheme == "https"
+        // A composed link menu is built for three kinds, each gated on the
+        // capabilities the host supplies: resolved wiki links (tab actions +
+        // Add Bookmark… / Find Similar…), unresolved links (Suggest…), and
+        // external http(s) links (Add as Source). Anything else — mailto:,
+        // anchors — keeps the plain WebKit menu.
+        guard resolvedKind != nil || isExternalHTTP
+                || url.scheme == WikiLinkMarkdown.scheme
+        else { return }
+
+        if resolvedKind != nil {
+            // Insert directly after WebKit's "Open Link" (which routes the
+            // plain click), mirroring where the reader places its custom
+            // items. A trailing separator groups them apart from the rest.
+            let insertionIndex = menu.items.firstIndex {
+                $0.identifier?.rawValue == "WKMenuItemIdentifierOpenLink"
+            }.map { $0 + 1 } ?? 0
+
+            let newTab = NSMenuItem.wikiItem("Open in New Tab") { [weak self] in
+                self?.onOpenInNewTab?(url)
+            }
+            newTab.image = NSImage(systemSymbolName: "plus.rectangle.on.rectangle",
+                                   accessibilityDescription: "Open in New Tab")
+            let background = NSMenuItem.wikiItem("Open in Background") { [weak self] in
+                self?.onOpenInBackgroundTab?(url)
+            }
+            background.image = NSImage(systemSymbolName: "dock.arrow.down.rectangle",
+                                       accessibilityDescription: "Open in Background")
+            menu.insertItem(newTab, at: insertionIndex)
+            menu.insertItem(background, at: insertionIndex + 1)
+            menu.insertItem(NSMenuItem.separator(), at: insertionIndex + 2)
+
+            // Bottom group (Share…, Find Similar…) INSIDE the custom group —
+            // inserted at the separator's index so the separator trails the
+            // whole group, exactly the reader's topology:
+            // … Open in Background → Share… → — → Find Similar… → — → WebKit.
+            // Inserting after the separator would leave Find Similar… bare
+            // against WebKit's own items.
+            let clickPoint = convert(event.locationInWindow, from: nil)
+            let bottom = WikiLinkMenuNSItems.items(
+                for: url, actions: WikiLinkMenuBuilder.bottomActions(for: url),
+                capabilities: linkMenuCapabilities,
+                anchorView: self,
+                anchorRect: NSRect(x: clickPoint.x, y: clickPoint.y, width: 1, height: 1))
+            for item in bottom.reversed() { menu.insertItem(item, at: insertionIndex + 2) }
+        }
+
+        // Reader-parity actions from the capability seam, prepended above
+        // WebKit's items with a trailing separator — the reader's convention
+        // for its custom group. Missing capabilities yield no items here, so
+        // a degraded host's menu is exactly the URL-only one.
+        let parity = WikiLinkMenuNSItems.items(for: url, capabilities: linkMenuCapabilities)
+        if !parity.isEmpty {
+            menu.insertItem(NSMenuItem.separator(), at: 0)
+            for item in parity.reversed() { menu.insertItem(item, at: 0) }
+        }
+    }
+
+    /// Remove leading, trailing, and consecutive separators from `menu` so the
+    /// built-in removals above never leave an orphaned divider. (Same cleanup
+    /// as `WikiReaderWebView`.)
+    private func collapseMenuSeparators(_ menu: NSMenu) {
+        var lastWasSeparator = true // treat start-of-menu as "after separator"
+        var i = 0
+        while i < menu.items.count {
+            let item = menu.items[i]
+            if item.isSeparatorItem {
+                if lastWasSeparator {
+                    menu.removeItem(at: i)
+                    continue
+                }
+                lastWasSeparator = true
+            } else {
+                lastWasSeparator = false
+            }
+            i += 1
+        }
+    }
+}
+
 struct ChatWebView: NSViewRepresentable {
     let chatRows: [ChatDisplayRow]
     /// A stable typed transcript identity prevents mutations for one chat or
@@ -105,6 +248,12 @@ struct ChatWebView: NSViewRepresentable {
     var quoteAnchor: ChatHighlightRequest? = nil
 
     var onChatIntent: ((ChatTranscriptIntent) -> Void)? = nil
+    /// Reader-parity link-menu actions the host can supply, carried as opaque
+    /// closures (see ``WikiLinkMenuCapabilities``). Refreshed on every
+    /// `updateNSView` — like `blobStore`, it goes stale when a wiki window
+    /// opens or closes under an Activity-window row. Defaults to `.none`,
+    /// which keeps only the URL-only tab actions.
+    var linkMenuCapabilities: WikiLinkMenuCapabilities = .none
 
     /// Name of the `WKScriptMessage` channel the per-bubble "Copy" button posts
     /// to (issue #285). The JS click listener calls
@@ -121,7 +270,8 @@ struct ChatWebView: NSViewRepresentable {
         blobStore: WikiStoreModel? = nil,
         zoom: Double = Double(ZoomScale.defaultScale),
         scrollRequest: ChatWebScrollRequest? = nil,
-        quoteAnchor: ChatHighlightRequest? = nil
+        quoteAnchor: ChatHighlightRequest? = nil,
+        linkMenuCapabilities: WikiLinkMenuCapabilities = .none
     ) {
         self.chatRows = chatRows
         self.transcriptID = transcriptID
@@ -131,6 +281,7 @@ struct ChatWebView: NSViewRepresentable {
         self.scrollRequest = scrollRequest
         self.quoteAnchor = quoteAnchor
         self.onChatIntent = onChatIntent
+        self.linkMenuCapabilities = linkMenuCapabilities
     }
 
     func makeNSView(context: Context) -> WKWebView {
@@ -147,10 +298,20 @@ struct ChatWebView: NSViewRepresentable {
         let cc = WKUserContentController()
         cc.add(context.coordinator, name: Self.copyMessageName)
         cc.add(context.coordinator, name: Self.followMessageName)
+        // Hover bridge for the link context menu (#1315): the reader's proven
+        // hover-listener script posts the `<a>` href under the cursor to the
+        // `linkHover` channel. Each web view has its own content controller,
+        // so reusing the reader's script + name here cannot collide — and a
+        // fix to the shared script benefits both surfaces.
+        cc.add(context.coordinator, name: WikiReaderWebView.linkHoverName)
+        cc.addUserScript(WKUserScript(
+            source: WikiReaderWebView.hoverListenerJS,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true))
         config.userContentController = cc
         let blobHandler = BlobSchemeHandler(store: blobStore)
         config.setURLSchemeHandler(blobHandler, forURLScheme: BlobSchemeHandler.scheme)
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = ChatTranscriptWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.underPageBackgroundColor = .clear
@@ -158,6 +319,9 @@ struct ChatWebView: NSViewRepresentable {
         webView.allowsBackForwardNavigationGestures = false
         context.coordinator.webView = webView
         context.coordinator.onChatIntent = onChatIntent
+        webView.onOpenInNewTab = { url in onChatIntent?(.openWikiLink(url, inNewTab: true)) }
+        webView.onOpenInBackgroundTab = { url in onChatIntent?(.openWikiLinkInBackground(url)) }
+        webView.linkMenuCapabilities = linkMenuCapabilities
         context.coordinator.renderContext = renderContext
         context.coordinator.reload(chatRows: chatRows, transcriptID: transcriptID)
         return webView
@@ -167,6 +331,14 @@ struct ChatWebView: NSViewRepresentable {
         webView.pageZoom = zoom
         context.coordinator.onChatIntent = onChatIntent
         context.coordinator.renderContext = renderContext
+        if let transcriptWebView = webView as? ChatTranscriptWebView {
+            transcriptWebView.onOpenInNewTab = { url in onChatIntent?(.openWikiLink(url, inNewTab: true)) }
+            transcriptWebView.onOpenInBackgroundTab = { url in onChatIntent?(.openWikiLinkInBackground(url)) }
+            // Refresh per update: an Activity-window row's store appears and
+            // disappears with its wiki window, and a value frozen at
+            // makeNSView would keep right-clicking the dead store.
+            transcriptWebView.linkMenuCapabilities = linkMenuCapabilities
+        }
         // Keep the blob handler's store fresh (a wiki switch swaps the store).
         if let handler = webView.configuration.urlSchemeHandler(forURLScheme: BlobSchemeHandler.scheme) as? BlobSchemeHandler {
             handler.store = blobStore
@@ -479,6 +651,10 @@ struct ChatWebView: NSViewRepresentable {
             _ userContentController: WKUserContentController,
             didReceive message: WKScriptMessage
         ) {
+            if message.name == WikiReaderWebView.linkHoverName {
+                (webView as? ChatTranscriptWebView)?.hoveredLinkHref = message.body as? String
+                return
+            }
             guard message.name == ChatWebView.copyMessageName,
                   let text = message.body as? String
             else {
@@ -556,6 +732,20 @@ struct ChatWebView: NSViewRepresentable {
                 </article>
                 """
 
+            case .assistantInterim(_, _, let text, _, let contentState):
+                // A non-final assistant block: one-line expandable note, so
+                // the turn reads question → compact work rows → final answer.
+                let state = contentState == .streaming ? "streaming" : "completed"
+                let preview = String(text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
+                let previewShort = preview.count > ChatTranscriptPresentationMetrics.reasoningPreviewLength
+                    ? String(preview.prefix(ChatTranscriptPresentationMetrics.reasoningPreviewLength)) + "…"
+                    : preview
+                return """
+                <details class="row chat-row row-thinking chat-interim collapsible\(contentState == .streaming ? " is-streaming" : "")" role="group" aria-label="Interim note, \(state)"\(attributes)>
+                <summary data-focus-key="disclosure" aria-label="Show interim note, \(state)"><span class="row-status" aria-hidden="true">\(contentState == .streaming ? "◌" : "✓")</span> <span class="row-thinking-label">Note</span> <span class="row-thinking-preview">\(escape(previewShort))</span></summary>
+                <div class="row-thinking-body">\(renderedMarkdown(text, context: context, isFinal: contentState == .final))</div></details>
+                """
+
             case .reasoning(_, _, let text, _, let contentState):
                 let state = contentState == .streaming ? "streaming" : "completed"
                 let preview = String(text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
@@ -568,17 +758,18 @@ struct ChatWebView: NSViewRepresentable {
                 <div class="row-thinking-body">\(renderedMarkdown(text, context: context, isFinal: contentState == .final))</div></details>
                 """
 
-            case .toolCall(_, _, let toolName, let status, let detail, let output, _, _):
-                let statusText = toolStatusLabel(status)
-                let isError = status == .failed || status == .cancelled
-                let summaryText = toolSummary(descriptor: detail, output: output, fallback: toolName)
-                let outputText = toolDetailPayload(output ?? detail ?? "")
-                let cue = isError ? "⚠" : (status == .running || status == .pending ? "◌" : "✓")
-                return """
-                <details class="row chat-row chat-tool\(isError ? " is-error" : "")\((status == .running || status == .pending) ? " is-running" : "")" role="group" aria-label="Tool \(escape(toolName)), \(statusText)"\(attributes)>
-                <summary data-focus-key="disclosure" aria-label="Show tool details for \(escape(toolName)), \(statusText)"><span class="row-status" aria-hidden="true">\(cue)</span> <span class="chat-tool-name">\(escape(toolName))</span><span class="chat-tool-summary">\(escape(statusText))\(summaryText.isEmpty ? "" : " — \(escape(summaryText))")</span></summary>
-                \(outputText.isEmpty ? "" : "<pre class=\"chat-tool-detail\">\(escape(outputText))</pre>")</details>
-                """
+            case .toolCall(let call):
+                return Self.toolCallDetailsHTML(
+                    call,
+                    identityAttributes: attributes,
+                    cssClasses: "row chat-row chat-tool"
+                )
+
+            case .toolCallGroup(let group):
+                let rowID = htmlAttributeEscape(row.id.domValue)
+                let groupAttributes =
+                    " data-row-id=\"\(rowID)\"\(turnAttribute)"
+                return Self.toolCallGroupHTML(group, attributes: groupAttributes, context: context)
 
             case .notice(_, _, _, let title, let message, _):
                 return """
@@ -590,6 +781,68 @@ struct ChatWebView: NSViewRepresentable {
                 <aside class="row row-turn-failed" role="alert" aria-label="Chat action failed"\(attributes)><span class="row-turn-failed-icon" aria-hidden="true">⚠︎</span><div class="row-turn-failed-body"><strong>Chat action failed</strong> \(escape(message))</div></aside>
                 """
             }
+        }
+
+        /// The shared per-call markup. Used both by the canonical single-tool
+        /// row (identity = the root `data-row-id` protocol) and by children
+        /// inside a group row (identity = the child-only `data-tool-call-id`
+        /// attribute, never the root protocol). Formatting and escaping stay
+        /// in this one place.
+        private static func toolCallDetailsHTML(
+            _ call: ChatDisplayToolCall,
+            identityAttributes: String,
+            cssClasses: String
+        ) -> String {
+            let statusText = toolStatusLabel(call.status)
+            let isError = call.status == .failed || call.status == .cancelled
+            let summaryText = toolSummary(descriptor: call.detail, output: call.output, fallback: call.toolName)
+            let outputText = toolDetailPayload(call.output ?? call.detail ?? "")
+            let cue = isError ? "⚠" : (call.status == .running || call.status == .pending ? "◌" : "✓")
+            return """
+            <details class="\(cssClasses)\(isError ? " is-error" : "")\((call.status == .running || call.status == .pending) ? " is-running" : "")" role="group" aria-label="Tool \(escape(call.toolName)), \(statusText)"\(identityAttributes)>
+            <summary data-focus-key="disclosure" aria-label="Show tool details for \(escape(call.toolName)), \(statusText)"><span class="row-status" aria-hidden="true">\(cue)</span> <span class="chat-tool-name">\(escape(call.toolName))</span><span class="chat-tool-summary">\(escape(statusText))\(summaryText.isEmpty ? "" : " — \(escape(summaryText))")</span></summary>
+            \(outputText.isEmpty ? "" : "<pre class=\"chat-tool-detail\">\(escape(outputText))</pre>")</details>
+            """
+        }
+
+        /// One collapsed tool-activity row: a stable host identity, the
+        /// deterministic category phrase, text+symbol state, and every child
+        /// call in the expanded body. The detail area is height-bounded and
+        /// scrolls (`CSS` in `shellHTML`).
+        private static func toolCallGroupHTML(
+            _ group: ChatToolCallGroupRow,
+            attributes: String,
+            context: WikiRenderContext?
+        ) -> String {
+            let state = group.state
+            let phrase = group.summary.phrase
+            let summaryPhrase = phrase.isEmpty
+                ? escape(state.text)
+                : "\(escape(phrase)) — \(escape(state.text))"
+            // Total count, failure count, and state in one deterministic label.
+            let ariaLabel = "Tool activity, "
+                + "\(group.calls.count) tool call\(group.calls.count == 1 ? "" : "s"), "
+                + state.text
+            let children = group.reasoning.map { entry in
+                let streaming = entry.contentState == .streaming
+                return """
+                <div class="chat-tool-group-reasoning\(streaming ? " is-streaming" : "")" data-reasoning-id="\(htmlAttributeEscape(entry.id.rawValue))"><span class="row-status" aria-hidden="true">\(streaming ? "◌" : "✓")</span> \(renderedMarkdown(entry.text, context: context, isFinal: !streaming))</div>
+                """
+            }
+            .joined()
+                + group.calls.map { call in
+                    toolCallDetailsHTML(
+                        call,
+                        identityAttributes: " data-tool-call-id=\"\(htmlAttributeEscape(call.id.rawValue))\"",
+                        cssClasses: "chat-tool chat-tool-child"
+                    )
+                }
+                .joined()
+            return """
+            <details class="row chat-row chat-tool-group\(state.isActive ? " is-running" : "")" role="group" aria-label="\(escape(ariaLabel))"\(attributes)>
+            <summary data-focus-key="disclosure" aria-label="Show tool activity, \(escape(ariaLabel))"><span class="row-status" aria-hidden="true">\(state.symbol)</span> <span class="chat-tool-group-label">Tool activity</span><span class="chat-tool-group-summary">\(summaryPhrase)</span></summary>
+            <div class="chat-tool-group-detail">\(children)</div></details>
+            """
         }
 
         /// Returns a collapsed descriptor without mutating durable output. New
@@ -952,6 +1205,67 @@ struct ChatWebView: NSViewRepresentable {
             white-space: pre-wrap; word-break: break-word;
             max-height: 200px; overflow-y: auto;
           }
+          /* Collapsed tool-activity group (Summary mode): one row per
+             contiguous run. Colors come only from the semantic variables so
+             light and dark follow the system appearance. */
+          .chat-tool-group {
+            display: block; font-size: 11.5px; color: var(--muted);
+            margin: 0 0 10px; padding: 2px 2px;
+            background: var(--code-bg); border: 1px solid var(--border);
+            border-radius: 6px;
+          }
+          .chat-tool-group > summary {
+            display: grid; grid-template-columns: auto auto minmax(0, 1fr);
+            align-items: baseline; column-gap: 6px;
+            list-style: none; cursor: pointer; padding: 3px 4px;
+          }
+          .chat-tool-group > summary::-webkit-details-marker { display: none; }
+          .chat-tool-group[open] > summary .chat-tool-group-summary::before {
+            content: "▾ "; opacity: 0.5;
+          }
+          .chat-tool-group:not([open]) > summary .chat-tool-group-summary::before {
+            content: "▸ "; opacity: 0.5;
+          }
+          .chat-tool-group-label {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-weight: 600; color: var(--text);
+          }
+          .chat-tool-group-summary {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            min-width: 0; overflow-wrap: anywhere;
+          }
+          /* A failed child call is surfaced by its own red text inside the
+             expanded body; the group row itself stays neutral — the summary
+             already carries "N failed" text and the warning symbol. */
+          /* Expanded body: every child call, height-bounded so one huge run
+             cannot take over the transcript. */
+          .chat-tool-group-detail {
+            margin: 2px 0 0; padding: 4px 6px;
+            border-top: 1px solid var(--border);
+            max-height: 400px; overflow-y: auto;
+          }
+          .chat-tool-child {
+            display: block; padding: 2px 0;
+            border-bottom: 1px solid var(--border);
+          }
+          .chat-tool-child:last-child { border-bottom: none; }
+          /* Reasoning folded into a group's expanded body: dim, italic,
+             never counted in the summary phrase. */
+          .chat-tool-group-reasoning {
+            font-size: 11px; font-style: italic; color: var(--muted);
+            padding: 2px 0; border-bottom: 1px solid var(--border);
+            white-space: pre-wrap; word-break: break-word;
+          }
+          .chat-tool-group-reasoning .row-status { font-style: normal; }
+          /* Paragraphs stay block-level: a folded reasoning entry can hold
+             several bolded step lines, and inline flow would concatenate
+             them into one unreadable run. */
+          .chat-tool-group-reasoning p { margin: 0; }
+          .chat-tool-group-reasoning.is-streaming { opacity: 0.85; }
+          /* Interim assistant notes (Summary mode): one-line expandable
+             disclosures so only the turn's final answer renders expanded. */
+          .chat-row.chat-interim { font-size: 11.5px; }
+          .chat-interim > summary .row-thinking-label { text-transform: none; }
           p { margin: 0 0 0.6em; }
           p:last-child { margin-bottom: 0; }
           h1, h2, h3, h4, h5, h6 { line-height: 1.25; font-weight: 600; margin: 0.7em 0 0.3em; }
@@ -1127,9 +1441,14 @@ struct ChatWebView: NSViewRepresentable {
             var active = document.activeElement;
             var focusKey = active && oldRow.contains(active) ? active.getAttribute('data-focus-key') : null;
             var offsets = selectionOffsets(oldRow);
+            // Disclosure state must survive a same-identity replacement: a
+            // live group grows (or changes status) while the user has it
+            // expanded, and the expansion must not reset.
+            var wasOpen = oldRow.tagName === 'DETAILS' ? oldRow.open : null;
             oldRow.outerHTML = html;
             var newRow = document.querySelector('[data-row-id="' + CSS.escape(rowID) + '"]');
             if (!newRow) return renderAcknowledgement('replace', revision, rowID, 'missingRow');
+            if (wasOpen !== null && newRow.tagName === 'DETAILS') newRow.open = wasOpen;
             if (focusKey) {
               var replacementFocus = newRow.querySelector('[data-focus-key="' + CSS.escape(focusKey) + '"]');
               if (replacementFocus) replacementFocus.focus({preventScroll:true});
@@ -1171,6 +1490,22 @@ struct ChatWebView: NSViewRepresentable {
             if (!summary) return;
             var details = summary.closest('details');
             if (!details) return;
+            details.open = !details.open;
+          });
+          // Keyboard disclosure for tool-activity groups: when a group
+          // summary holds focus, unmodified Space toggles it instead of
+          // scrolling the page. preventDefault suppresses the native
+          // default (scroll, or the engine's own toggle) so the group
+          // toggles exactly once; Return keeps its native behavior.
+          document.addEventListener('keydown', function(e) {
+            if (e.key !== ' ' && e.code !== 'Space') return;
+            if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+            var summary = e.target && e.target.closest
+              ? e.target.closest('.chat-tool-group > summary') : null;
+            if (!summary) return;
+            var details = summary.closest('details');
+            if (!details) return;
+            e.preventDefault();
             details.open = !details.open;
           });
         </script>

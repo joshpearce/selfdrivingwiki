@@ -661,7 +661,7 @@ struct EditorTabTests {
         model.openTab(.page(b.id))
         #expect(model.tabs.count == 2)
 
-        model.delete(a.id)
+        try model.delete(a.id, unlinkIncomingLinks: false)
         #expect(model.tabs.count == 1)
         #expect(model.tabs[0].selection == .page(b.id))
     }
@@ -678,7 +678,7 @@ struct EditorTabTests {
         model.openTab(.page(b.id))
         // Active is B.
 
-        model.delete(b.id)
+        try model.delete(b.id, unlinkIncomingLinks: false)
         #expect(model.tabs.count == 1)
         #expect(model.activeTabID == tabA)
         #expect(model.tabs[0].selection == .page(a.id))
@@ -697,7 +697,7 @@ struct EditorTabTests {
         let activeBefore = model.activeTabID
 
         // Delete C — not open in any tab.
-        model.delete(c.id)
+        try model.delete(c.id, unlinkIncomingLinks: false)
         #expect(model.tabs.count == 2)
         #expect(model.activeTabID == activeBefore)
     }
@@ -715,7 +715,7 @@ struct EditorTabTests {
         model.openTab(.source(f1.id))
         #expect(model.tabs.count == 2)
 
-        model.deleteSource(f1.id)
+        try model.deleteSource(f1.id, unlinkIncomingLinks: false)
         #expect(model.tabs.count == 1)
         #expect(model.tabs[0].selection == .page(a.id))
     }
@@ -761,7 +761,7 @@ struct EditorTabTests {
         model.rename(a.id, to: "Renamed A")
         #expect(model.tabs[0].title == "Renamed A")  // page A
         #expect(model.tabs[1].title == "B")          // page B unchanged
-        #expect(model.tabs[2].title == "Chat")        // Chat tab unchanged
+        #expect(model.tabs[2].title == "New Chat")    // Chat tab unchanged
     }
 
     // MARK: - newPageInNewTab
@@ -855,7 +855,7 @@ struct EditorTabTests {
 
     @Test func tabTitleForSpecialSelections() throws {
         let (model, _) = try tempModel()
-        #expect(model.tabTitle(for: .newChat) == "Chat")
+        #expect(model.tabTitle(for: .newChat) == "New Chat")
         #expect(model.tabTitle(for: .changeLog) == "Activity")
     }
 

@@ -1,5 +1,6 @@
 import Foundation
 import WikiFSCore
+import WikiFSMarkdown
 
 // pattern: Functional Core
 
@@ -54,9 +55,72 @@ public enum ExtractorRouteTableBuilder {
     }
 
     public static func build(_ input: Input) -> [ExtractorRouteSettingsRow] {
-        let routes = descriptors(for: input).map(\.route)
-        return routes.map { route in
-            buildRow(route: route, input: input)
+        // The descriptor list is the single source of route identity and
+        // display names: rows carry the descriptor they were built from and
+        // never re-derive one, so the list and the rows cannot disagree.
+        descriptors(for: input).map { descriptor in
+            buildRow(descriptor: descriptor, input: input)
+        }
+    }
+
+    /// All matching active registrations for a source input, in the same
+    /// deterministic order `activeRegistration` uses for its primary pick.
+    /// The Raw Source affordance uses this to offer every matching
+    /// extractor, not just the primary.
+    public static func activeRegistrations(
+        mimeType: String?,
+        filenameExtension: String?,
+        registrations: [ExtractorRouteRegistrationSnapshot]
+    ) -> [ExtractorRouteRegistrationSnapshot] {
+        let normalizedMIME = mimeType?.lowercased()
+        let normalizedExtension = filenameExtension?.lowercased()
+        return registrations
+            .filter { registration in
+                let matchesMIME = normalizedMIME.map { value in
+                    registration.mimeTypes.contains { mime in mime.rawValue == value }
+                } ?? false
+                let matchesExtension = normalizedExtension.map { value in
+                    registration.filenameExtensions.contains { ext in ext.rawValue == value }
+                } ?? false
+                return matchesMIME || matchesExtension
+            }
+            .sorted {
+                ($0.packageName, $0.displayName, $0.reference) <
+                ($1.packageName, $1.displayName, $1.reference)
+            }
+    }
+
+    /// Returns the deterministic primary active registration for a source
+    /// input. This uses the same manifest-declared MIME/extension surface as
+    /// the Settings route table, but excludes unavailable catalog entries by
+    /// accepting only the active `registrations` collection.
+    public static func activeRegistration(
+        mimeType: String?,
+        filenameExtension: String?,
+        registrations: [ExtractorRouteRegistrationSnapshot]
+    ) -> ExtractorRouteRegistrationSnapshot? {
+        activeRegistrations(
+            mimeType: mimeType,
+            filenameExtension: filenameExtension,
+            registrations: registrations)
+            .first
+    }
+
+    /// Queue-execution backend that force-runs one reviewed package. This is
+    /// invocation data — the same (kind, package) pairs
+    /// `ProcessExtractionServices.executionKey` resolves to reviewed package
+    /// lineages — not extractor policy: WHICH extractors are offered still
+    /// comes from the registration snapshots. A package without a legacy
+    /// execution backend returns nil and runs with the configured route
+    /// default.
+    public static func executionBackend(
+        for registration: ExtractorRouteRegistrationSnapshot
+    ) -> ExtractionBackend? {
+        guard registration.kinds.contains(.pdf) else { return nil }
+        switch registration.reference.revision.packageID.rawValue {
+        case "org.selfdrivingwiki.pdf2md": return .localPdf2md
+        case "org.selfdrivingwiki.docling-serve": return .doclingServe
+        default: return nil
         }
     }
 
@@ -81,17 +145,23 @@ public enum ExtractorRouteTableBuilder {
             extra.append(record.route)
         }
         // Deterministic: typed route order (kind raw value, then MIME raw value).
-        descriptors.append(contentsOf: extra.sorted().map(ExtractorRouteHostCatalog.genericDescriptor(for:)))
+        descriptors.append(contentsOf: extra.sorted().map { route in
+            ExtractorRouteDescriptor(
+                route: route,
+                displayName: registrationDisplayName(for: route, in: input.availableRegistrations)
+                    ?? route.mimeType.rawValue,
+                systemImage: nil)
+        })
         return descriptors
     }
 
     // MARK: - Row construction
 
     private static func buildRow(
-        route: ExtractorRouteID,
+        descriptor: ExtractorRouteDescriptor,
         input: Input
     ) -> ExtractorRouteSettingsRow {
-        let descriptor = descriptor(for: route, input: input)
+        let route = descriptor.route
         let savedSelection = input.configuration.extractorSelection(for: route)
         let choices = buildChoices(route: route, input: input, savedSelection: savedSelection)
         // Resolver compatibility is route-scoped: only registrations declaring
@@ -115,9 +185,28 @@ public enum ExtractorRouteTableBuilder {
             status: status)
     }
 
-    private static func descriptor(for route: ExtractorRouteID, input: Input) -> ExtractorRouteDescriptor {
-        ExtractorRouteHostCatalog.descriptors.first { $0.route == route }
-            ?? ExtractorRouteHostCatalog.genericDescriptor(for: route)
+    /// The display name package data gives one route: the lexicographically
+    /// smallest registration displayName among the registrations whose
+    /// declared kinds × MIME types cover the route, so the result never
+    /// depends on snapshot order. Blank names are treated as absent — the
+    /// manifest gate rejects them, but a snapshot built any other way
+    /// degrades to the MIME fallback instead of tripping the descriptor's
+    /// precondition in a settings render path.
+    private static func registrationDisplayName(
+        for route: ExtractorRouteID,
+        in registrations: [ExtractorRouteRegistrationSnapshot]
+    ) -> String? {
+        registrations
+            .filter { snapshot in
+                snapshot.kinds.contains { kind in
+                    snapshot.mimeTypes.contains { mimeType in
+                        ExtractorRouteID(kind: kind, mimeType: mimeType) == route
+                    }
+                }
+            }
+            .map(\.displayName)
+            .filter { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }
+            .min()
     }
 
     private static func buildChoices(

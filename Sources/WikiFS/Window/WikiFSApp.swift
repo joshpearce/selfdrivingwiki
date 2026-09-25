@@ -80,7 +80,7 @@ struct WikiFSApp: App {
     private var queueStoreError: String? { localQueueRuntimeController.startupError }
     /// Drives the Settings TabView selection so the activity windows can open
     /// Settings on the relevant tab (gear button → extraction/agents config).
-    @AppStorage("settings.selectedTab") private var settingsSelectedTabRaw = SettingsTab.zotero.rawValue
+    @AppStorage("settings.selectedTab") private var settingsSelectedTabRaw = SettingsTab.extraction.rawValue
     /// Per-app appearance override (Light / Dark / System). Shared key with
     /// `AppearanceSettingsView`. Applied via `.preferredColorScheme` on every
     /// scene + `NSApp.appearance` for AppKit surfaces (NSAlert, menu bar).
@@ -93,7 +93,16 @@ struct WikiFSApp: App {
     /// app delegate) so wiki windows can be reopened from the status item
     /// when no windows are visible (accessory mode). Wired by
     /// `WindowBridgeProbe`, a hidden view inside the main `WindowGroup`.
-    @State private var openWindowBridge = OpenWindowBridge()
+    /// Process-wide window-opening bridge. Deliberately NOT `@State`:
+    /// SwiftUI re-creates the App struct, and a `@State` reference read from
+    /// a non-installed copy (the AppDelegate bootstrap closure, the windows'
+    /// `.task` fallbacks — all call `startStatusItem()`) yields a DISTINCT
+    /// freshly-initialized instance. The status item then holds a bridge no
+    /// `WindowBridgeProbe` ever wires, and every window-opening menu entry
+    /// silently no-ops. A static reference is shared by every copy by
+    /// construction, so the probe's wiring is always visible to the menu.
+    private static let sharedOpenWindowBridge = OpenWindowBridge()
+    private var openWindowBridge: OpenWindowBridge { Self.sharedOpenWindowBridge }
     /// Owns the open-windows list for the standard Window menu (issue #567).
     @State private var windowTracker: WindowListTracker
 
@@ -126,6 +135,10 @@ struct WikiFSApp: App {
         // the legacy key is set + valid. The legacy key is orphaned (not deleted)
         // — see `PermissionModeMigration` + `plans/acp-permissions.md` §5.3.
         PermissionModeMigration.migrateOnce()
+        // Tool-call display: migrate the legacy `chat.hideToolCalls` Boolean
+        // into the typed `chat.toolCallDisplayMode` key before any
+        // ChatDetailView reads it. Idempotent; the legacy key is orphaned.
+        ChatToolCallDisplayPreference.migrate(in: .standard)
         // Install the app-only PDFKit title extractor into Core's injectable
         // seam. Core must not import PDFKit (it pulls AppKit into the File
         // Provider extension on macOS 26), so the real implementation lives in
@@ -201,10 +214,11 @@ struct WikiFSApp: App {
         let processComposition = AppProcessPluginCatalog(
             containerDirectory: directory,
             transportBridge: transportBridge,
-            extractionProvider: { services in
+            extractionProvider: { services, queueDBURL in
                 AppQueueExtractionProvider(
                     extractionServices: services,
-                    sessionBox: sessionBox)
+                    sessionBox: sessionBox,
+                    queueDatabaseURL: queueDBURL)
             },
             makeIngestionProvider: { store, providerServices in
                 AppQueueIngestionProvider(
@@ -221,7 +235,10 @@ struct WikiFSApp: App {
         _extractionCoordinator = State(initialValue: coordinator)
         let extractionProvider = AppQueueExtractionProvider(
             extractionServices: extractionServices,
-            sessionBox: sessionBox)
+            sessionBox: sessionBox,
+            queueDatabaseURL: DebugLog.trying(
+                "resolve queue database URL",
+                operation: { try DatabaseLocation.queueDatabaseURL() }))
         let runtimeController = processComposition.queueController
         let transportOwner = processComposition.transportOwner
         let rendererOwner = processComposition.rendererOwner
@@ -275,7 +292,6 @@ struct WikiFSApp: App {
             searchRuntimeRegistry: searchRuntimeRegistry,
             providerServices: providerServices,
             htmlBackendResolver: { ExtractionConfig.load(from: directory).htmlSelectionLabel },
-            podcastBackendResolver: { ExtractionConfig.load(from: directory).podcastBackend },
             interactiveUsageRecorder: { [weak activityTracker] usage in
                 activityTracker?.recordInteractiveUsage(usage)
             },
@@ -291,7 +307,6 @@ struct WikiFSApp: App {
                     extractionProvider: extractionProvider,
                     searchRuntimeRegistry: searchRuntimeRegistry,
                     htmlBackendResolver: { ExtractionConfig.load(from: directory).htmlSelectionLabel },
-                    podcastBackendResolver: { ExtractionConfig.load(from: directory).podcastBackend },
                     interactiveUsageRecorder: { usage in
                         activityTracker?.recordInteractiveUsage(usage)
                     })
@@ -516,11 +531,27 @@ struct WikiFSApp: App {
         appDelegate.shutdownForTermination = { [
             daemonTransportCoordinator,
             sessionManager,
-            processProfileOwner
+            processProfileOwner,
+            containerDirectory
         ] in
             await daemonTransportCoordinator.shutdown()
             await sessionManager.shutdownSearchRuntimes()
             await processProfileOwner.shutdown()
+            // Remove this session's extractor operation directories. Each run
+            // leaves a private operation root (input/output/home/cache); a
+            // clean close is the moment to reclaim it. Stale sessions from
+            // crashes are reclaimed by the daemon at its startup.
+            do {
+                let layout = try ExtractorPackageStoreLayout(
+                    appGroupContainerRoot: containerDirectory,
+                    processRole: .app)
+                try ExtractorDirectoryValidator.cleanupOperationSessions(
+                    layout: layout,
+                    scope: .currentSession)
+            } catch {
+                DebugLog.extraction(
+                    "App close: extractor operation cleanup failed: \(error)")
+            }
         }
         appDelegate.unregisterDaemon = {
             // The daemon is a bundled XPC service — the system manages its
@@ -594,7 +625,7 @@ struct WikiFSApp: App {
             .background(WindowBridgeProbe(bridge: openWindowBridge))
             .appEnvironment(
                 tracker: activityTracker,
-                openActivityWindow: { [weak openWindowBridge] queue in openWindowBridge?.openActivityWindow?(queue) },
+                openActivityWindow: { queue in openWindowBridge.openActivityWindow?(queue) },
                 chatDaemon: chatDaemonHolder.coordinator,
                 healthMonitor: healthMonitor)
             .preferredColorScheme(appearanceColorScheme)
@@ -663,6 +694,16 @@ struct WikiFSApp: App {
             }
         }
         .windowToolbarStyle(.unified)
+        // Always PRESENT the main window at launch. Without this, a relaunch
+        // that restores a windowless session (quit with all windows closed)
+        // starts the app headless — only the status item exists — and the
+        // `OpenWindowBridge` closures are never created, because they only
+        // come into existence when the `WindowBridgeProbe`'s hosting window
+        // first appears. In that state every bridge-driven status-item entry
+        // (queue windows, wiki opens) silently no-ops until some other path
+        // opens a window (e.g. a Dock reopen). The closures survive a window
+        // CLOSE by design; this closes the never-opened gap.
+        .defaultLaunchBehavior(.presented)
         .commands {
             // Suppress the auto-generated File ▸ New Window command (Cmd-N).
             // This app is single-window per wiki; Cmd-N would open a broken
@@ -690,7 +731,7 @@ struct WikiFSApp: App {
             .background(WindowBridgeProbe(bridge: openWindowBridge))
             .appEnvironment(
                 tracker: activityTracker,
-                openActivityWindow: { [weak openWindowBridge] queue in openWindowBridge?.openActivityWindow?(queue) },
+                openActivityWindow: { queue in openWindowBridge.openActivityWindow?(queue) },
                 chatDaemon: chatDaemonHolder.coordinator,
                 healthMonitor: healthMonitor)
             .preferredColorScheme(appearanceColorScheme)
@@ -757,32 +798,45 @@ struct WikiFSApp: App {
         // opened via `openWindow(value:)` / `openWindowBridge.openQueueWindow`.
         // `WindowGroup(for:)` deduplicates by `==`, so re-opening a queue's
         // window focuses the existing one (#835). System-managed scene replaces
-        // the hand-built `NSWindow` — correct title-bar inset, frame persistence,
-        // and state restoration come for free.
+        // the hand-built `NSWindow` — correct title-bar inset and frame
+        // persistence come for free. Scene restoration is DISABLED by design:
+        // the queue windows must always start closed on launch and require an
+        // explicit open (menu item, CTA, or deep link) each session — they are
+        // transient monitors, not documents. Durable queue data and reports
+        // live in the store, unaffected.
         WindowGroup("Agent Queue", for: QueueKind.self) { $queue in
             ActivityWindowView(
                 queue: queue ?? .ingestion,
                 queueEngine: queueEngine,
                 activityTracker: activityTracker,
                 sessionManager: sessionManager,
+                wikiDescriptors: registry.wikis,
                 openWindowBridge: openWindowBridge
             )
             .appEnvironment(
                 tracker: activityTracker,
-                openActivityWindow: { [weak openWindowBridge] queue in
-                    openWindowBridge?.openQueueWindow?(queue)
+                openActivityWindow: { queue in
+                    openWindowBridge.openQueueWindow?(queue)
                 },
                 healthMonitor: healthMonitor)
             .preferredColorScheme(appearanceColorScheme)
         }
-        .defaultSize(width: 760, height: 500)
+        .defaultSize(width: 1040, height: 720)
         .windowResizability(.contentMinSize)
+        // Always start closed across app restarts (see above). Explicit
+        // opens during a session are unaffected — this only opts the scene
+        // out of launch-time state restoration.
+        .restorationBehavior(.disabled)
+        // A unified window toolbar makes the toolbar region structurally
+        // reserved, so the sidebar column's List always gets its top
+        // safe-area inset — sidebar rows can never scroll up under the
+        // traffic lights, even when the detail column's layout changes
+        // (belt-and-braces with the #835 `toolbarBackground` pin in
+        // `ActivityWindowView`).
+        .windowToolbarStyle(.unified)
 
         Settings {
             TabView(selection: settingsSelectedTab) {
-                ZoteroSettingsView(containerDirectory: containerDirectory)
-                    .tag(SettingsTab.zotero)
-                    .tabItem { Label("Zotero", systemImage: "books.vertical") }
                 ExtractionSettingsView(
                     containerDirectory: containerDirectory,
                     launcher: settingsLauncher,
@@ -835,8 +889,12 @@ struct WikiFSApp: App {
                             guard let reference = ExtractorCredentialSettingsSupport
                                 .bindingReference(for: summary)
                             else {
+                                DebugLog.extraction(
+                                    "credentials: authorize closure found NO binding reference for \(summary.packageID)/\(summary.requirementID)")
                                 return .failed("This requirement could not be authorized.")
                             }
+                            DebugLog.extraction(
+                                "credentials: authorize closure granting \(summary.packageID)/\(summary.requirementID) → \(reference.rawValue)")
                             let requirement = try ExtractorCredentialRequirement(
                                 id: ExtractorCredentialRequirementID(
                                     validating: summary.requirementID),
@@ -844,7 +902,7 @@ struct WikiFSApp: App {
                                 isOptional: summary.isOptional,
                                 label: summary.label,
                                 purpose: summary.purpose)
-                            _ = try await writer.grant(
+                            let snapshot = try await writer.grant(
                                 packageID: ExtractorPackageID(
                                     validating: summary.packageID),
                                 registrationID: ExtractorRegistrationID(
@@ -853,8 +911,12 @@ struct WikiFSApp: App {
                                 mimeTypes: summary.mimeTypes,
                                 requirement: requirement,
                                 credentialReference: reference)
+                            DebugLog.extraction(
+                                "credentials: grant written generation=\(snapshot.generation) records=\(snapshot.records.count)")
                             return .succeeded(nil)
                         } catch {
+                            DebugLog.extraction(
+                                "credentials: authorize closure FAILED for \(summary.packageID)/\(summary.requirementID): \(ExtractorPackageMutationMessage.describe(error))")
                             return .failed(ExtractorPackageMutationMessage.describe(error))
                         }
                     },
@@ -864,13 +926,19 @@ struct WikiFSApp: App {
                                 layout: ExtractorCredentialAuthorizationStoreLayout(
                                     appGroupContainerRoot: containerDirectory),
                                 processRole: .app)
-                            _ = try await writer.revoke(
+                            DebugLog.extraction(
+                                "credentials: revoke closure revoking \(summary.packageID)/\(summary.requirementID)")
+                            let snapshot = try await writer.revoke(
                                 packageID: ExtractorPackageID(
                                     validating: summary.packageID),
                                 requirementID: ExtractorCredentialRequirementID(
                                     validating: summary.requirementID))
+                            DebugLog.extraction(
+                                "credentials: revoke written generation=\(snapshot.generation) records=\(snapshot.records.count)")
                             return .succeeded(nil)
                         } catch {
+                            DebugLog.extraction(
+                                "credentials: revoke closure FAILED for \(summary.packageID)/\(summary.requirementID): \(ExtractorPackageMutationMessage.describe(error))")
                             return .failed(ExtractorPackageMutationMessage.describe(error))
                         }
                     },
@@ -962,8 +1030,9 @@ struct WikiFSApp: App {
     }
 
     /// Settings tab tags used by the TabView selection and `@AppStorage`.
+    /// Zotero account setup lives inside the Extraction tab (the reviewed
+    /// zotero package's pane), not as its own tab.
     enum SettingsTab: String {
-        case zotero
         case extraction
         case agents
         case operations
@@ -972,13 +1041,14 @@ struct WikiFSApp: App {
     }
 
     /// Binding that bridges `@AppStorage(String)` → `SettingsTab` for the
-    /// Settings `TabView(selection:)`. Falls back to `.zotero` (the new
+    /// Settings `TabView(selection:)`. Falls back to `.extraction` (the
     /// first tab) when the stored raw value is missing or references a
-    /// removed tab (e.g. `.about` / `.general` from before the About and
+    /// removed tab (e.g. `.zotero`, folded into the Extraction tab's
+    /// account pane; or `.about` / `.general` from before the About and
     /// General tabs were removed).
     private var settingsSelectedTab: Binding<SettingsTab> {
         Binding(
-            get: { SettingsTab(rawValue: settingsSelectedTabRaw) ?? .zotero },
+            get: { SettingsTab(rawValue: settingsSelectedTabRaw) ?? .extraction },
             set: { settingsSelectedTabRaw = $0.rawValue }
         )
     }

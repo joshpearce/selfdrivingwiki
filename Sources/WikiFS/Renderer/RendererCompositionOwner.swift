@@ -190,7 +190,10 @@ final class AppProcessPluginCatalog {
     init(
         containerDirectory: URL,
         transportBridge: DaemonTransportAppBridge,
-        extractionProvider: @escaping @MainActor (any ExtractionServices) -> any QueueExtractionProvider,
+        extractionProvider: @escaping @MainActor (
+            any ExtractionServices,
+            URL
+        ) -> any QueueExtractionProvider,
         makeIngestionProvider: @escaping @MainActor (
             QueueStore,
             any AgentProviderServices
@@ -208,7 +211,9 @@ final class AppProcessPluginCatalog {
         let queueController = LocalQueueRuntimeController {
             try await QueueRuntimeFactory(
                 databaseURL: queueDBURL,
-                extractionProvider: await MainActor.run { extractionProvider(extractionServices) },
+                extractionProvider: await MainActor.run {
+                    extractionProvider(extractionServices, queueDBURL)
+                },
                 makeIngestionProvider: { store in
                     await MainActor.run { makeIngestionProvider(store, providerServices) }
                 })
@@ -246,11 +251,14 @@ final class AppProcessPluginCatalog {
                         services: providerServices,
                         readConfiguration: { AgentProvidersConfig.loadOrSeed(from: containerDirectory) },
                         resolveCommand: { providers in
-                            let searchPath = await PathPreflight.loginShellPATH()
-                            return Dictionary(uniqueKeysWithValues: providers.compactMap { provider in
-                                AgentLauncher.resolveCommand(for: provider, searchPath: searchPath)
-                                    .map { (provider.id, $0) }
-                            })
+                            // Issue #1279: the shared production resolution —
+                            // login-shell PATH first, the validated Bun
+                            // locator as the only bare-`bun` fallback. The
+                            // app and the daemon MUST NOT drift (pinned by
+                            // `ProviderCommandResolverWiringTests`).
+                            await ProviderCommandResolver.resolveCommands(
+                                for: providers,
+                                searchPath: await PathPreflight.loginShellPATH())
                         },
                         readCredential: { providerID in
                             KeychainACPCredentialStore().apiKey(forProvider: providerID.rawValue)
@@ -324,14 +332,6 @@ final class AppProcessPluginCatalog {
                 makeURLFetchProvider: {
                     ProcessRuntimeLease(
                         service: URLFetchProvider(makeFetcher: { URLSessionFetcher() }),
-                        dispose: {})
-                },
-                makeZoteroClientProvider: {
-                    ProcessRuntimeLease(
-                        service: ZoteroClientProvider(
-                            readConfiguration: { ZoteroConfig.load(from: containerDirectory) },
-                            readCredential: { KeychainZoteroCredentialStore().apiKey() },
-                            makeFetcher: { URLSessionZoteroFetcher() }),
                         dispose: {})
                 }), homeDirectory: containerDirectory)
     }

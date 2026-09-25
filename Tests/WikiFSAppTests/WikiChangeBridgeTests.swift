@@ -195,11 +195,19 @@ private struct StubExtractionProvider: QueueExtractionProvider {
     func resolveExtraction(
         wikiID: WikiID, sourceID: SourceID, backendOverride: ExtractionBackend?
     ) async throws -> ExtractionResolution? { nil }
-    func persistExtraction(
-        wikiID: WikiID, sourceID: SourceID, markdown: String,
-        backend: ExtractionBackend, modelVersion: String?,
-        technique: String?
-    ) async throws {}
+    func persistBytesExtraction(
+        wikiID: WikiID, sourceID: SourceID,
+        resolution: BytesExtractionResolution, markdown: String
+    ) async throws -> QueueExtractionOutputReference? { nil }
+    func persistTranscriptExtraction(
+        wikiID: WikiID, sourceID: SourceID,
+        resolution: TranscriptExtractionResolution, outcome: TranscriptFetchOutcome
+    ) async throws -> QueueExtractionOutputReference? { nil }
+    func persistAttachmentExtraction(
+        wikiID: WikiID, sourceID: SourceID,
+        resolution: AttachmentExtractionResolution, outcome: AttachmentFetchOutcome
+    ) async throws -> QueueExtractionOutputReference? { nil }
+    func enqueueFollowOnExtraction(wikiID: WikiID, sourceID: SourceID) async throws {}
 }
 
 /// Creates a `QueueEngine` backed by an in-memory store + stub provider.

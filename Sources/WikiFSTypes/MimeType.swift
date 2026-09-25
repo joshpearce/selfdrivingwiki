@@ -52,6 +52,16 @@ public enum MimeType {
     /// `application/xhtml+xml`.
     public static let xhtml = "application/xhtml+xml"
 
+    /// `audio/podcast` — the synthetic source MIME for byteless RSS podcast
+    /// feed sources. Not a real IANA media type: it exists so the URL-backed
+    /// podcast-transcript extractor registration has a stable route MIME.
+    public static let audioPodcast = "audio/podcast"
+
+    /// `audio/apple-podcast` — the synthetic source MIME for byteless Apple
+    /// Podcasts episode sources. Route MIME for the `apple-podcast-transcript`
+    /// extractor registration; the input itself is the episode page URL.
+    public static let audioApplePodcast = "audio/apple-podcast"
+
     /// `application/xml`.
     public static let xml = "application/xml"
 

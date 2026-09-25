@@ -59,8 +59,29 @@ public protocol ExtractionServices: Sendable {
     /// resolves through the configuration, defaulting to the reviewed docx2md
     /// lineage when nothing is configured.
     func prepareDOCX() async throws -> any DocxMarkdownExtractor
+    /// The podcast transcript route is also package-only: the selection
+    /// resolves through the configuration (bundled default reviewed lineage
+    /// when nothing is configured) and fails closed on an explicit disable
+    /// or an unavailable selection. The prepared adapter runs validated
+    /// `remote-url` operations with exact package provenance.
+    func preparePodcastTranscript() async throws -> ProcessPackagePodcastTranscript
+    /// The Apple Podcasts transcript route: same package-only shape as the
+    /// RSS sibling, over the `apple-podcast-transcript` kind.
+    func prepareApplePodcastTranscript() async throws -> ProcessPackageApplePodcastTranscript
+    /// The YouTube transcript route: same package-only shape as the podcast
+    /// siblings, over the `youtube-transcript` kind.
+    func prepareYouTubeTranscript() async throws -> ProcessPackageYouTubeTranscript
+    /// The Zotero attachment route: same package-only shape as the
+    /// transcript siblings, over the `zotero` kind. The prepared adapter
+    /// runs validated `remote-url` operations whose revision-4 results
+    /// carry either Markdown or source bytes plus `resultMIMEType`.
+    func prepareZoteroAttachment() async throws -> ProcessPackageZoteroAttachment
     /// Active package registration claims used for import recognition.
     func registeredExtractionInputs() async -> RegisteredExtractionInputs
+    /// Active package registrations with manifest-derived presentation data.
+    /// This is a read-only snapshot for UI affordances; execution still goes
+    /// through the managed extraction queue.
+    func activeRegistrationSnapshots() async -> [ExtractorRouteRegistrationSnapshot]
 }
 
 public extension ExtractionServices {
@@ -82,8 +103,40 @@ public extension ExtractionServices {
         throw ExtractionServicesError.unavailable
     }
 
+    /// Default for seams that never run packages (test runtimes, the legacy
+    /// coordinator). The process facade overrides it with real package
+    /// resolution.
+    func preparePodcastTranscript() async throws -> ProcessPackagePodcastTranscript {
+        throw ExtractionServicesError.unavailable
+    }
+
+    /// Default for seams that never run packages (test runtimes, the legacy
+    /// coordinator). The process facade overrides it with real package
+    /// resolution.
+    func prepareApplePodcastTranscript() async throws -> ProcessPackageApplePodcastTranscript {
+        throw ExtractionServicesError.unavailable
+    }
+
+    /// Default for seams that never run packages (test runtimes, the legacy
+    /// coordinator). The process facade overrides it with real package
+    /// resolution.
+    func prepareYouTubeTranscript() async throws -> ProcessPackageYouTubeTranscript {
+        throw ExtractionServicesError.unavailable
+    }
+
+    /// Default for seams that never run packages (test runtimes, the legacy
+    /// coordinator). The process facade overrides it with real package
+    /// resolution.
+    func prepareZoteroAttachment() async throws -> ProcessPackageZoteroAttachment {
+        throw ExtractionServicesError.unavailable
+    }
+
     func registeredExtractionInputs() async -> RegisteredExtractionInputs {
         .none
+    }
+
+    func activeRegistrationSnapshots() async -> [ExtractorRouteRegistrationSnapshot] {
+        []
     }
 }
 
@@ -151,8 +204,28 @@ public actor MutableExtractionServices: ExtractionServices {
         try await installed.prepareDOCX()
     }
 
+    public func preparePodcastTranscript() async throws -> ProcessPackagePodcastTranscript {
+        try await installed.preparePodcastTranscript()
+    }
+
+    public func prepareApplePodcastTranscript() async throws -> ProcessPackageApplePodcastTranscript {
+        try await installed.prepareApplePodcastTranscript()
+    }
+
+    public func prepareYouTubeTranscript() async throws -> ProcessPackageYouTubeTranscript {
+        try await installed.prepareYouTubeTranscript()
+    }
+
+    public func prepareZoteroAttachment() async throws -> ProcessPackageZoteroAttachment {
+        try await installed.prepareZoteroAttachment()
+    }
+
     public func registeredExtractionInputs() async -> RegisteredExtractionInputs {
         await installed.registeredExtractionInputs()
+    }
+
+    public func activeRegistrationSnapshots() async -> [ExtractorRouteRegistrationSnapshot] {
+        await installed.activeRegistrationSnapshots()
     }
 }
 
@@ -336,6 +409,13 @@ public final class ExtractionCoordinator {
 
     public func prepareDOCX() async throws -> any DocxMarkdownExtractor {
         try await services.prepareDOCX()
+    }
+
+    /// Active package registrations with manifest-derived presentation data.
+    /// Read-only snapshot for UI affordances (the Raw Source extract action);
+    /// execution still goes through the managed extraction queue.
+    public func activeRegistrationSnapshots() async -> [ExtractorRouteRegistrationSnapshot] {
+        await services.activeRegistrationSnapshots()
     }
 
     /// Kind-neutral import-extraction preparation. WHICH kinds auto-extract

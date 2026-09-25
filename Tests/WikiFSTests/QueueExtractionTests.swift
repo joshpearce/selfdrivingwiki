@@ -137,6 +137,32 @@ struct QueueExtractionTests {
         store.close()
     }
 
+    @Test func testResolveThrowFailsInsteadOfStayingQueued() async throws {
+        let store = try QueueStore(databaseURL: tempDatabaseURL())
+
+        // Any other resolve throw (bad legacy identity data, an extractor
+        // admission failure, a lost store) is a real per-item fault.
+        // providerID(for:) hands the item the neutral capacity bucket so
+        // dispatch claims it and the engine marks it failed with the error
+        // detail. It must never return to .queued silently.
+        let provider = FakeExtractionProvider(resolveResult: .admissionFailure)
+        let factory = QueueExtractionWorkerFactory(
+            provider: provider, emitProgress: { _, _ in })
+        let engine = QueueEngine(store: store, workerFactory: factory)
+        await engine.start()
+
+        let id = try await engine.enqueue(
+            QueueItemRequest(queue: .extraction, wikiID: WikiID(rawValue: "wiki1"), payload: makePayload()))
+
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let item = try store.getItem(id)
+        #expect(item?.state == .failed)
+        #expect(item?.error?.contains("preparationFailed") == true)
+        #expect(item?.error?.contains("Operation not permitted") == true)
+        store.close()
+    }
+
     // MARK: - AC.4: Readiness check
 
     @Test func testReadinessCheckMarksFailed() async throws {
@@ -197,8 +223,9 @@ struct QueueExtractionTests {
             timeout: .seconds(5))
 
         #expect(lines.count == 2)
-        #expect(lines[0] == "Converting page 1...")
-        #expect(lines[1] == "Converting page 2...")
+        // Lines carry an elapsed-time stamp prefix ([mm:ss]).
+        #expect(lines[0].hasSuffix("Converting page 1..."))
+        #expect(lines[1].hasSuffix("Converting page 2..."))
         store.close()
     }
 
@@ -420,6 +447,9 @@ private final class FakeExtractionProvider: QueueExtractionProvider, @unchecked 
         /// The typed fail-closed error for an explicit selection with no
         /// active registration.
         case unavailableSelection
+        /// A generic resolve throw, e.g. an extractor directory admission
+        /// failure with its bounded stage detail.
+        case admissionFailure
     }
 
     private let lock = OSAllocatedUnfairLock(initialState: State())
@@ -456,15 +486,15 @@ private final class FakeExtractionProvider: QueueExtractionProvider, @unchecked 
 
         switch resolveResult {
         case .resolved(let backend):
-            return ExtractionResolution(
+            return .bytes(BytesExtractionResolution(
                 extractor: FakeMarkdownExtractor(
                     readiness: extractorReadiness,
                     convert: convertBehavior
                 ),
-                pdfData: Data([0x25, 0x50, 0x44, 0x46]), // "%PDF"
+                sourceBytes: Data([0x25, 0x50, 0x44, 0x46]), // "%PDF"
                 filename: "test.pdf",
                 backend: backend
-            )
+            ))
         case .nilResolution:
             return nil
         case .unavailableSelection:
@@ -473,18 +503,37 @@ private final class FakeExtractionProvider: QueueExtractionProvider, @unchecked 
                 registrationID: ExtractorRegistrationID(validating: "main"))
             throw ExtractionServicesError.selectedExtractorUnavailable(
                 route: .canonicalPDF, reference: logical)
+        case .admissionFailure:
+            throw ExtractorDirectoryAdmissionError.preparationFailure(errno: 1, stage: "fchmod directory")
         }
     }
 
-    func persistExtraction(
+    func persistBytesExtraction(
         wikiID: WikiID, sourceID: SourceID,
-        markdown: String, backend: ExtractionBackend,
-        modelVersion: String?, technique: String?
-    ) async throws {
+        resolution: BytesExtractionResolution, markdown: String
+    ) async throws -> QueueExtractionOutputReference? {
         lock.withLock { state in
-            state.callLog.append("persist(wikiID:\(wikiID.rawValue), sourceID:\(sourceID.rawValue), backend:\(backend.rawValue))")
+            state.callLog.append("persist(wikiID:\(wikiID.rawValue), sourceID:\(sourceID.rawValue), backend:\(resolution.backend.rawValue))")
         }
+        return nil
     }
+
+    func persistTranscriptExtraction(
+        wikiID: WikiID, sourceID: SourceID,
+        resolution: TranscriptExtractionResolution, outcome: TranscriptFetchOutcome
+    ) async throws -> QueueExtractionOutputReference? {
+        lock.withLock { state in
+            state.callLog.append("persistTranscript(wikiID:\(wikiID.rawValue), sourceID:\(sourceID.rawValue))")
+        }
+        return nil
+    }
+
+    func persistAttachmentExtraction(
+        wikiID: WikiID, sourceID: SourceID,
+        resolution: AttachmentExtractionResolution, outcome: AttachmentFetchOutcome
+    ) async throws -> QueueExtractionOutputReference? { nil }
+
+    func enqueueFollowOnExtraction(wikiID: WikiID, sourceID: SourceID) async throws {}
 }
 
 // MARK: - Fake MarkdownExtractor

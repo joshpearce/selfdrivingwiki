@@ -2,10 +2,11 @@ import SwiftUI
 import WikiFSEngine
 import WikiFSCore
 
-/// The Pages section of the sidebar — a native header (title, New Page, sort
-/// picker, search) above an AppKit `NSTableView` (`PagesListView`). Mirrors
-/// `BookmarksContainerView`: SwiftUI chrome on top, AppKit list below for
-/// instant selection + native double-click.
+/// The Pages section of the sidebar — a native header (title, New Page,
+/// filter and sort menu icons, search) above an AppKit `NSTableView`
+/// (`PagesListView`). Mirrors `BookmarksContainerView` / `SourcesContainerView`:
+/// SwiftUI chrome on top, AppKit list below for instant selection + native
+/// double-click.
 struct PagesContainerView: View {
     @Bindable var store: WikiStoreModel
     let fileProvider: FileProviderFacade
@@ -20,13 +21,59 @@ struct PagesContainerView: View {
     @State private var renameText = ""
     /// Non-nil while the bookmark-target picker is open for a page selection.
     @State private var addToBookmarksContext: BookmarkTargetPickerContext?
-    /// Non-nil while the incoming-reference delete confirmation is open. Set
-    /// when the user deletes a page that other pages link to or bookmarks point
-    /// at (issue #219).
-    @State private var pendingDeletion: PendingPageDeletion?
+    /// Non-nil while a delete-confirmation surface is on screen (issue #219
+    /// hardening): the typed outcome produced by the shared
+    /// `DeletionConfirmationCoordinator`.
+    @State private var deletionOutcome: DeletionConfirmationOutcome?
+    /// The page ids behind `deletionOutcome` — what the action handler deletes.
+    @State private var pendingDeletionIDs: [PageID] = []
+    /// "Show" date-window filter backing the filter menu. `all` is the
+    /// default and returns the list unchanged.
+    @State private var dateFilter: PageDateFilter = .all
+
+    /// "Show" date-window filter for the page list (follow-up to #241's
+    /// header treatment; display-only). `WikiPageSummary` carries only
+    /// title + dates, so the filter windows compare `updatedAt` against a
+    /// reference date at calendar granularity — `now` and `calendar` are
+    /// injectable so the predicate is unit-testable without real time.
+    enum PageDateFilter: String, CaseIterable {
+        case all
+        case today
+        case week
+        case month
+
+        func matches(
+            _ date: Date,
+            now: Date = Date(),
+            calendar: Calendar = .current
+        ) -> Bool {
+            switch self {
+            case .all: return true
+            case .today: return calendar.isDate(date, equalTo: now, toGranularity: .day)
+            case .week: return calendar.isDate(date, equalTo: now, toGranularity: .weekOfYear)
+            case .month: return calendar.isDate(date, equalTo: now, toGranularity: .month)
+            }
+        }
+
+        /// Pure: pages whose `updatedAt` falls inside the window. `all`
+        /// returns the input unchanged.
+        func filtered(
+            _ pages: [WikiPageSummary],
+            now: Date = Date(),
+            calendar: Calendar = .current
+        ) -> [WikiPageSummary] {
+            guard self != .all else { return pages }
+            return pages.filter { matches($0.updatedAt, now: now, calendar: calendar) }
+        }
+    }
 
     private var visible: [WikiPageSummary] {
-        store.searchQuery.isEmpty ? store.summaries : store.searchResults
+        // During search, results are relevance-ranked by the engine — the
+        // date filter does not apply (the same rule the sort follows).
+        if store.searchQuery.isEmpty {
+            return dateFilter.filtered(store.summaries)
+        }
+        return store.searchResults
     }
 
     var body: some View {
@@ -34,10 +81,10 @@ struct PagesContainerView: View {
             pagesHeader
             Divider()
             ZStack(alignment: .topLeading) {
-                PagesListView(store: store, fileProvider: fileProvider,
+                PagesListView(store: store, pages: visible, fileProvider: fileProvider,
                               session: session, launcher: launcher,
                               callbacks: callbacks)
-                if visible.isEmpty && !store.searchQuery.isEmpty {
+                if visible.isEmpty && (!store.searchQuery.isEmpty || dateFilter != .all) {
                     Text("No matching pages")
                         .foregroundStyle(.secondary).font(.callout)
                         .padding(.vertical, 8).padding(.horizontal, 4)
@@ -74,21 +121,15 @@ struct PagesContainerView: View {
                 }
             )
         }
-        .confirmationDialog(
-            pendingDeletion.map { deletionDialogTitle(ids: $0.ids) } ?? "",
-            isPresented: deletionDialogPresented,
-            titleVisibility: .visible,
-            presenting: pendingDeletion
-        ) { pending in
-            deletionDialogActions(for: pending)
-        } message: { pending in
-            Text(deletionDialogMessage(for: pending))
+        .deletionOutcomeDialog($deletionOutcome) { action in
+            handleDeletionAction(action)
         }
     }
 
-    /// Header: title + compact New Page button, then the sort picker and search
-    /// bar (matching the prior pagesSection layout, with the bookmarks-style
-    /// compact action button).
+    /// Header: title + compact New Page button and the filter/sort menu
+    /// icons, then the search bar. The filter is a date-window "Show" menu
+    /// (display-only); the sort drives `store.pageSortOrder` (model-level,
+    /// re-queries the store).
     private var pagesHeader: some View {
         VStack(spacing: 0) {
             HStack(spacing: 2) {
@@ -98,27 +139,67 @@ struct PagesContainerView: View {
                     onNewPage()
                 }
                 .keyboardShortcut("n", modifiers: .command)
+                filterMenu
+                sortMenu
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-
-            HStack {
-                Text("Sort by").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Picker("Sort", selection: $store.pageSortOrder) {
-                    Text("Last Updated").tag(PageSortOrder.lastUpdated)
-                    Text("Newest First").tag(PageSortOrder.newestFirst)
-                    Text("Title A–Z").tag(PageSortOrder.titleAZ)
-                }
-                .pickerStyle(.menu).buttonStyle(.borderless).labelsHidden().fixedSize()
-            }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 2)
 
             searchBar
                 .padding(.horizontal, 4)
                 .padding(.vertical, 6)
         }
+    }
+
+    /// The "Show" date-window filter — a filter icon whose dropdown lists
+    /// All / Edited Today / This Week / This Month, the same
+    /// `Menu { Picker … }` pattern as the sibling sections' icons. The icon
+    /// tints accent while a non-All window is active.
+    private var filterMenu: some View {
+        Menu {
+            Picker("Filter", selection: $dateFilter) {
+                Text("All").tag(PageDateFilter.all)
+                Text("Edited Today").tag(PageDateFilter.today)
+                Text("This Week").tag(PageDateFilter.week)
+                Text("This Month").tag(PageDateFilter.month)
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Image(systemName: "line.3.horizontal.decrease")
+                .font(.body)
+                .frame(width: 24, height: 24)
+                .foregroundStyle(dateFilter == .all ? Color.secondary : Color.accentColor)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Show")
+    }
+
+    /// The "Sort by" control — a sort icon whose dropdown drives
+    /// `store.pageSortOrder` (the model re-queries the store; same choices
+    /// as the former caption row). The icon tints accent while a non-default
+    /// (non-Last Updated) sort is active.
+    private var sortMenu: some View {
+        Menu {
+            Picker("Sort", selection: $store.pageSortOrder) {
+                Text("Last Updated").tag(PageSortOrder.lastUpdated)
+                Text("Newest First").tag(PageSortOrder.newestFirst)
+                Text("Title A–Z").tag(PageSortOrder.titleAZ)
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Image(systemName: "arrow.up.arrow.down")
+                .font(.body)
+                .frame(width: 24, height: 24)
+                .foregroundStyle(store.pageSortOrder == .lastUpdated ? Color.secondary : Color.accentColor)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Sort by")
     }
 
     private var searchBar: some View {
@@ -178,10 +259,21 @@ struct PagesContainerView: View {
             onLint: { ids in
                 Task {
                     do {
+                        // Closed-wiki name resolution: record the page
+                        // titles already in hand (the wiki is open here) so
+                        // the Activity window keeps readable input rows
+                        // after this wiki's window closes.
+                        let titles = Dictionary(uniqueKeysWithValues: ids.compactMap { id in
+                            store.summaries.first { $0.id == id }.map { (id.rawValue, $0.title) }
+                        })
+                        let payload = QueueItemPayload(
+                            sourceIDs: [],
+                            lintPageIDs: ids,
+                            recordedNames: titles.isEmpty ? nil : titles)
                         _ = try await session.queueEngine.enqueue(QueueItemRequest(
                             queue: .ingestion,
                             wikiID: session.wikiID,
-                            payload: QueueItemPayload(sourceIDs: [], lintPageIDs: ids)
+                            payload: payload
                         ))
                     } catch {
                         DebugLog.store("PagesContainerView.onLint enqueue failed: \(error)")
@@ -225,106 +317,58 @@ struct PagesContainerView: View {
         )
     }
 
-    // MARK: - Delete with incoming-reference warning (issue #219)
+    // MARK: - Delete with incoming-reference warning (issue #219 hardening)
 
-    /// Aggregate the incoming links + bookmarks for the selected pages, then
-    /// either delete immediately (nothing references them) or open the
-    /// confirmation dialog so the user can see and choose how to handle them.
+    /// Aggregate the incoming links + bookmarks for the selected pages via the
+    /// shared coordinator, then either delete immediately (nothing references
+    /// them) or route to the typed confirmation state.
     private func requestPageDeletion(_ ids: [PageID]) {
-        let deletedIDs = Set(ids)
-        var linkingIDs: [PageID] = []
-        var bookmarkFolders: Set<String> = []
-        var bookmarkCount = 0
-        for id in ids {
-            let impact = store.deletionImpact(forPage: id)
-            linkingIDs.append(contentsOf: impact.linkingPageIDs)
-            bookmarkCount += impact.bookmarkLabels.count
-            bookmarkFolders.formUnion(impact.bookmarkLabels)
-        }
-        // Drop pages that are themselves being deleted (they vanish with the
-        // batch), then dedupe for display.
-        let displayTitles = Array(Set(linkingIDs))
-            .filter { !deletedIDs.contains($0) }
-            .compactMap { id in store.summaries.first { $0.id == id }?.title }
-            .sorted()
-
-        if displayTitles.isEmpty && bookmarkCount == 0 {
-            confirmPageDeletion(ids: ids, unlink: false)
+        pendingDeletionIDs = ids
+        let coordinator = DeletionConfirmationCoordinator(
+            kind: .page,
+            loadImpacts: {
+                try ids.map { try store.deletionImpact(forPage: $0) }
+            },
+            onDelete: { decision in
+                performPageDeletion(ids: ids, decision: decision)
+            },
+            pageTitle: { id in
+                store.summaries.first { $0.id == id }?.title
+            },
+            selectionCount: ids.count)
+        let outcome = coordinator.evaluate()
+        if case .deleteImmediately = outcome {
+            // No references, no blockers — delete without a dialog.
+            coordinator.perform(.delete)
         } else {
-            pendingDeletion = PendingPageDeletion(
-                ids: ids,
-                linkingPageTitles: displayTitles,
-                bookmarkCount: bookmarkCount,
-                bookmarkFolders: bookmarkFolders.sorted())
+            deletionOutcome = outcome
         }
     }
 
-    private func confirmPageDeletion(ids: [PageID], unlink: Bool) {
-        for id in ids { store.delete(id, unlinkIncomingLinks: unlink) }
-        // If a deleted page was the home page, clear the stale homePageID so the
-        // Home button doesn't linger as dead UI.
-        if let homeID = session.descriptor.homePageID, ids.contains(homeID) {
+    private func performPageDeletion(ids: [PageID], decision: DeletionDecision) {
+        // ONE protected transaction for the whole selection; on failure the
+        // model surfaces the store error and returns nil (nothing changed).
+        guard let result = store.performPageDeletion(
+            ids, unlinkIncomingLinks: decision == .unlink) else { return }
+        // If a deleted page was the home page, clear the stale homePageID so
+        // the Home button doesn't linger as dead UI. Runs only for pages the
+        // store reports as actually deleted.
+        let deletedIDs = result.deletedTargets.compactMap(\.pageID)
+        if let homeID = session.descriptor.homePageID, deletedIDs.contains(homeID) {
             registry.setHomePage(id: session.wikiID, pageID: nil)
             var d = session.descriptor
             d.homePageID = nil
             session.updateDescriptor(d)
         }
-        pendingDeletion = nil
     }
 
-    private var deletionDialogPresented: Binding<Bool> {
-        Binding(
-            get: { pendingDeletion != nil },
-            set: { if !$0 { pendingDeletion = nil } }
-        )
-    }
-
-    private func deletionDialogTitle(ids: [PageID]) -> String {
-        ids.count == 1 ? "Delete Page?" : "Delete \(ids.count) Pages?"
-    }
-
-    private func deletionDialogMessage(for pending: PendingPageDeletion) -> String {
-        var lines: [String] = []
-        if !pending.linkingPageTitles.isEmpty {
-            let names = pending.linkingPageTitles.joined(separator: ", ")
-            let noun = pending.linkingPageTitles.count == 1 ? "page" : "pages"
-            lines.append("Linked from \(pending.linkingPageTitles.count) \(noun): \(names).")
+    private func handleDeletionAction(_ action: DeletionDialogAction) {
+        let ids = pendingDeletionIDs
+        switch action {
+        case .unlinkAndDelete: performPageDeletion(ids: ids, decision: .unlink)
+        case .delete: performPageDeletion(ids: ids, decision: .preserve)
+        case .cancel: break
         }
-        if pending.bookmarkCount > 0 {
-            let noun = pending.bookmarkCount == 1 ? "bookmark" : "bookmarks"
-            let where_ = pending.bookmarkFolders.joined(separator: ", ")
-            lines.append("\(pending.bookmarkCount) \(noun) point to this and will be removed (\(where_)).")
-        }
-        if !pending.linkingPageTitles.isEmpty {
-            lines.append("Unlink and Delete converts the links to plain text.")
-        }
-        return lines.joined(separator: "\n")
+        pendingDeletionIDs = []
     }
-
-    @ViewBuilder
-    private func deletionDialogActions(for pending: PendingPageDeletion) -> some View {
-        if !pending.linkingPageTitles.isEmpty {
-            Button("Unlink and Delete", role: .destructive) {
-                confirmPageDeletion(ids: pending.ids, unlink: true)
-            }
-            Button("Delete", role: .destructive) {
-                confirmPageDeletion(ids: pending.ids, unlink: false)
-            }
-        } else {
-            Button("Delete", role: .destructive) {
-                confirmPageDeletion(ids: pending.ids, unlink: false)
-            }
-        }
-        Button("Cancel", role: .cancel) { pendingDeletion = nil }
-    }
-}
-
-/// State carried by the incoming-reference delete-confirmation dialog
-/// (issue #219).
-private struct PendingPageDeletion: Identifiable {
-    let id = UUID()
-    let ids: [PageID]
-    let linkingPageTitles: [String]
-    let bookmarkCount: Int
-    let bookmarkFolders: [String]
 }

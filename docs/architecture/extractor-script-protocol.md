@@ -1,6 +1,6 @@
 # Extractor script protocol
 
-This document is the normative reference for extractor protocol revision 1. It defines how the host talks to an extractor package script in a separate process.
+This document is the normative reference for extractor protocol revisions 1, 2, 3, and 4. It defines how the host talks to an extractor package script in a separate process.
 
 Sources of truth in code:
 
@@ -12,7 +12,7 @@ Sources of truth in code:
 
 ## Model
 
-Protocol revision 1 is one-shot. The host starts one process per extraction request. The package converts one input file to one Markdown result.
+The protocol is one-shot. The host starts one process per extraction request. The package converts one input to one Markdown result.
 
 - The host writes one request frame to standard input and then closes standard input.
 - The package writes zero or more progress and diagnostic frames to standard output, then exactly one terminal frame.
@@ -43,22 +43,44 @@ The host encodes one `ExtractorProtocolRequest` as JSON, appends a newline, writ
 | Field | Type | Rules |
 | --- | --- | --- |
 | `requestID` | UUID string | Identifies the operation. Every frame must repeat it. |
-| `protocolRevision` | integer | Must be `1`. |
-| `kind` | string | `pdf`, `html`, or `docx`. |
+| `protocolRevision` | integer | `1`, `2`, `3`, or `4`. Must equal the manifest `protocolRevision`. |
+| `kind` | string | `pdf`, `html`, `docx`, `podcast-transcript`, `apple-podcast-transcript`, `youtube-transcript`, or `zotero`. |
 | `mimeType` | string | Normalized lowercase MIME type. |
 | `originalFilename` | string | 1 to 1,024 bytes, no NUL. |
-| `inputTransport` | string | `operation-file` in revision 1. |
-| `inputPath` | string | Package-relative path to the input file. |
-| `outputPath` | string | Package-relative path for the Markdown result. Must differ from `inputPath`. |
+| `inputTransport` | string | `operation-file` (all revisions) or `remote-url` (revision 3 and later). |
+| `inputPath` | string | Package-relative path to the input file. Mandatory for `operation-file`; must be absent for `remote-url`. |
+| `remoteURL` | string | One normalized HTTP or HTTPS source URL (revision 3 and later, `remote-url` only). Mandatory for `remote-url`; must be absent for `operation-file`. |
+| `outputPath` | string | Package-relative path for the result file. Must differ from `inputPath`. |
 | `deadlineMillisecondsSince1970` | integer | Positive. The host cancels the operation at this deadline. |
+| `credentialFilePath` | string | Revision 2 and later. Package-relative path to the private credential input file. Must be absent in revision 1. |
+| `operationConfigurationPath` | string | Revision 2 and later. Package-relative path to the public operation-configuration file. Must be absent in revision 1. |
 
-Example request:
+### Operation configuration envelope
+
+The configuration file is a closed, non-secret envelope. One case per supported family; the case tag is the construction seam, so a secret or an arbitrary path cannot be encoded.
+
+| Family | Wire shape | Fields |
+| --- | --- | --- |
+| Docling Serve | `{"endpoint": …, "timeoutMilliseconds": …}` (flat; the installed reviewed package reads this shape) | Bounded `http`/`https` endpoint, in-policy timeout. Both optional. |
+| Apple Podcasts | `{"kind": "apple-podcast-transcript", "helperPath": …}` | `helperPath` is a RELATIVE path inside the operation root naming the host-staged, owner-private token helper. |
+
+Unknown fields, mixed fields, unknown kinds, absolute paths, and traversal are rejected on decode. The staged helper is REVIEWED-ONLY host support: the host stages the executable into the operation's private `support/<request-id>/` directory for one exact reviewed revision (package ID, version, and digest), never for a kind, MIME type, capability, or any package-controlled value. The support directory is deleted on every terminal path.
+
+Example request (revision 1, operation-file):
 
 ```json
 {"requestID":"1b0d...","protocolRevision":1,"kind":"html","mimeType":"text/html","originalFilename":"article.html","inputTransport":"operation-file","inputPath":"input/source.html","outputPath":"output/result.md","deadlineMillisecondsSince1970":1735689600000}
 ```
 
-Content bytes never travel in JSON. The host puts the input file inside a private operation directory that it creates with owner-only permissions (`0700`). The package reads `inputPath` and writes `outputPath` inside that directory.
+Example request (revision 3, remote-url):
+
+```json
+{"requestID":"1b0d...","protocolRevision":3,"kind":"podcast-transcript","mimeType":"audio/podcast","originalFilename":"feed","inputTransport":"remote-url","remoteURL":"https://example.com/feed.rss","outputPath":"output/result.md","deadlineMillisecondsSince1970":1735689600000}
+```
+
+Content bytes never travel in JSON. With `operation-file`, the host puts the input file inside a private operation directory that it creates with owner-only permissions (`0700`). The package reads `inputPath` and writes `outputPath` inside that directory.
+
+With `remote-url` (revision 3), the host stages no input bytes. The request carries one validated source URL, and the package fetches the source itself. The host validates the URL before launch and rejects anything that is not HTTP or HTTPS, that embeds credentials, that carries a fragment, that has no host, that contains NUL, or that exceeds 2,048 bytes. The stored URL is normalized: lowercase scheme and host, no default port. A remote-url package must keep source URLs out of its diagnostics.
 
 ## Package frames
 
@@ -90,14 +112,17 @@ Every package frame uses one envelope:
 | --- | --- | --- |
 | `requestID` | UUID string | Must match the request. |
 | `outputPath` | string | Must equal the request `outputPath`. |
-| `markdownByteCount` | integer | 0 to 128 MiB. Must match the bytes the package wrote. |
+| `markdownByteCount` | integer | 0 to 128 MiB. The output-file byte count. Must match the bytes the package wrote. |
 | `warnings` | array of strings, optional | At most 128 entries, each 1 to 1,024 bytes. |
 | `metadata` | object, optional | Package-reported tool and model facts. |
 | `articleMetadata` | object, optional | Article facts for HTML packages. |
+| `resultMIMEType` | string, optional (revision 4) | A valid MIME type. Absent or `text/markdown`: the output file IS the Markdown result. Any other value: the output file holds source bytes of that MIME, and the host owns the format conversion. |
+
+`markdownByteCount` is the output-file byte count for both result shapes.
 
 `metadata` fields, each optional and at most 256 bytes: `toolName`, `toolVersion`, `modelName`, `modelVersion`. The host records these as provenance. It does not treat a package version as a model version.
 
-`articleMetadata` fields: `title`, `author`, `description`, `published` (each an optional string of at most 1,024 bytes) and `wordCount` (an optional integer from 0 to 10,000,000). The reviewed Defuddle package uses these to carry article metadata end to end.
+`articleMetadata` fields: `title`, `author`, `description`, `published`, `identifier` (each an optional string of 1 to 1,024 bytes, no NUL) and `wordCount` (an optional integer from 0 to 10,000,000). The reviewed Defuddle package uses `title`, `author`, `description`, `published`, and `wordCount` to carry article metadata end to end. Revision 4 adds `identifier`: an external identity for provenance, for example the Zotero parent item key behind an attachment. The host records it; it never uses it to address host objects.
 
 ### Failure frame
 
@@ -117,7 +142,7 @@ Every package frame uses one envelope:
 | `invalid-request` | The request is malformed for the package. | Package |
 | `missing-runtime` | A runtime command is absent. | Host |
 | `setup` | Dependency or model setup failed. | Package |
-| `timeout` | The operation passed its deadline or duration limit. | Host |
+| `timeout` | The operation passed its deadline or duration limit. | Host, or the package when it detects the request deadline has passed |
 | `cancellation` | The user or the host canceled the operation. | Host |
 | `process-termination` | The process exited nonzero or died from a signal. | Host |
 | `output-limit` | Output exceeded a host limit. | Host |
@@ -132,8 +157,9 @@ Every package frame uses one envelope:
 2. Progress events must not exceed the manifest limit.
 3. The stream must contain exactly one terminal frame.
 4. A result frame must name the expected `outputPath`.
-5. No frame may follow the terminal frame.
-6. At end of stream, a terminal frame must exist. Otherwise the operation fails.
+5. A result frame against a request of revision 3 or lower must not carry `resultMIMEType` or `articleMetadata.identifier`. The host rejects the frame instead of silently dropping the new fields.
+6. No frame may follow the terminal frame.
+7. At end of stream, a terminal frame must exist. Otherwise the operation fails.
 
 The host decodes standard output continuously with `ExtractorJSONLinesDecoder`. Malformed UTF-8 or malformed JSON is a protocol failure. When the host detects a protocol failure, it requests termination of the verified process group and fails the operation. A nonzero exit code or a signal after a valid terminal frame is still a `process-termination` failure. The host requires exit code 0.
 
@@ -158,6 +184,8 @@ The current working directory is the operation root.
 
 The host owns time. The effective timeout is the smaller of the manifest duration limit and the remaining time to the request deadline. When the timeout passes or the host cancels the task, the host sends `SIGTERM` to the verified process group, waits a one-second grace period, and then sends `SIGKILL` to the same group. The host rechecks the executable identity immediately before spawn and refuses to launch changed bytes.
 
+A package that receives a deadline may check it at its own processing seams and report `timeout` itself, before the host terminates the process. That self-report does not weaken host ownership: the host still enforces the deadline and still terminates the process group when the effective timeout passes.
+
 ## Host rejections
 
 The host fails the operation, and the package loses the selection, when any of these happen:
@@ -172,7 +200,16 @@ The host fails the operation, and the package loses the selection, when any of t
 
 ## Compatibility
 
-Revision 1 is the only protocol revision. The manifest declares the revision the package speaks, and the request repeats it. A mismatch fails the operation before spawn. Future revisions must keep this document updated with a migration note in `docs/architecture/extractor-package-manifest.md`.
+Revisions 1, 2, 3, and 4 are supported. The manifest declares the revision the package speaks, and the request repeats it. A mismatch fails the operation before spawn. A revision-4 host serves revision 1-4 packages.
+
+- Revision 1: operation-file requests only. No credential or operation-configuration paths.
+- Revision 2: adds the optional credential input file and operation-configuration file paths. The wire shape of the other fields is unchanged from revision 1.
+- Revision 3: adds the `remote-url` input transport and the `podcast-transcript`, `apple-podcast-transcript`, and `youtube-transcript` kinds. Revision 3 packages can use either input transport. Revisions 1 and 2 reject the `remoteURL` key and the `remote-url` transport; no revision accepts a mixed shape (both `inputPath` and `remoteURL`).
+- Revision 4: adds two optional result-frame fields — `resultMIMEType` and `articleMetadata.identifier`. Requests keep the exact revision-3 wire shape. When `resultMIMEType` is absent or `text/markdown`, the output file is the Markdown result, as in every earlier revision. When it names another MIME type, the output file holds source bytes of that MIME, and the host runs its own format route on those bytes. Kinds stay registration data: revision 4 adds the `zotero` kind only as a new registration value.
+
+Migration note: a revision 3 or lower host rejects a result frame that carries `resultMIMEType` or `articleMetadata.identifier` — it fails closed. It never silently drops the new fields and treats the output as Markdown. A revision-4 host accepts revision 1-3 result frames unchanged, so old packages keep working.
+
+A remote-url package is a registration and transport change, not a manifest-format change: the reviewed podcast transcript package keeps manifest revision 1 with protocol revision 3. An older host fails closed — it rejects the unknown kind at validation. Future revisions must keep this document updated with a migration note in `docs/architecture/extractor-package-manifest.md`.
 
 Related documents:
 

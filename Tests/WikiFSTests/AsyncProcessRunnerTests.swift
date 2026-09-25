@@ -201,7 +201,7 @@ struct AsyncProcessRunnerTests {
                 """
                 ready="$1"
                 hold="$2"
-                /usr/bin/perl -MPOSIX=setsid -e 'setsid() or die "setsid: $!"; open my $fh, ">", $ARGV[0] or die "open: $!"; print {$fh} $$; close $fh or die "close: $!"; exec "sleep", "60" or die "exec: $!";' "$ready" &
+                /usr/bin/perl -MPOSIX=setsid -e 'setsid() or die "setsid: $!"; my $tmp = "$ARGV[0].tmp"; open my $fh, ">", $tmp or die "open: $!"; print {$fh} $$; close $fh or die "close: $!"; rename $tmp, $ARGV[0] or die "rename: $!"; exec "sleep", "60" or die "exec: $!";' "$ready" &
                 trap '' TERM
                 while [ ! -f "$hold" ]; do sleep 0.05; done
                 """,
@@ -221,14 +221,14 @@ struct AsyncProcessRunnerTests {
         }
 
         let descendantPID = try await waitForPIDFile(readyFile)
-        #expect(kill(descendantPID, 0) == 0)
+        #expect(try signalDescendant(descendantPID, 0) == 0)
 
         task.cancel()
         await #expect(throws: AsyncProcessRunnerError.cancelled) {
             _ = try await task.value
         }
-        #expect(kill(descendantPID, 0) == 0)
-        _ = kill(descendantPID, SIGKILL)
+        #expect(try signalDescendant(descendantPID, 0) == 0)
+        _ = try signalDescendant(descendantPID, SIGKILL)
         #expect(launchedProcessID.get() == 1)
     }
 
@@ -376,12 +376,40 @@ struct AsyncProcessRunnerTests {
         ])
     }
 
+    /// Polls until `url` holds a PID that is safe to signal.
+    ///
+    /// Never falls back to a sentinel: `kill(-1, SIGKILL)` signals every
+    /// process the user owns. An earlier version returned `-1` when it read
+    /// the file after the child created it but before it wrote the PID, and a
+    /// parallel test run killed the whole login session.
     private func waitForPIDFile(_ url: URL, timeout: Duration = .seconds(5)) async throws -> Int32 {
-        try await waitForFile(url, timeout: timeout)
-        let data = try Data(contentsOf: url)
-        let text = String(decoding: data, as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return Int32(text) ?? -1
+        let deadline = ContinuousClock.now + timeout
+        var lastText = ""
+        while ContinuousClock.now < deadline {
+            if let data = FileManager.default.contents(atPath: url.path) {
+                lastText = String(decoding: data, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let pid = Int32(lastText), isSignallableDescendant(pid) {
+                    return pid
+                }
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        throw NSError(domain: "AsyncProcessRunnerTests", code: 2, userInfo: [
+            NSLocalizedDescriptionKey: "Timed out waiting for a valid PID at \(url.path); last read \"\(lastText)\""
+        ])
+    }
+
+    private func isSignallableDescendant(_ pid: Int32) -> Bool {
+        pid > 1 && pid != getpid() && pid != getppid()
+    }
+
+    /// The only raw `kill` in this suite. Refuses `0`, `-1`, negative group
+    /// IDs, launchd, and this process, any of which would widen the signal
+    /// far beyond the one child the test started.
+    private func signalDescendant(_ pid: Int32, _ signal: Int32) throws -> Int32 {
+        try #require(isSignallableDescendant(pid), "refusing to signal PID \(pid)")
+        return kill(pid, signal)
     }
 }
 #endif

@@ -14,8 +14,10 @@ import WikiFSEngine
 ///       persisted `chatMessages`. Plus the flip-timing gate: `activeChatID` is
 ///       cleared in `finish()` AFTER `flushTranscript()` commits the tail.
 ///   (b) `retargetTab` preserves the tab UUID while changing its selection.
-///   (c) draft-state morph: the runner retargets the active tab from .newChat
-///       to .chat(id) on first send (via `retargetActiveTabToChat`).
+///   (c) legacy runner morph: `AgentOperationRunner.startChat` persists the
+///       chat and retargets the active tab in place (the app's New Chat flow
+///       persists first and opens `.chat(id)` directly — see
+///       `NewChatSidebarProjectionTests`).
 ///   (d) `startNewChat` clears `activeChatID`.
 @MainActor
 struct ChatViewD2Tests {
@@ -253,8 +255,8 @@ struct ChatViewD2Tests {
         #expect(model.tabs.count == 1)
         #expect(model.tabs[0].id == askTabID)
         #expect(model.tabs[0].selection == .chat(chatID))
-        // The tab title should update to the chat title (or "Chat" fallback).
-        #expect(model.tabs[0].title == "Chat")
+        // The tab title should update to the chat title (or "New Chat" fallback).
+        #expect(model.tabs[0].title == "New Chat")
     }
 
     @Test func draftMorph_editToChat_preservesTab() throws {
@@ -284,22 +286,10 @@ struct ChatViewD2Tests {
         #expect(launcher.events.isEmpty)
     }
 
-    @Test func startNewChat_retargetBackToDraft_preservesTab() throws {
-        let (model, _) = try tempModel()
-        // Start in .chat(id) state (post-morph).
-        let chatID = ChatID(rawValue: "01J" + String(repeating: "F", count: 22))
-        model.openTab(.chat(chatID))
-        let chatTabID = model.tabs[0].id
-        #expect(model.tabs[0].selection == .chat(chatID))
-
-        // Simulate "New Chat": clear launcher state + retarget back to .newChat.
-        model.retargetTab(id: chatTabID, to: .newChat)
-
-        #expect(model.tabs.count == 1)
-        #expect(model.tabs[0].id == chatTabID)  // same tab UUID
-        #expect(model.tabs[0].selection == .newChat)
-        #expect(model.selection == .newChat)
-    }
+    // The D2-era `startNewChat_retargetBackToDraft_preservesTab` test was
+    // removed: retargetTab-to-.newChat non-reuse is pinned in EditorTabTests,
+    // and the legacy rollback revert is pinned in
+    // OrphanChatSeedingTests.rollbackRevertsRetargetedTabToDraftComposer.
 
     // MARK: - Integration: persisted chat renders through ChatDetailView path
 
@@ -326,7 +316,6 @@ struct ChatViewD2Tests {
     /// removed because the agent reads via wikictl (DB-direct), not the mount.
     @Test func canSendPredicateTrueWithDraftTextAndIdleAgent() {
         #expect(ChatDetailView.canSendPredicate(
-            hasMount: true,
             runState: .idle,
             hasDraftText: true,
             isChatOperationConfigured: true) == true)
@@ -336,7 +325,6 @@ struct ChatViewD2Tests {
     /// the mount guard was removed (issue #441).
     @Test func canSendPredicateTrueWithoutMount() {
         #expect(ChatDetailView.canSendPredicate(
-            hasMount: false,
             runState: .idle,
             hasDraftText: true,
             isChatOperationConfigured: true) == true)
@@ -345,7 +333,6 @@ struct ChatViewD2Tests {
     /// `canSendPredicate` returns false when generating (can't send mid-response).
     @Test func canSendPredicateFalseWhileGenerating() {
         #expect(ChatDetailView.canSendPredicate(
-            hasMount: true,
             runState: .answering,
             hasDraftText: true,
             isChatOperationConfigured: true) == false)
@@ -355,7 +342,6 @@ struct ChatViewD2Tests {
     /// generation gate.
     @Test func canSendPredicateFalseWhileQueued() {
         #expect(ChatDetailView.canSendPredicate(
-            hasMount: true,
             runState: .queued,
             hasDraftText: true,
             isChatOperationConfigured: true) == false)
@@ -364,7 +350,6 @@ struct ChatViewD2Tests {
     /// `canSendPredicate` returns false with no draft text.
     @Test func canSendPredicateFalseWithNoDraftText() {
         #expect(ChatDetailView.canSendPredicate(
-            hasMount: true,
             runState: .idle,
             hasDraftText: false,
             isChatOperationConfigured: true) == false)

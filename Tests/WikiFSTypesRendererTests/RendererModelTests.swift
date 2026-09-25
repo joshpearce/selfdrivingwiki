@@ -884,10 +884,10 @@ struct RendererModelTests {
         let fixtures: [(path: String, version: String, hash: String)] = [
             ("RendererPackages/Excalidraw/manifest.json", "1.1.0",
              "713d4d9e0c36e0b996f37b56099081160f4542f92a4fece56cb1af90362b91d6"),
-            ("RendererPackages/Mermaid/manifest.json", "1.1.0",
-             "93cbd039a633d9a628e67ef162bb385239ba011c8d0e063db9d5e04fac8742cf"),
-            ("RendererPackages/SVG/manifest.json", "1.1.0",
-             "d0f52f26a3914c18d957a756d6426a9905a9e958d339d0855831ff39ad32887a"),
+            ("RendererPackages/Mermaid/manifest.json", "1.1.1",
+             "a1b5f9d2a6e00285d8c67fc9691d4379e4404d83e2f294a9fbf2eea86545564b"),
+            ("RendererPackages/SVG/manifest.json", "1.1.1",
+             "003750b5f64c688797ee2863699c45b4266e8524688470861b16578d363f0eba"),
             ("RendererPackages/JSONCanvas/manifest.json", "1.2.0",
              "8bad166255e12ec34a6581eae0d4f457cb0f1a9ad8da55bab2a94398ab4daae0"),
         ]

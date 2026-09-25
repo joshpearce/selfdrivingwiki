@@ -3,8 +3,8 @@ import WikiFSEngine
 import SwiftUI
 import WikiFSCore
 
-/// The Sources section — a native header (Add buttons, filter picker, search)
-/// above an AppKit `NSTableView` (`SourcesListView`). Mirrors
+/// The Sources section — a native header (Add buttons, a filter menu icon,
+/// search) above an AppKit `NSTableView` (`SourcesListView`). Mirrors
 /// `PagesContainerView` / `BookmarksContainerView`. Filtering and search live
 /// here (SwiftUI); the AppKit list below stays dumb and just renders the
 /// computed array.
@@ -19,12 +19,13 @@ struct SourcesContainerView: View {
     let extractionProvider: any QueueExtractionProvider
     var ingestingSourceIDs: Set<SourceID> = []
 
-    @Binding var showingAddFromZotero: Bool
     @Binding var showingImportMarkdown: Bool
     var onAddFromURL: () -> Void
-    var isZoteroConfigured: Bool = false
 
     @State private var sourceFilter: SourceFilter = .all
+    /// Display order backing the "Sort by" menu. `lastUpdated` is the
+    /// store's native order — today's default.
+    @State private var sourceSort: SourceSortOrder = .lastUpdated
     @State private var renameTarget: SourceSummary?
     @State private var renameText = ""
     @State private var showBatchReingestConfirmation = false
@@ -32,13 +33,54 @@ struct SourcesContainerView: View {
     @State private var pendingReingestNames: [String] = []
     /// Non-nil while the bookmark-target picker is open for a source selection.
     @State private var addToBookmarksContext: BookmarkTargetPickerContext?
-    /// Non-nil while the incoming-reference delete confirmation is open (issue #219).
-    @State private var pendingDeletion: PendingSourceDeletion?
+    /// Non-nil while a delete-confirmation surface is on screen (issue #219
+    /// hardening): the typed outcome produced by the shared
+    /// `DeletionConfirmationCoordinator`.
+    @State private var deletionOutcome: DeletionConfirmationOutcome?
+    /// The source ids behind `deletionOutcome` — what the action handler deletes.
+    @State private var pendingDeletionIDs: [SourceID] = []
 
     enum SourceFilter: String, CaseIterable {
         case all = "All"
         case ready = "Ready"
         case ingested = "Processed"
+    }
+
+    /// Display order for the source list (follow-up to #241's Bookmarks
+    /// header). `lastUpdated` is the store's native `ORDER BY updated_at
+    /// DESC` — today's behavior — and the default. Raw value matches the
+    /// case name, mirroring `PageSortOrder`, should the choice persist later.
+    enum SourceSortOrder: String, CaseIterable {
+        /// Most recently updated first — the store's native order (default).
+        case lastUpdated
+        /// Most recently added first (`created_at DESC`).
+        case newestFirst
+        /// Display name, localized case-insensitive, A–Z.
+        case titleAZ
+
+        /// Sorts the source list for display. Pure; unit-tested without a
+        /// live store. Equal keys tie-break on `id.rawValue` (a ULID, so
+        /// monotonic by ingest time) for a deterministic order.
+        nonisolated func sorted(_ sources: [SourceSummary]) -> [SourceSummary] {
+            switch self {
+            case .lastUpdated:
+                return sources.sorted { a, b in
+                    if a.updatedAt != b.updatedAt { return a.updatedAt > b.updatedAt }
+                    return a.id.rawValue < b.id.rawValue
+                }
+            case .newestFirst:
+                return sources.sorted { a, b in
+                    if a.createdAt != b.createdAt { return a.createdAt > b.createdAt }
+                    return a.id.rawValue < b.id.rawValue
+                }
+            case .titleAZ:
+                return sources.sorted { a, b in
+                    let order = a.effectiveName.localizedCaseInsensitiveCompare(b.effectiveName)
+                    if order == .orderedSame { return a.id.rawValue < b.id.rawValue }
+                    return order == .orderedAscending
+                }
+            }
+        }
     }
 
     private var filteredSources: [SourceSummary] {
@@ -54,9 +96,15 @@ struct SourcesContainerView: View {
     /// paths via `SourceSummary.isPrimary`, so they never appear in the main
     /// Sources view — they are presentation content surfaced via embeds, not the
     /// content list (graph-model §4.2).
+    ///
+    /// The display sort applies only when NOT searching: search results are
+    /// relevance-ranked by the engine, and re-ranking them would destroy
+    /// that (mirrors `PagesContainerView`, which never sorts search results).
     private var visibleSources: [SourceSummary] {
-        (store.sourceSearchQuery.isEmpty ? filteredSources : store.sourceSearchResults)
-            .filter { $0.isPrimary }
+        if store.sourceSearchQuery.isEmpty {
+            return sourceSort.sorted(filteredSources.filter { $0.isPrimary })
+        }
+        return store.sourceSearchResults.filter { $0.isPrimary }
     }
 
     var body: some View {
@@ -114,16 +162,17 @@ struct SourcesContainerView: View {
                 }
             )
         }
-        .confirmationDialog(
-            pendingDeletion.map { deletionDialogTitle(for: $0) } ?? "",
-            isPresented: deletionDialogPresented,
-            titleVisibility: .visible,
-            presenting: pendingDeletion
-        ) { pending in
-            deletionDialogActions(for: pending)
-        } message: { pending in
-            Text(deletionDialogMessage(for: pending))
-        }
+        .deletionOutcomeDialog(
+            $deletionOutcome,
+            onAction: { action in
+                handleDeletionAction(action)
+            },
+            onOpenPage: { pageID in
+                // A clickable blocking page: open it so the user can remove
+                // the provenance reference, then retry the delete.
+                store.openTab(.page(pageID))
+            }
+        )
     }
 
     private var sourcesHeader: some View {
@@ -131,11 +180,6 @@ struct SourcesContainerView: View {
             HStack(spacing: 2) {
                 Text("Sources").font(.headline).foregroundStyle(.primary)
                 Spacer()
-                if isZoteroConfigured {
-                    headerButton(systemImage: "books.vertical", help: "Add from Zotero…") {
-                        showingAddFromZotero = true
-                    }
-                }
                 headerButton(systemImage: "link.badge.plus", help: "Add from URL…") {
                     onAddFromURL()
                 }
@@ -145,27 +189,67 @@ struct SourcesContainerView: View {
                 headerButton(systemImage: "folder.badge.plus", help: "Add Folder…") {
                     showingImportMarkdown = true
                 }
+                filterMenu
+                sortMenu
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-
-            HStack {
-                Text("Show").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Picker("Filter", selection: $sourceFilter) {
-                    Text("All").tag(SourceFilter.all)
-                    Text("Ready").tag(SourceFilter.ready)
-                    Text("Processed").tag(SourceFilter.ingested)
-                }
-                .pickerStyle(.menu).buttonStyle(.borderless).labelsHidden().fixedSize()
-            }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 2)
 
             sourceSearchBar
                 .padding(.horizontal, 4)
                 .padding(.vertical, 6)
         }
+    }
+
+    /// The "Show" source filter (issue follow-up to #241) — a filter icon
+    /// whose dropdown menu lists All / Ready / Processed, replacing the
+    /// former "Show" caption row. The `Picker` inside the `Menu` checks the
+    /// current choice; the icon tints accent while a non-default filter is
+    /// active. Same `Menu { Picker … }` pattern as the Bookmarks header.
+    private var filterMenu: some View {
+        Menu {
+            Picker("Filter", selection: $sourceFilter) {
+                Text("All").tag(SourceFilter.all)
+                Text("Ready").tag(SourceFilter.ready)
+                Text("Processed").tag(SourceFilter.ingested)
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Image(systemName: "line.3.horizontal.decrease")
+                .font(.body)
+                .frame(width: 24, height: 24)
+                .foregroundStyle(sourceFilter == .all ? Color.secondary : Color.accentColor)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Show")
+    }
+
+    /// The "Sort by" control — a sort icon whose dropdown lists the display
+    /// orders, the same `Menu { Picker … }` pattern as the filter icon.
+    /// The icon tints accent while a non-default (non-Last Updated) sort is
+    /// active. Last Updated is the store's native order — the default.
+    private var sortMenu: some View {
+        Menu {
+            Picker("Sort", selection: $sourceSort) {
+                Text("Last Updated").tag(SourceSortOrder.lastUpdated)
+                Text("Newest First").tag(SourceSortOrder.newestFirst)
+                Text("Title A–Z").tag(SourceSortOrder.titleAZ)
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Image(systemName: "arrow.up.arrow.down")
+                .font(.body)
+                .frame(width: 24, height: 24)
+                .foregroundStyle(sourceSort == .lastUpdated ? Color.secondary : Color.accentColor)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Sort by")
     }
 
     private var sourceSearchBar: some View {
@@ -288,107 +372,47 @@ struct SourcesContainerView: View {
         )
     }
 
-    // MARK: - Delete with incoming-reference warning (issue #219)
+    // MARK: - Delete with incoming-reference warning (issue #219 hardening)
 
+    /// Aggregate the incoming citations + bookmarks + provenance blockers for
+    /// the selected sources via the shared coordinator, then either delete
+    /// immediately (nothing references them) or route to the typed state.
     private func requestSourceDeletion(_ ids: [SourceID]) {
-        var linkingIDs: [PageID] = []
-        var bookmarkFolders: Set<String> = []
-        var bookmarkCount = 0
-        var blockedPageIDs = Set<PageID>()
-        for id in ids {
-            let impact = store.deletionImpact(forSource: id)
-            linkingIDs.append(contentsOf: impact.linkingPageIDs)
-            bookmarkCount += impact.bookmarkLabels.count
-            bookmarkFolders.formUnion(impact.bookmarkLabels)
-            blockedPageIDs.formUnion(impact.provenanceBlockers.map(\.pageID))
-        }
-        let displayTitles = Array(Set(linkingIDs))
-            .compactMap { id in store.summaries.first { $0.id == id }?.title }
-            .sorted()
-        let blockedTitles = blockedPageIDs
-            .compactMap { id in store.summaries.first { $0.id == id }?.title }
-            .sorted()
-
-        if blockedTitles.isEmpty && displayTitles.isEmpty && bookmarkCount == 0 {
-            confirmSourceDeletion(ids: ids, unlink: false)
+        pendingDeletionIDs = ids
+        let coordinator = DeletionConfirmationCoordinator(
+            kind: .source,
+            loadImpacts: {
+                try ids.map { try store.deletionImpact(forSource: $0) }
+            },
+            onDelete: { decision in
+                performSourceDeletion(ids: ids, decision: decision)
+            },
+            pageTitle: { id in
+                store.summaries.first { $0.id == id }?.title
+            },
+            selectionCount: ids.count)
+        let outcome = coordinator.evaluate()
+        if case .deleteImmediately = outcome {
+            // No references, no blockers — delete without a dialog.
+            coordinator.perform(.delete)
         } else {
-            pendingDeletion = PendingSourceDeletion(
-                ids: ids,
-                linkingPageTitles: displayTitles,
-                bookmarkCount: bookmarkCount,
-                bookmarkFolders: bookmarkFolders.sorted(),
-                blockedPageTitles: blockedTitles)
+            deletionOutcome = outcome
         }
     }
 
-    private func confirmSourceDeletion(ids: [SourceID], unlink: Bool) {
-        for id in ids { store.deleteSource(id, unlinkIncomingLinks: unlink) }
-        pendingDeletion = nil
+    private func performSourceDeletion(ids: [SourceID], decision: DeletionDecision) {
+        // ONE protected transaction for the whole selection; on failure the
+        // model surfaces the store error and returns nil (nothing changed).
+        _ = store.performSourceDeletion(ids, unlinkIncomingLinks: decision == .unlink)
     }
 
-    private var deletionDialogPresented: Binding<Bool> {
-        Binding(
-            get: { pendingDeletion != nil },
-            set: { if !$0 { pendingDeletion = nil } }
-        )
+    private func handleDeletionAction(_ action: DeletionDialogAction) {
+        let ids = pendingDeletionIDs
+        switch action {
+        case .unlinkAndDelete: performSourceDeletion(ids: ids, decision: .unlink)
+        case .delete: performSourceDeletion(ids: ids, decision: .preserve)
+        case .cancel: break
+        }
+        pendingDeletionIDs = []
     }
-
-    private func deletionDialogTitle(for pending: PendingSourceDeletion) -> String {
-        if !pending.blockedPageTitles.isEmpty { return "Can't Delete Source" }
-        return pending.ids.count == 1 ? "Delete Source?" : "Delete \(pending.ids.count) Sources?"
-    }
-
-    private func deletionDialogMessage(for pending: PendingSourceDeletion) -> String {
-        if !pending.blockedPageTitles.isEmpty {
-            let names = pending.blockedPageTitles.joined(separator: ", ")
-            return "This source is referenced as evidence by page versions (\(names)). Remove those references before deleting."
-        }
-        var lines: [String] = []
-        if !pending.linkingPageTitles.isEmpty {
-            let names = pending.linkingPageTitles.joined(separator: ", ")
-            let noun = pending.linkingPageTitles.count == 1 ? "page" : "pages"
-            lines.append("Cited by \(pending.linkingPageTitles.count) \(noun): \(names).")
-        }
-        if pending.bookmarkCount > 0 {
-            let noun = pending.bookmarkCount == 1 ? "bookmark" : "bookmarks"
-            let where_ = pending.bookmarkFolders.joined(separator: ", ")
-            lines.append("\(pending.bookmarkCount) \(noun) point to this and will be removed (\(where_)).")
-        }
-        if !pending.linkingPageTitles.isEmpty {
-            lines.append("Unlink and Delete converts the citations to plain text.")
-        }
-        return lines.joined(separator: "\n")
-    }
-
-    @ViewBuilder
-    private func deletionDialogActions(for pending: PendingSourceDeletion) -> some View {
-        if !pending.blockedPageTitles.isEmpty {
-            Button("OK", role: .cancel) { pendingDeletion = nil }
-        } else if !pending.linkingPageTitles.isEmpty {
-            Button("Unlink and Delete", role: .destructive) {
-                confirmSourceDeletion(ids: pending.ids, unlink: true)
-            }
-            Button("Delete", role: .destructive) {
-                confirmSourceDeletion(ids: pending.ids, unlink: false)
-            }
-            Button("Cancel", role: .cancel) { pendingDeletion = nil }
-        } else {
-            Button("Delete", role: .destructive) {
-                confirmSourceDeletion(ids: pending.ids, unlink: false)
-            }
-            Button("Cancel", role: .cancel) { pendingDeletion = nil }
-        }
-    }
-}
-
-/// State carried by the incoming-reference delete-confirmation dialog
-/// (issue #219). When `blockedPageTitles` is non-empty, the source can't be
-/// deleted at all (provenance-restricted) and only an OK button is shown.
-private struct PendingSourceDeletion: Identifiable {
-    let id = UUID()
-    let ids: [SourceID]
-    let linkingPageTitles: [String]
-    let bookmarkCount: Int
-    let bookmarkFolders: [String]
-    let blockedPageTitles: [String]
 }

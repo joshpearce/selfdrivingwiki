@@ -54,7 +54,34 @@ public enum ReviewedExtractorPackages {
         version: "1.0.0",
         digest: "ae5247e9108a0da5b8deb4f1dda154f72939c758f9f3db8f12d4dbb61977d42e")
 
-    public static let all: [ReviewedExtractorPackage] = [defuddle, pdf2md, doclingServe, docx2md]
+    public static let podcastTranscript = make(
+        directoryName: "PodcastTranscript",
+        packageID: "org.selfdrivingwiki.podcast-transcript",
+        version: "1.0.1",
+        digest: "14ea800bd0fd525a925f5bc47ce4b4cf5b3b6d31892edfea20e0cb8d3a5621af")
+
+    public static let applePodcastTranscript = make(
+        directoryName: "ApplePodcastTranscript",
+        packageID: "org.selfdrivingwiki.apple-podcast-transcript",
+        version: "1.0.0",
+        digest: "7d02732f4d7b91368b73c08fe7c7cd8b7c2761b341c49e92a00d03318369d3a8")
+
+    public static let youtubeTranscript = make(
+        directoryName: "YouTubeTranscript",
+        packageID: "org.selfdrivingwiki.youtube-transcript",
+        version: "1.0.1",
+        digest: "23e987d6ee3207ff89fb506a23c5ccef8e2693410dd14bc7f8e47e4f8acd7679")
+
+    public static let zotero = make(
+        directoryName: "Zotero",
+        packageID: "org.selfdrivingwiki.zotero",
+        version: "1.0.2",
+        digest: "5460e414e96cc8f4dc87dfd561cdbb2d6cdd16a2cb360c85d736803539643a83")
+
+    public static let all: [ReviewedExtractorPackage] = [
+        defuddle, pdf2md, doclingServe, docx2md, podcastTranscript,
+        applePodcastTranscript, youtubeTranscript, zotero,
+    ]
 
     /// Locates the reviewed payload. `Bundle.main` resolves in both hosts:
     /// `build.sh` copies the same tree into the application resources and into
@@ -96,6 +123,75 @@ public enum ReviewedExtractorPackages {
         } catch {
             preconditionFailure("Invalid compiled reviewed extractor identity: \(error)")
         }
+    }
+}
+
+/// One reviewed-lineage host-credential binding (security review HIGH-1):
+/// the exact stored credential a reviewed package's declared requirement
+/// resolves to when the user authorizes it. These references are reserved
+/// for their reviewed lineages — a package outside this table can never
+/// bind to them, no matter what it names its requirements.
+///
+/// One table serves both binding-policy consumers — publish-time grant
+/// seeding (`ReviewedExtractorBootstrap`) and the Settings authorize
+/// action (`ExtractorCredentialSettingsSupport`) — so the two can never
+/// disagree about which credential a lineage uses.
+public struct ReviewedExtractorCredentialBinding: Sendable, Hashable {
+    public let package: ReviewedExtractorPackage
+    public let requirementID: ExtractorCredentialRequirementID
+    public let reference: CredentialReference
+}
+
+/// Compiled reviewed credential bindings: golden constants with the same
+/// standing as the reviewed package identities.
+public enum ReviewedExtractorCredentialBindings {
+    /// Docling Serve's optional API token at its legacy extraction location.
+    public static let doclingServeToken = make(
+        package: ReviewedExtractorPackages.doclingServe,
+        requirementID: "api-token",
+        reference: CredentialReference.extraction(.doclingServeToken))
+
+    /// The Zotero API key at its legacy zotero-service location — the same
+    /// reference the generic extractor-package credential dialog writes and
+    /// publish-time seeding grants.
+    public static let zoteroAPIKey = make(
+        package: ReviewedExtractorPackages.zotero,
+        requirementID: "zotero-api-key",
+        reference: .zoteroAPIKey())
+
+    public static let all: [ReviewedExtractorCredentialBinding] = [
+        doclingServeToken,
+        zoteroAPIKey,
+    ]
+
+    /// The reserved binding for one lineage + requirement id, if any.
+    public static func binding(
+        packageID: String,
+        requirementID: String
+    ) -> ReviewedExtractorCredentialBinding? {
+        all.first {
+            $0.package.packageID.rawValue == packageID
+                && $0.requirementID.rawValue == requirementID
+        }
+    }
+
+    /// Golden-constant construction: an invalid id or reference is a
+    /// programmer error and crashes at first touch.
+    private static func make(
+        package: ReviewedExtractorPackage,
+        requirementID: String,
+        reference: CredentialReference?
+    ) -> ReviewedExtractorCredentialBinding {
+        guard let requirementID = ExtractorCredentialRequirementID(rawValue: requirementID),
+              let reference
+        else {
+            preconditionFailure(
+                "Invalid compiled reviewed credential binding: \(package.packageID.rawValue)/\(requirementID)")
+        }
+        return ReviewedExtractorCredentialBinding(
+            package: package,
+            requirementID: requirementID,
+            reference: reference)
     }
 }
 

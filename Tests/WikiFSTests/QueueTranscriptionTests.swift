@@ -306,7 +306,9 @@ struct QueueTranscriptionTests {
             from: events,
             timeout: .seconds(5))
 
-        #expect(lines == ["Fetching transcript…"])
+        // Lines carry an elapsed-time stamp prefix ([mm:ss]).
+        #expect(lines.count == 1)
+        #expect(lines.first?.hasSuffix("Fetching transcript…") == true)
         store.close()
     }
 
@@ -371,27 +373,45 @@ private final class FakeTranscriptionProvider: QueueExtractionProvider, @uncheck
 
         switch resolveResult {
         case .resolved:
-            return ExtractionResolution(
-                transcriptFetch: { @Sendable in
+            return .transcript(TranscriptExtractionResolution(
+                fetch: { _ in
                     try await self.fetchBehavior()
-                    return "# Transcript markdown"
+                    return TranscriptFetchOutcome(markdown: "# Transcript markdown")
                 },
-                technique: "youtube-captions",
-                filename: "transcript")
+                filename: "transcript",
+                resultMode: .builtInTool(.youtubeCaptions)))
         case .nilResolution:
             return nil
         }
     }
 
-    func persistExtraction(
+    func persistBytesExtraction(
         wikiID: WikiID, sourceID: SourceID,
-        markdown: String, backend: ExtractionBackend,
-        modelVersion: String?, technique: String?
-    ) async throws {
+        resolution: BytesExtractionResolution, markdown: String
+    ) async throws -> QueueExtractionOutputReference? {
         lock.withLock { state in
-            state.callLog.append("persist(wikiID:\(wikiID.rawValue), sourceID:\(sourceID.rawValue), technique:\(technique ?? "nil"))")
+            state.callLog.append("persistBytes(wikiID:\(wikiID.rawValue), sourceID:\(sourceID.rawValue))")
         }
+        return nil
     }
+
+    func persistTranscriptExtraction(
+        wikiID: WikiID, sourceID: SourceID,
+        resolution: TranscriptExtractionResolution, outcome: TranscriptFetchOutcome
+    ) async throws -> QueueExtractionOutputReference? {
+        lock.withLock { state in
+            state.callLog.append("persist(wikiID:\(wikiID.rawValue), sourceID:\(sourceID.rawValue), tool:\(resolution.resultMode))")
+            state.lastTechnique = "youtube-captions"
+        }
+        return nil
+    }
+
+    func persistAttachmentExtraction(
+        wikiID: WikiID, sourceID: SourceID,
+        resolution: AttachmentExtractionResolution, outcome: AttachmentFetchOutcome
+    ) async throws -> QueueExtractionOutputReference? { nil }
+
+    func enqueueFollowOnExtraction(wikiID: WikiID, sourceID: SourceID) async throws {}
 }
 
 // MARK: - Progress event wait + CountDownLatch

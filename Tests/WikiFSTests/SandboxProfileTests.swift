@@ -9,6 +9,7 @@ struct SandboxProfileTests {
 
   static let scratchDir = "/Users/me/Library/Caches/Self Driving Wiki-agent/UUID"
   static let wikiDB = "/Users/me/Library/Group Containers/group.x/01WIKI.sqlite"
+  static let queueDB = "/Users/me/Library/Group Containers/group.x/queue.sqlite"
 
   private func profile() -> String {
     SandboxProfile.generate(
@@ -44,6 +45,31 @@ struct SandboxProfileTests {
 
   @Test func sidecarSuffixesAreExactlyWalShmJournal() {
     #expect(SandboxProfile.sqliteSidecarSuffixes == ["-wal", "-shm", "-journal"])
+  }
+
+  @Test func queueDatabaseAllowanceIsExplicitAndIncludesSQLiteSidecars() {
+    let invocation = SandboxProfile.invocation(
+      homePath: "/Users/me",
+      scratchDir: Self.scratchDir,
+      wikiDBPath: Self.wikiDB,
+      queueDBPath: Self.queueDB)
+
+    #expect(invocation.defines.contains { $0.0 == "QUEUE_DB" && $0.1 == Self.queueDB })
+    #expect(invocation.profile.contains("(allow file-write* (literal (param \"QUEUE_DB\")))"))
+    for suffix in SandboxProfile.sqliteSidecarSuffixes {
+      #expect(invocation.profile.contains(
+        "(allow file-write* (literal (string-append (param \"QUEUE_DB\") \"\(suffix)\")))"))
+    }
+  }
+
+  @Test func queueDatabaseAllowanceIsAbsentUnlessRequested() {
+    let invocation = SandboxProfile.invocation(
+      homePath: "/Users/me",
+      scratchDir: Self.scratchDir,
+      wikiDBPath: Self.wikiDB)
+
+    #expect(invocation.defines.contains { $0.0 == "QUEUE_DB" } == false)
+    #expect(invocation.profile.contains("QUEUE_DB") == false)
   }
 
   // MARK: - Claude config writes (generate)
@@ -348,5 +374,172 @@ struct SandboxProfileTests {
     // hooks is a DIR → subpath, not literal.
     #expect(p.contains("(deny file-write* (subpath (string-append (param \"HOME\") \"/.claude/hooks\")))"))
     #expect(!p.contains("(deny file-write* (literal (string-append (param \"HOME\") \"/.claude/hooks\")))"))
+  }
+
+  // MARK: - Provider config-home extras (issue #1251)
+
+  /// Empty extras return the base invocation unchanged — providers whose
+  /// config home the base profile already allows (claude) must compile to a
+  /// byte-identical profile.
+  @Test func addingHomeSubpathsEmptyIsIdentity() {
+    let base = SandboxProfile.invocation(
+      homePath: "/Users/me", scratchDir: Self.scratchDir, wikiDBPath: Self.wikiDB)
+    let same = SandboxProfile.invocation(base, addingHomeSubpaths: [])
+    #expect(same == base)
+  }
+
+  /// Each extra subpath appends one `allow file-write*` rule that reuses the
+  /// existing HOME define; defines are unchanged (HOME is already present).
+  @Test func addingHomeSubpathsAppendsAllowRulesWithoutNewDefines() throws {
+    let base = SandboxProfile.invocation(
+      homePath: "/Users/me", scratchDir: Self.scratchDir, wikiDBPath: Self.wikiDB)
+    let widened = SandboxProfile.invocation(base, addingHomeSubpaths: [".codex"])
+    #expect(widened.profile.contains(
+      "(allow file-write* (subpath (string-append (param \"HOME\") \"/.codex\")))"))
+    // Appended AFTER the base rules (last-match-wins semantics stay intact).
+    #expect(widened.profile.hasSuffix(
+      "(allow file-write* (subpath (string-append (param \"HOME\") \"/.codex\")))\n"))
+    #expect(widened.defines.map { $0.0 } == base.defines.map { $0.0 })
+    #expect(widened.defines.map { $0.1 } == base.defines.map { $0.1 })
+    // Two extras append two rules in order.
+    let both = SandboxProfile.invocation(base, addingHomeSubpaths: [".codex", ".gemini"])
+    #expect(both.profile.contains("\"/.codex\""))
+    #expect(both.profile.contains("\"/.gemini\""))
+    let codexRange = try #require(both.profile.range(of: "\"/.codex\""))
+    let geminiRange = try #require(both.profile.range(of: "\"/.gemini\""))
+    #expect(codexRange.lowerBound < geminiRange.lowerBound)
+  }
+
+  /// The shared argv wrap: `-p <profile> -D k=v … -- <executable> <args…>`,
+  /// the exact pattern the deleted `OperationCommand.applySandbox` used.
+  @Test func wrappedArgumentsMatchesDeletedApplySandboxPattern() {
+    let invocation = SandboxProfile.SandboxInvocation(
+      profile: "(version 1)",
+      defines: [("HOME", "/Users/me"), ("SCRATCH_DIR", "/tmp/scratch")])
+    let wrapped = SandboxProfile.wrappedArguments(
+      executablePath: "/usr/local/bin/claude",
+      arguments: ["--print", "hi"],
+      invocation: invocation)
+    #expect(wrapped == [
+      "-p", "(version 1)",
+      "-D", "HOME=/Users/me",
+      "-D", "SCRATCH_DIR=/tmp/scratch",
+      "--", "/usr/local/bin/claude",
+      "--print", "hi",
+    ])
+    // The front-end path is the absolute system location, never a PATH search.
+    #expect(SandboxProfile.sandboxExecutablePath == "/usr/bin/sandbox-exec")
+  }
+
+  // MARK: - Strict summarizer tier (issue #1276)
+
+  private func strictInvocation() -> SandboxProfile.SandboxInvocation {
+    SandboxProfile.strictReadOnlyInvocation(
+      homePath: "/Users/me",
+      scratchDir: Self.scratchDir,
+      claudeTempBase: "/private/tmp/claude-501")
+  }
+
+  private func plainReadOnlyInvocation() -> SandboxProfile.SandboxInvocation {
+    SandboxProfile.readOnlyInvocation(
+      homePath: "/Users/me",
+      scratchDir: Self.scratchDir,
+      claudeTempBase: "/private/tmp/claude-501")
+  }
+
+  /// P1 + P2: strict is purely ADDITIVE — the non-strict profile is its exact
+  /// base (byte-identical prefix), and the non-strict invocation keeps its
+  /// trailer-less shape so extraction/probe output is unchanged.
+  @Test func strict_readOnlyProfileIsAnExactPrefix() {
+    let strict = strictInvocation()
+    let plain = plainReadOnlyInvocation()
+    #expect(strict.baseProfile == plain.profile)
+    #expect(plain.trailer.isEmpty)
+    #expect(plain.profile == plain.baseProfile)
+    #expect(strict.profile.hasPrefix(plain.profile))
+    #expect(strict.profile != plain.profile)
+  }
+
+  /// P3: the trailer pins the exact deny s-expressions — a silent edit fails.
+  @Test func strict_trailerPinsTheRuleText() {
+    let strict = strictInvocation()
+    let required = [
+      // W^X on writable land (exec AND the mmap variant).
+      "(deny process-exec* (subpath (param \"SCRATCH_DIR\")))",
+      "(deny file-map-executable (subpath (param \"SCRATCH_DIR\")))",
+      "(deny process-exec* (subpath (param \"CLAUDE_TMP\")))",
+      "(deny process-exec* (subpath \"/private/tmp\"))",
+      "(deny file-map-executable (subpath \"/private/tmp\"))",
+      "(deny process-exec* (subpath \"/private/var/tmp\"))",
+      // macOS pivots/escapes.
+      "(deny process-exec* (literal \"/usr/bin/open\"))",
+      "(deny process-exec* (literal \"/bin/launchctl\"))",
+      "(deny process-exec* (literal \"/usr/bin/osascript\"))",
+      "(deny process-exec* (literal \"/usr/bin/security\"))",
+      "(deny process-exec* (literal \"/usr/bin/crontab\"))",
+      "(deny process-exec* (literal \"/usr/bin/sudo\"))",
+      // Credential stores (subpath + literal forms).
+      "(deny file-read* (subpath (string-append (param \"HOME\") \"/.ssh\")))",
+      "(deny file-read* (subpath (string-append (param \"HOME\") \"/.aws\")))",
+      "(deny file-read* (subpath (string-append (param \"HOME\") \"/.gnupg\")))",
+      "(deny file-read* (subpath (string-append (param \"HOME\") \"/.config/gcloud\")))",
+      "(deny file-read* (literal (string-append (param \"HOME\") \"/.netrc\")))",
+      "(deny file-read* (subpath \"/Library/Keychains\"))",
+      // Personal data.
+      "(deny file-read* (subpath (string-append (param \"HOME\") \"/Library/Safari\")))",
+    ]
+    for rule in required {
+      #expect(strict.trailer.contains(rule), "missing strict rule: \(rule)")
+    }
+  }
+
+  /// P4 (the highest-value invariant): the seatbelt is LAST-MATCH-WINS, so
+  /// layering provider-home write allows must fold them into the BASE and
+  /// carry the strict trailer through unchanged — always emitted last.
+  @Test func strict_layeredHomeSubpathsKeepTheTrailerLast() {
+    let strict = strictInvocation()
+    let layered = SandboxProfile.invocation(strict, addingHomeSubpaths: [".codex", ".bun"])
+    #expect(layered.baseProfile.contains("\"/.codex\""))
+    #expect(layered.baseProfile.contains("\"/.bun\""))
+    #expect(layered.trailer == strict.trailer)
+    #expect(layered.profile.hasSuffix(strict.trailer.last! + "\n"))
+    // The trailer rules must all appear AFTER the layered allows in the
+    // effective profile text.
+    let lastAllow = layered.baseProfile.range(of: "\"/.bun\"")!.lowerBound
+    let firstTrailer = layered.profile.range(of: strict.trailer[0])!.lowerBound
+    #expect(lastAllow < firstTrailer)
+  }
+
+  /// P5: strict adds NO new defines — argv indices and existing wiring stay
+  /// valid.
+  @Test func strict_addsNoNewDefines() {
+    let plain = plainReadOnlyInvocation()
+    let strict = strictInvocation()
+    #expect(strict.defines.count == plain.defines.count)
+    #expect(strict.defines.map { $0.0 } == plain.defines.map { $0.0 })
+    #expect(strict.defines.map { $0.1 } == plain.defines.map { $0.1 })
+  }
+
+  /// P8 + canonical-path discipline: the temp denies use the canonical
+  /// `/private/tmp` and `/private/var/tmp`, never bare `/tmp`, and no
+  /// `string-append` root leaves a doubled slash.
+  @Test func strict_usesCanonicalTempPathsNeverBareTmp() {
+    let strict = strictInvocation()
+    #expect(strict.profile.contains("(deny process-exec* (subpath \"/private/tmp\"))"))
+    #expect(strict.profile.contains("(deny process-exec* (subpath \"/private/var/tmp\"))"))
+    #expect(!strict.profile.contains("(deny process-exec* (subpath \"/tmp\"))"))
+    #expect(!strict.profile.contains("//"))
+  }
+
+  /// The fence must stay read-only (no wiki DB ever) and must NOT deny the
+  /// interpreters an arbitrary ACP adapter may itself be (`uv`, `bun`,
+  /// `python3`, `node`).
+  @Test func strict_noWikiDBAndNoInterpreterDenies() {
+    let strict = strictInvocation()
+    #expect(!strict.profile.contains("WIKI_DB"))
+    #expect(!strict.profile.contains("(deny process-exec* (literal \"/usr/bin/python3\"))"))
+    #expect(!strict.profile.contains("(deny process-exec* (literal \"/usr/bin/env\"))"))
+    #expect(!strict.profile.contains("(deny process-exec* (literal \"/usr/bin/uv\"))"))
+    #expect(!strict.profile.contains("(deny process-exec* (literal \"/usr/bin/bun\"))"))
   }
 }

@@ -42,12 +42,13 @@ enum ProcessPackagePreparationError: LocalizedError, Equatable {
     }
 }
 
-enum ProcessPackageRunError: LocalizedError, Equatable {
+public enum ProcessPackageRunError: LocalizedError, Equatable {
     case declaredSizeMismatch
     case invalidOutputEncoding
     case missingTerminalFrame
+    case unexpectedBytesResult
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .declaredSizeMismatch:
             return "The extractor reported a different result size than written."
@@ -55,6 +56,8 @@ enum ProcessPackageRunError: LocalizedError, Equatable {
             return "The extractor result was not valid UTF-8."
         case .missingTerminalFrame:
             return "The extractor returned no terminal result."
+        case .unexpectedBytesResult:
+            return "The extractor returned source bytes where Markdown was expected."
         }
     }
 }
@@ -87,6 +90,25 @@ internal struct ProcessPackageExecutionOutcome: Sendable {
     var reportedMetadata: ExtractorReportedMetadata { frame.metadata }
 }
 
+/// The verified terminal output of one operation before interpretation: the
+/// redacted result frame plus the raw output-file bytes. A Markdown result
+/// decodes `outputData` as UTF-8; a revision-4 bytes result passes the bytes
+/// through with `frame.resultMIMEType`.
+internal struct ProcessPackageTerminalOutput: Sendable {
+    let frame: ExtractorResultFrame
+    let outputData: Data
+}
+
+/// A revision-4 bytes-capable operation outcome: the terminal frame plus the
+/// output-file bytes. The caller interprets `frame.isMarkdownResult` — the
+/// Zotero attachment route can receive either shape from the same package.
+internal struct ProcessPackageSourceOutcome: Sendable {
+    let frame: ExtractorResultFrame
+    let sourceBytes: Data
+
+    var reportedMetadata: ExtractorReportedMetadata { frame.metadata }
+}
+
 /// Builds process-backed extraction adapters for one exact validated package
 /// revision. Every preparation rechecks admission and authoritative catalog
 /// membership before pinning a private validated snapshot; the resulting
@@ -109,6 +131,15 @@ public struct ProcessExtractorProvider: Sendable {
     /// operation-configuration file, never the credential file.
     let operationConfiguration:
         (@Sendable (ExtractorPackageRevisionID) -> ExtractorOperationConfiguration?)?
+    /// Reviewed-only operation support (the staged token helper). The
+    /// provider admits by exact revision; nil for hosts and tests that never
+    /// stage support.
+    let operationSupport: (any ExtractorOperationSupportProviding)?
+    /// The host-owned durable token-cache root for one exact revision (the
+    /// reviewed Apple package). Nil for every other revision; the closure —
+    /// not this engine — owns the exact-revision admission decision.
+    let durableTokenCacheRoot:
+        (@Sendable (ExtractorPackageRevisionID) -> URL?)?
     /// The one extractor runtime locator. Preparation resolves each runtime
     /// command through it exactly once and retains the outcome.
     let runtimeLocator: any ExtractorRuntimeLocating
@@ -125,6 +156,8 @@ public struct ProcessExtractorProvider: Sendable {
         sharedModelCacheRoot: URL? = nil,
         operationCredentials: (any ExtractorOperationCredentialResolving)? = nil,
         operationConfiguration: (@Sendable (ExtractorPackageRevisionID) -> ExtractorOperationConfiguration?)? = nil,
+        operationSupport: (any ExtractorOperationSupportProviding)? = nil,
+        durableTokenCacheRoot: (@Sendable (ExtractorPackageRevisionID) -> URL?)? = nil,
         runtimeLocator: (any ExtractorRuntimeLocating)? = nil
     ) {
         self.layout = layout
@@ -137,6 +170,8 @@ public struct ProcessExtractorProvider: Sendable {
         self.sharedModelCacheRoot = sharedModelCacheRoot
         self.operationCredentials = operationCredentials
         self.operationConfiguration = operationConfiguration
+        self.operationSupport = operationSupport
+        self.durableTokenCacheRoot = durableTokenCacheRoot
         self.runtimeLocator = runtimeLocator ?? RuntimeCommandLocator()
     }
 
@@ -194,6 +229,61 @@ public struct ProcessExtractorProvider: Sendable {
         let operation = try await prepareOperation(
             kind: .docx, revision: revision, manifest: manifest)
         return ProcessPackageDOCXExtractor(operation: operation)
+    }
+
+    /// Prepares the process-backed podcast transcript adapter for one exact
+    /// package revision. The adapter accepts a typed source URL and runs a
+    /// `remote-url` revision-3 operation against the pinned snapshot — no
+    /// input bytes are staged. Readiness, cancellation, deadline, redaction,
+    /// and output validation reuse the shared operation path.
+    public func preparePodcastTranscript(
+        revision: ExtractorPackageRevisionID,
+        manifest: ExtractorManifest
+    ) async throws -> ProcessPackagePodcastTranscript {
+        let operation = try await prepareOperation(
+            kind: .podcastTranscript, revision: revision, manifest: manifest)
+        return ProcessPackagePodcastTranscript(operation: operation)
+    }
+
+    /// Prepares the process-backed Apple Podcasts transcript adapter for one
+    /// exact package revision. Same `remote-url` revision-3 operation shape
+    /// as the RSS sibling; the Apple package decides between its Apple TTML
+    /// workflow and its RSS fallback from the host-staged operation support,
+    /// never from a request field.
+    public func prepareApplePodcastTranscript(
+        revision: ExtractorPackageRevisionID,
+        manifest: ExtractorManifest
+    ) async throws -> ProcessPackageApplePodcastTranscript {
+        let operation = try await prepareOperation(
+            kind: .applePodcastTranscript, revision: revision, manifest: manifest)
+        return ProcessPackageApplePodcastTranscript(operation: operation)
+    }
+
+    /// Prepares the process-backed YouTube transcript adapter for one exact
+    /// package revision. Same `remote-url` revision-3 operation shape as the
+    /// podcast siblings; the package fetches only the captions YouTube
+    /// exposes — media download and speech-to-text stay outside the
+    /// registration.
+    public func prepareYouTubeTranscript(
+        revision: ExtractorPackageRevisionID,
+        manifest: ExtractorManifest
+    ) async throws -> ProcessPackageYouTubeTranscript {
+        let operation = try await prepareOperation(
+            kind: .youtubeTranscript, revision: revision, manifest: manifest)
+        return ProcessPackageYouTubeTranscript(operation: operation)
+    }
+
+    /// Prepares the process-backed Zotero attachment adapter for one exact
+    /// package revision. Same `remote-url` request shape as the transcript
+    /// siblings; the revision-4 operation returns either a Markdown result
+    /// or a bytes result carrying `resultMIMEType` plus article metadata.
+    public func prepareZoteroAttachment(
+        revision: ExtractorPackageRevisionID,
+        manifest: ExtractorManifest
+    ) async throws -> ProcessPackageZoteroAttachment {
+        let operation = try await prepareOperation(
+            kind: .zotero, revision: revision, manifest: manifest)
+        return ProcessPackageZoteroAttachment(operation: operation)
     }
 
     public static func packageProvenance(
@@ -273,9 +363,14 @@ public struct ProcessExtractorProvider: Sendable {
                 at: sharedRoot,
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700])
-            guard try Self.isOwnerPrivateDirectory(sharedRoot) else {
-                throw ExtractorDirectoryAdmissionError.preparationFailed
-            }
+            // `createDirectory(attributes:)` applies the mode only when it
+            // creates the final component. A pre-existing root — for example
+            // one seeded by a manual `uv` run, which creates world-traversable
+            // directories — keeps its old mode and would fail verification
+            // forever. Ownership is the safety boundary (as in
+            // `removeStoreTree`): tighten any owner-owned root to 0700, then
+            // verify.
+            try Self.normalizeOwnerPrivateDirectory(sharedRoot)
         }
         let materializedRevision = try ExtractorDirectoryValidator.materializeOperationPackage(
             from: snapshot,
@@ -327,17 +422,48 @@ public struct ProcessExtractorProvider: Sendable {
             },
             operationCredentials: operationCredentials,
             operationConfiguration: operationConfiguration,
+            operationSupport: operationSupport,
+            durableTokenCacheRoot: durableTokenCacheRoot,
             runtimeResolution: runtimeResolution)
     }
 
     private static func isOwnerPrivateDirectory(_ url: URL) throws -> Bool {
         var status = stat()
         guard lstat(url.path, &status) == 0 else {
-            throw ExtractorDirectoryAdmissionError.preparationFailed
+            throw ExtractorDirectoryAdmissionError.preparationFailure(errno: errno, stage: "lstat directory")
         }
         return status.st_mode & S_IFMT == S_IFDIR
             && status.st_uid == getuid()
             && status.st_mode & 0o7777 == 0o700
+    }
+
+    /// Tightens an existing shared cache root to owner-private 0700, then
+    /// verifies it through the opened descriptor. Refuses anything that is
+    /// not a directory owned by this UID — ownership is the boundary that
+    /// makes the chmod safe, matching `removeStoreTree`.
+    static func normalizeOwnerPrivateDirectory(_ url: URL) throws {
+        let fd = url.path.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW) }
+        guard fd >= 0 else {
+            throw ExtractorDirectoryAdmissionError.preparationFailure(errno: errno, stage: "open shared cache root")
+        }
+        defer { close(fd) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0 else {
+            throw ExtractorDirectoryAdmissionError.preparationFailure(errno: errno, stage: "fstat shared cache root")
+        }
+        guard opened.st_mode & S_IFMT == S_IFDIR, opened.st_uid == getuid() else {
+            throw ExtractorDirectoryAdmissionError.preparationFailure("shared cache root is not an owner directory")
+        }
+        guard fchmod(fd, 0o700) == 0 else {
+            throw ExtractorDirectoryAdmissionError.preparationFailure(errno: errno, stage: "fchmod shared cache root")
+        }
+        var tightened = stat()
+        guard fstat(fd, &tightened) == 0,
+              tightened.st_mode & S_IFMT == S_IFDIR,
+              tightened.st_uid == getuid(),
+              tightened.st_mode & 0o7777 == 0o700 else {
+            throw ExtractorDirectoryAdmissionError.preparationFailure("shared cache directory verification failed")
+        }
     }
 
     static func registration(
@@ -382,6 +508,12 @@ public final class PreparedProcessOperation: Sendable {
     let operationCredentials: (any ExtractorOperationCredentialResolving)?
     let operationConfiguration:
         (@Sendable (ExtractorPackageRevisionID) -> ExtractorOperationConfiguration?)?
+    /// Reviewed-only operation support staging (exact-revision admitted).
+    let operationSupport: (any ExtractorOperationSupportProviding)?
+    /// The host-owned durable token-cache root closure (exact-revision
+    /// admitted by the closure itself).
+    let durableTokenCacheRoot:
+        (@Sendable (ExtractorPackageRevisionID) -> URL?)?
     /// The one retained runtime resolution. Nil for a `direct` launch; for a
     /// `runtime` launch it holds the single success or typed failure resolved
     /// at preparation. Readiness and every execute consume exactly this
@@ -406,6 +538,8 @@ public final class PreparedProcessOperation: Sendable {
         launchGate: (@Sendable () async throws -> Void)?,
         operationCredentials: (any ExtractorOperationCredentialResolving)?,
         operationConfiguration: (@Sendable (ExtractorPackageRevisionID) -> ExtractorOperationConfiguration?)?,
+        operationSupport: (any ExtractorOperationSupportProviding)? = nil,
+        durableTokenCacheRoot: (@Sendable (ExtractorPackageRevisionID) -> URL?)? = nil,
         runtimeResolution: RuntimeCommandOutcome?
     ) {
         self.directoryRoot = directoryRoot
@@ -425,6 +559,8 @@ public final class PreparedProcessOperation: Sendable {
         self.launchGate = launchGate
         self.operationCredentials = operationCredentials
         self.operationConfiguration = operationConfiguration
+        self.operationSupport = operationSupport
+        self.durableTokenCacheRoot = durableTokenCacheRoot
         self.runtimeResolution = runtimeResolution
     }
 
@@ -498,9 +634,84 @@ public final class PreparedProcessOperation: Sendable {
         filename: String,
         onProgress: (@Sendable (String) -> Void)?
     ) async throws -> ProcessPackageExecutionOutcome {
+        try await Self.markdownOutcome(runProtocol(
+            kind: kind,
+            payload: .bytes(input),
+            filename: filename,
+            onProgress: onProgress))
+    }
+
+    /// Runs exactly one one-shot `remote-url` conversion against the pinned
+    /// snapshot. No input bytes exist, so nothing is staged; the request
+    /// carries the validated source URL only.
+    func execute(
+        kind: ExtractorKind,
+        remoteURL: ExtractorRemoteSourceURL,
+        filename: String,
+        onProgress: (@Sendable (String) -> Void)?
+    ) async throws -> ProcessPackageExecutionOutcome {
+        try await Self.markdownOutcome(runProtocol(
+            kind: kind,
+            payload: .remoteURL(remoteURL),
+            filename: filename,
+            onProgress: onProgress))
+    }
+
+    /// Runs one revision-4-capable `remote-url` operation and returns the
+    /// terminal frame plus the raw output-file bytes. The caller interprets
+    /// `frame.isMarkdownResult` / `frame.resultMIMEType` (the Zotero
+    /// attachment route); this edge performs no UTF-8 assumption.
+    func executeSourceResult(
+        kind: ExtractorKind,
+        remoteURL: ExtractorRemoteSourceURL,
+        filename: String,
+        onProgress: (@Sendable (String) -> Void)?
+    ) async throws -> ProcessPackageSourceOutcome {
+        let output = try await runProtocol(
+            kind: kind,
+            payload: .remoteURL(remoteURL),
+            filename: filename,
+            onProgress: onProgress)
+        return ProcessPackageSourceOutcome(
+            frame: output.frame,
+            sourceBytes: output.outputData)
+    }
+
+    /// The revision ≤ 3 result contract: the output file IS the Markdown.
+    /// A bytes result reaching a Markdown caller is a protocol violation —
+    /// fail closed rather than misinterpret source bytes as text.
+    private static func markdownOutcome(
+        _ output: ProcessPackageTerminalOutput
+    ) throws -> ProcessPackageExecutionOutcome {
+        guard output.frame.isMarkdownResult else {
+            throw ProcessPackageRunError.unexpectedBytesResult
+        }
+        guard let markdown = String(data: output.outputData, encoding: .utf8) else {
+            throw ProcessPackageRunError.invalidOutputEncoding
+        }
+        return ProcessPackageExecutionOutcome(frame: output.frame, markdown: markdown)
+    }
+
+    /// The internal operation payload: staged bytes for the `operation-file`
+    /// transport, or the validated source URL for `remote-url`.
+    private enum ProcessOperationPayload: Sendable {
+        case bytes(Data)
+        case remoteURL(ExtractorRemoteSourceURL)
+    }
+
+    /// The shared operation body: builds the request, runs the managed
+    /// process, verifies the declared size, and returns the redacted terminal
+    /// frame plus the raw output-file bytes. Markdown and revision-4 bytes
+    /// results are interpreted at their own edges (`markdownOutcome`,
+    /// `executeSourceResult`).
+    private func runProtocol(
+        kind: ExtractorKind,
+        payload: ProcessOperationPayload,
+        filename: String,
+        onProgress: (@Sendable (String) -> Void)?
+    ) async throws -> ProcessPackageTerminalOutput {
         let requestID = UUID()
         let name = requestID.uuidString.lowercased()
-        let inputPath = "input/\(name)/source"
         let outputPath = "output/\(name)/result.md"
         let runtimeCacheRoot = manifest.capabilities.contains(.sharedRuntimeCache)
             ? self.sharedRuntimeCacheRoot
@@ -509,8 +720,8 @@ public final class PreparedProcessOperation: Sendable {
             ? self.sharedModelCacheRoot
             : nil
 
-        // ---- Operation input preparation (revision 2 + declared requirements)
-        let declaresRequirements = manifest.protocolRevision == .v2
+        // ---- Operation input preparation (revision 2+ and declared requirements)
+        let declaresRequirements = manifest.protocolRevision >= .v2
             && registration.credentialRequirements.isEmpty == false
         var resolvedValues: [ExtractorCredentialRequirementID: String] = [:]
         var configuration: ExtractorOperationConfiguration?
@@ -550,9 +761,41 @@ public final class PreparedProcessOperation: Sendable {
                 }
             }
         }
-        if manifest.protocolRevision == .v2 {
+        if manifest.protocolRevision >= .v2 {
             configuration = operationConfiguration?(revision)
         }
+
+        // Reviewed-only operation support (Phase 2): the provider admits by
+        // EXACT revision, so a grant exists only for the reviewed Apple
+        // package revision. Staging happens per execute inside the private
+        // operation root; the request carries only the staged file's
+        // RELATIVE path through the operation-configuration file. Cleanup is
+        // armed by the defer below together with the credential and
+        // configuration subdirectories.
+        var supportSubdirectory: URL?
+        let requestStagedSupport: StagedExtractorOperationSupport?
+        if let operationSupport, let grant = operationSupport.operationSupport(for: revision) {
+            let staged = try ExtractorOperationSupportStager.stage(
+                grant: grant,
+                operationRoot: directoryRoot,
+                requestName: name)
+            supportSubdirectory = staged.supportDirectoryURL
+            requestStagedSupport = staged
+            precondition(
+                configuration == nil,
+                "operation support and operation configuration cannot both configure one request")
+            switch grant.role {
+            case .podcastTokenHelper:
+                configuration = .applePodcastTranscript(helperPath: staged.relativePath)
+            }
+        } else {
+            requestStagedSupport = nil
+        }
+        // The durable private token-cache root: the host closure admits by
+        // exact revision and returns nil otherwise. Passed to the executor
+        // as a typed request field, which exposes it to the child only
+        // through its dedicated environment key.
+        let requestTokenCacheRoot = durableTokenCacheRoot?(revision)
 
         // The redactor covers every resolved value for THIS request; it is
         // constructed even when empty so call sites stay uniform.
@@ -586,7 +829,7 @@ public final class PreparedProcessOperation: Sendable {
         // block below — still deletes it. Fires on success, every error, and
         // cancellation.
         defer {
-            for subdirectory in [credentialSubdirectory, configurationSubdirectory]
+            for subdirectory in [credentialSubdirectory, configurationSubdirectory, supportSubdirectory]
             .compactMap({ $0 }) {
                 do {
                     try FileManager.default.removeItem(at: subdirectory)
@@ -614,6 +857,16 @@ public final class PreparedProcessOperation: Sendable {
         // Immutable snapshots of the request paths for the @Sendable body.
         let requestCredentialPath = credentialFilePath
         let requestConfigurationPath = configurationFilePath
+        // Operation-file requests stage exactly one input file inside the
+        // private operation root. Remote-url requests stage nothing: the
+        // request carries the validated source URL and the package fetches
+        // the source itself.
+        let stagedInputPath: String?
+        if case .bytes = payload {
+            stagedInputPath = "input/\(name)/source"
+        } else {
+            stagedInputPath = nil
+        }
         // The retained success, consumed by the executor's launch. A retained
         // failure never reaches this point (it threw above).
         let retainedRuntimeResolution: RuntimeCommandResolution?
@@ -626,12 +879,15 @@ public final class PreparedProcessOperation: Sendable {
             redactor: redactor,
             onProgress: onProgress
         ) {
-            let inputURL = self.directoryRoot.appendingPathComponent(inputPath)
-            try FileManager.default.createDirectory(
-                at: inputURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700])
-            try input.write(to: inputURL, options: [.atomic])
+            if let stagedInputPath,
+               case .bytes(let input) = payload {
+                let inputURL = self.directoryRoot.appendingPathComponent(stagedInputPath)
+                try FileManager.default.createDirectory(
+                    at: inputURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700])
+                try input.write(to: inputURL, options: [.atomic])
+            }
 
             // Explicit per-kind input MIME default: the registration's declared
             // MIME types win; the fallback matches the kind's canonical input
@@ -640,19 +896,42 @@ public final class PreparedProcessOperation: Sendable {
             case .pdf: MimeType.pdf
             case .html: MimeType.html
             case .docx: MimeType.docx
+            case .podcastTranscript: MimeType.audioPodcast
+            case .applePodcastTranscript: MimeType.audioApplePodcast
+            case .youtubeTranscript: MimeType.videoYouTube
+            case .zotero: ContentTypeRegistry.zoteroAttachment
             }
-            let request = try ExtractorProtocolRequest(
-                requestID: ExtractorRequestID(),
-                protocolRevision: self.manifest.protocolRevision,
-                kind: kind,
-                mimeType: ExtractorMIMEType(validating: self.mimeType(defaulting: fallbackMIMEType)),
-                originalFilename: filename,
-                inputPath: ExtractorRelativePath(validating: inputPath),
-                outputPath: ExtractorRelativePath(validating: outputPath),
-                deadlineMillisecondsSince1970: Int64(Date().timeIntervalSince1970 * 1_000)
-                    + max(Int64(self.manifest.limits.maximumDurationMilliseconds), 1),
-                credentialFilePath: requestCredentialPath,
-                operationConfigurationPath: requestConfigurationPath)
+            let mimeType = try ExtractorMIMEType(
+                validating: self.mimeType(defaulting: fallbackMIMEType))
+            let deadlineMillisecondsSince1970 = Int64(Date().timeIntervalSince1970 * 1_000)
+                + max(Int64(self.manifest.limits.maximumDurationMilliseconds), 1)
+            let request: ExtractorProtocolRequest
+            switch payload {
+            case .bytes:
+                request = try ExtractorProtocolRequest(
+                    requestID: ExtractorRequestID(),
+                    protocolRevision: self.manifest.protocolRevision,
+                    kind: kind,
+                    mimeType: mimeType,
+                    originalFilename: filename,
+                    inputPath: ExtractorRelativePath(validating: stagedInputPath ?? ""),
+                    outputPath: ExtractorRelativePath(validating: outputPath),
+                    deadlineMillisecondsSince1970: deadlineMillisecondsSince1970,
+                    credentialFilePath: requestCredentialPath,
+                    operationConfigurationPath: requestConfigurationPath)
+            case .remoteURL(let sourceURL):
+                request = try ExtractorProtocolRequest(
+                    requestID: ExtractorRequestID(),
+                    protocolRevision: self.manifest.protocolRevision,
+                    kind: kind,
+                    mimeType: mimeType,
+                    originalFilename: filename,
+                    remoteURL: sourceURL,
+                    outputPath: ExtractorRelativePath(validating: outputPath),
+                    deadlineMillisecondsSince1970: deadlineMillisecondsSince1970,
+                    credentialFilePath: requestCredentialPath,
+                    operationConfigurationPath: requestConfigurationPath)
+            }
 
             let managedRequest = ManagedExtractorProcessRequest(
                 revision: self.revision,
@@ -666,13 +945,27 @@ public final class PreparedProcessOperation: Sendable {
                     privateCacheRoot: self.cacheRoot,
                     sharedRuntimeCacheRoot: runtimeCacheRoot,
                     sharedModelCacheRoot: modelCacheRoot),
-                runtimeResolution: retainedRuntimeResolution)
+                runtimeResolution: retainedRuntimeResolution,
+                durableTokenCacheRoot: requestTokenCacheRoot)
             // Final launch-seam gate: the LAST thing before spawn, after the
             // request snapshot is fully constructed (PR 3 review HIGH-1).
             // Revision-1 prepared operations never re-consult admission
-            // (their pinned-snapshot semantics are preserved).
-            if declaresRequirements, let launchGate = self.launchGate {
+            // (their pinned-snapshot semantics are preserved). Every
+            // revision-2+ operation rechecks for EVERY launch — the gate
+            // protects admission and catalog membership, not just
+            // credentials, so a credential-free revision-3 package (the
+            // podcast transcript package) is rechecked too.
+            if manifest.protocolRevision >= .v2, let launchGate = self.launchGate {
                 try await launchGate()
+            }
+            // Pre-launch staged-identity re-verification (reviewed Apple
+            // support): the LAST descriptor-based check before spawn, so a
+            // replacement between staging and launch fails closed.
+            if let requestStagedSupport {
+                try ExtractorOperationSupportStager.verifyPublishedIdentity(
+                    requestStagedSupport.publishedIdentity,
+                    at: requestStagedSupport.relativePath,
+                    operationRoot: self.directoryRoot)
             }
             let outcome = try await self.executor.execute(managedRequest) { [redactor] (frame: ExtractorProtocolFrame) in
                 if case .progress(let progress) = frame, let message = progress.message {
@@ -689,16 +982,17 @@ public final class PreparedProcessOperation: Sendable {
                 guard data.count == frame.markdownByteCount else {
                     throw ProcessPackageRunError.declaredSizeMismatch
                 }
-                guard let markdown = String(data: data, encoding: .utf8) else {
-                    throw ProcessPackageRunError.invalidOutputEncoding
-                }
+                // The frame's byte count is the OUTPUT-FILE byte count for
+                // both result shapes (revision 4 kept that contract), so the
+                // size check above is revision-independent. UTF-8 decoding is
+                // NOT: a bytes result is decoded by its consumer.
                 // Result-frame article metadata is package-controlled text
                 // that becomes a persisted source filename and reaches the
                 // wiki DB and File Provider — it passes through the redactor
                 // like every other package-controlled string (MEDIUM-5).
-                return ProcessPackageExecutionOutcome(
+                return ProcessPackageTerminalOutput(
                     frame: try Self.redactedResultFrame(frame, redactor: redactor),
-                    markdown: markdown)
+                    outputData: data)
             case .failure(let frame):
                 // Terminal failure frames are package-controlled: redact the
                 // message before mapping into a user error (warnings are not
@@ -718,11 +1012,11 @@ public final class PreparedProcessOperation: Sendable {
     /// launch error cannot escape. Cleanup of request-scoped files is owned
     /// by `execute`'s defer, which arms the moment the credential file exists
     /// and therefore covers this entire region.
-    fileprivate func runManaged(
+    fileprivate func runManaged<Output: Sendable>(
         redactor: ExtractorSecretRedactor,
         onProgress: (@Sendable (String) -> Void)?,
-        _ body: @Sendable () async throws -> ProcessPackageExecutionOutcome
-    ) async throws -> ProcessPackageExecutionOutcome {
+        _ body: @Sendable () async throws -> Output
+    ) async throws -> Output {
         do {
             return try await body()
         } catch is CancellationError {
@@ -756,21 +1050,31 @@ public final class PreparedProcessOperation: Sendable {
                 author: article.author.map(redactor.redact),
                 description: article.description.map(redactor.redact),
                 published: article.published.map(redactor.redact),
-                wordCount: article.wordCount)
+                wordCount: article.wordCount,
+                // Revision 4: the external provenance identifier is
+                // package-controlled text like every other frame string.
+                identifier: article.identifier.map(redactor.redact))
         }
         let reported = frame.metadata
         let redactedReported = try ExtractorReportedMetadata(
             toolName: reported.toolName.map(redactor.redact),
             toolVersion: reported.toolVersion.map(redactor.redact),
             modelName: reported.modelName.map(redactor.redact),
-            modelVersion: reported.modelVersion.map(redactor.redact))
+            modelVersion: reported.modelVersion.map(redactor.redact),
+            // Caption-selection facts (protocol revision 3): the language is
+            // package-controlled text and goes through the same bounded
+            // redactor; the generated/manual flag is a boolean with no path
+            // or content surface.
+            language: reported.language.map(redactor.redact),
+            transcriptGenerated: reported.transcriptGenerated)
         return try ExtractorResultFrame(
             requestID: frame.requestID,
             outputPath: frame.outputPath,
             markdownByteCount: frame.markdownByteCount,
             warnings: frame.warnings.map(redactor.redact),
             metadata: redactedReported,
-            articleMetadata: redactedMetadata)
+            articleMetadata: redactedMetadata,
+            resultMIMEType: frame.resultMIMEType)
     }
 
     /// Creates a regular owner-read-only (0400) file at `url`. The file is
@@ -785,13 +1089,13 @@ public final class PreparedProcessOperation: Sendable {
         // Refuse to overwrite anything that already exists (a planted symlink
         // at the target must never be written through).
         guard FileManager.default.fileExists(atPath: url.path) == false else {
-            throw ExtractorDirectoryAdmissionError.preparationFailed
+            throw ExtractorDirectoryAdmissionError.preparationFailure("request output path already exists")
         }
         let fd = url.path.withCString {
             open($0, O_WRONLY | O_CREAT | O_EXCL, 0o400)
         }
         guard fd >= 0 else {
-            throw ExtractorDirectoryAdmissionError.preparationFailed
+            throw ExtractorDirectoryAdmissionError.preparationFailure(errno: errno, stage: "open request output file")
         }
         defer { close(fd) }
         let result: Int = data.withUnsafeBytes { raw in
@@ -808,7 +1112,7 @@ public final class PreparedProcessOperation: Sendable {
             return total
         }
         guard result == data.count else {
-            throw ExtractorDirectoryAdmissionError.preparationFailed
+            throw ExtractorDirectoryAdmissionError.preparationFailure(errno: errno, stage: "write request output file")
         }
         try verifyOwnerReadOnlyFile(fd: fd, at: url)
     }
@@ -824,7 +1128,7 @@ public final class PreparedProcessOperation: Sendable {
         var viaPath = stat()
         guard fstat(fd, &viaFD) == 0,
               lstat(url.path, &viaPath) == 0 else {
-            throw ExtractorDirectoryAdmissionError.preparationFailed
+            throw ExtractorDirectoryAdmissionError.preparationFailure(errno: errno, stage: "fstat/lstat request output file")
         }
         guard viaFD.st_dev == viaPath.st_dev,
               viaFD.st_ino == viaPath.st_ino,
@@ -832,7 +1136,7 @@ public final class PreparedProcessOperation: Sendable {
               viaFD.st_uid == getuid(),
               viaFD.st_nlink == 1,
               viaFD.st_mode & 0o777 == 0o400 else {
-            throw ExtractorDirectoryAdmissionError.preparationFailed
+            throw ExtractorDirectoryAdmissionError.preparationFailure("request output file verification failed")
         }
     }
 }
@@ -1022,5 +1326,276 @@ public struct ProcessPackageDOCXExtractor: DocxMarkdownExtractor, ProcessPackage
     /// the user's setup guidance.
     public func readiness() async -> ExtractionReadiness {
         operation.readiness()
+    }
+}
+
+/// The process-backed podcast transcript adapter for one exact package
+/// revision. Accepts a typed source URL, executes one prepared revision-3
+/// `remote-url` operation against the pinned snapshot, and returns Markdown
+/// plus the package-reported metadata. No input bytes are staged.
+public struct ProcessPackagePodcastTranscript: Sendable, ProcessPackageProvenanceProviding {
+    public var displayName: String { operation.manifest.displayName }
+    public var packageProvenance: ExtractorPackageExecutionProvenance {
+        ExtractorPackageExecutionProvenance(
+            revision: operation.revision,
+            registrationID: operation.registrationID,
+            protocolRevision: operation.protocolRevision)
+    }
+
+    let operation: PreparedProcessOperation
+
+    init(operation: PreparedProcessOperation) {
+        self.operation = operation
+    }
+
+    /// The shared operation-level readiness answer (runtime resolution,
+    /// entry-point presence). The podcast package is `runtime`-launched
+    /// through `uv`, so a missing runtime surfaces here as setup guidance.
+    public func readiness() async -> ExtractionReadiness {
+        operation.readiness()
+    }
+
+    /// One outcome of one transcript fetch: the Markdown product plus the
+    /// package-reported metadata for provenance.
+    public struct Outcome: Sendable {
+        public let markdown: String
+        public let reportedMetadata: ExtractorReportedMetadata
+
+        public init(markdown: String, reportedMetadata: ExtractorReportedMetadata) {
+            self.markdown = markdown
+            self.reportedMetadata = reportedMetadata
+        }
+    }
+
+    /// Fetches and converts the transcript at `sourceURL`. Progress lines
+    /// are package-controlled text already redacted by the operation.
+    public func transcript(
+        for sourceURL: URL,
+        onProgress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> Outcome {
+        do {
+            let outcome = try await operation.execute(
+                kind: .podcastTranscript,
+                remoteURL: ExtractorRemoteSourceURL(
+                    validating: sourceURL.absoluteString),
+                filename: "feed",
+                onProgress: onProgress)
+            return Outcome(
+                markdown: outcome.markdown,
+                reportedMetadata: outcome.reportedMetadata)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch ManagedExtractorProcessError.cancellation {
+            throw CancellationError()
+        } catch {
+            throw ProcessPackageError(
+                message: ProcessPackageFailureMapper.message(error))
+        }
+    }
+}
+
+/// The process-backed Apple Podcasts transcript adapter for one exact package
+/// revision. Accepts a validated episode page URL and executes one prepared
+/// revision-3 `remote-url` operation against the pinned snapshot. The package
+/// picks its Apple TTML workflow or its RSS fallback from the host-staged
+/// operation support; the adapter never branches on a kind or a package ID.
+public struct ProcessPackageApplePodcastTranscript: Sendable, ProcessPackageProvenanceProviding {
+    public var displayName: String { operation.manifest.displayName }
+    public var packageProvenance: ExtractorPackageExecutionProvenance {
+        ExtractorPackageExecutionProvenance(
+            revision: operation.revision,
+            registrationID: operation.registrationID,
+            protocolRevision: operation.protocolRevision)
+    }
+
+    let operation: PreparedProcessOperation
+
+    init(operation: PreparedProcessOperation) {
+        self.operation = operation
+    }
+
+    /// The shared operation-level readiness answer (runtime resolution,
+    /// entry-point presence). The Apple package is `runtime`-launched through
+    /// `uv`, so a missing runtime surfaces here as setup guidance.
+    public func readiness() async -> ExtractionReadiness {
+        operation.readiness()
+    }
+
+    /// One outcome of one transcript fetch: the Markdown product plus the
+    /// package-reported metadata for provenance.
+    public struct Outcome: Sendable {
+        public let markdown: String
+        public let reportedMetadata: ExtractorReportedMetadata
+
+        public init(markdown: String, reportedMetadata: ExtractorReportedMetadata) {
+            self.markdown = markdown
+            self.reportedMetadata = reportedMetadata
+        }
+    }
+
+    /// Fetches and converts the transcript at `sourceURL`. Progress lines
+    /// are package-controlled text already redacted by the operation.
+    public func transcript(
+        for sourceURL: URL,
+        onProgress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> Outcome {
+        do {
+            let outcome = try await operation.execute(
+                kind: .applePodcastTranscript,
+                remoteURL: ExtractorRemoteSourceURL(
+                    validating: sourceURL.absoluteString),
+                filename: "episode",
+                onProgress: onProgress)
+            return Outcome(
+                markdown: outcome.markdown,
+                reportedMetadata: outcome.reportedMetadata)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch ManagedExtractorProcessError.cancellation {
+            throw CancellationError()
+        } catch {
+            throw ProcessPackageError(
+                message: ProcessPackageFailureMapper.message(error))
+        }
+    }
+}
+
+/// The process-backed YouTube transcript adapter for one exact package
+/// revision. Accepts a validated video URL and executes one prepared
+/// revision-3 `remote-url` operation against the pinned snapshot. The
+/// package fetches only the captions YouTube exposes; media download and
+/// speech-to-text are outside the registration.
+public struct ProcessPackageYouTubeTranscript: Sendable, ProcessPackageProvenanceProviding {
+    public var displayName: String { operation.manifest.displayName }
+    public var packageProvenance: ExtractorPackageExecutionProvenance {
+        ExtractorPackageExecutionProvenance(
+            revision: operation.revision,
+            registrationID: operation.registrationID,
+            protocolRevision: operation.protocolRevision)
+    }
+
+    let operation: PreparedProcessOperation
+
+    init(operation: PreparedProcessOperation) {
+        self.operation = operation
+    }
+
+    /// The shared operation-level readiness answer (runtime resolution,
+    /// entry-point presence). The YouTube package is `runtime`-launched
+    /// through `uv`, so a missing runtime surfaces here as setup guidance.
+    public func readiness() async -> ExtractionReadiness {
+        operation.readiness()
+    }
+
+    /// One outcome of one transcript fetch: the Markdown product plus the
+    /// package-reported metadata for provenance.
+    public struct Outcome: Sendable {
+        public let markdown: String
+        public let reportedMetadata: ExtractorReportedMetadata
+
+        public init(markdown: String, reportedMetadata: ExtractorReportedMetadata) {
+            self.markdown = markdown
+            self.reportedMetadata = reportedMetadata
+        }
+    }
+
+    /// Fetches and converts the captions at `sourceURL`. Progress lines
+    /// are package-controlled text already redacted by the operation.
+    public func transcript(
+        for sourceURL: URL,
+        onProgress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> Outcome {
+        do {
+            let outcome = try await operation.execute(
+                kind: .youtubeTranscript,
+                remoteURL: ExtractorRemoteSourceURL(
+                    validating: sourceURL.absoluteString),
+                filename: "video",
+                onProgress: onProgress)
+            return Outcome(
+                markdown: outcome.markdown,
+                reportedMetadata: outcome.reportedMetadata)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch ManagedExtractorProcessError.cancellation {
+            throw CancellationError()
+        } catch {
+            throw ProcessPackageError(
+                message: ProcessPackageFailureMapper.message(error))
+        }
+    }
+}
+
+/// The process-backed Zotero attachment adapter for one exact package
+/// revision. Accepts the validated attachment file URL and executes one
+/// prepared revision-4 `remote-url` operation against the pinned snapshot.
+/// The outcome is bytes-shaped for both result forms: a Markdown result's
+/// bytes ARE the Markdown; a bytes result's bytes are the source content
+/// named by `frame.resultMIMEType`, which the HOST routes to its own format
+/// extraction. The package never converts formats.
+public struct ProcessPackageZoteroAttachment: Sendable, ProcessPackageProvenanceProviding {
+    public var displayName: String { operation.manifest.displayName }
+    public var packageProvenance: ExtractorPackageExecutionProvenance {
+        ExtractorPackageExecutionProvenance(
+            revision: operation.revision,
+            registrationID: operation.registrationID,
+            protocolRevision: operation.protocolRevision)
+    }
+
+    let operation: PreparedProcessOperation
+
+    init(operation: PreparedProcessOperation) {
+        self.operation = operation
+    }
+
+    /// The shared operation-level readiness answer (runtime resolution,
+    /// entry-point presence). The Zotero package is `runtime`-launched
+    /// through `uv`, so a missing runtime surfaces here as setup guidance.
+    public func readiness() async -> ExtractionReadiness {
+        operation.readiness()
+    }
+
+    /// One outcome of one attachment fetch: the terminal frame plus the
+    /// output-file bytes. Interpret `frame.isMarkdownResult` /
+    /// `frame.resultMIMEType` and read `frame.articleMetadata` for the
+    /// provenance fields (title, author, published, `identifier` = the
+    /// Zotero parent item key).
+    public struct Outcome: Sendable {
+        public let frame: ExtractorResultFrame
+        public let outputBytes: Data
+
+        public var isMarkdownResult: Bool { frame.isMarkdownResult }
+        public var resultMIMEType: ExtractorMIMEType? { frame.resultMIMEType }
+        public var articleMetadata: ExtractorArticleMetadata? { frame.articleMetadata }
+        public var reportedMetadata: ExtractorReportedMetadata { frame.metadata }
+
+        public init(frame: ExtractorResultFrame, outputBytes: Data) {
+            self.frame = frame
+            self.outputBytes = outputBytes
+        }
+    }
+
+    /// Downloads the attachment at `sourceURL`. Progress lines are
+    /// package-controlled text already redacted by the operation.
+    public func attachment(
+        for sourceURL: URL,
+        onProgress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> Outcome {
+        do {
+            let outcome = try await operation.executeSourceResult(
+                kind: .zotero,
+                remoteURL: ExtractorRemoteSourceURL(
+                    validating: sourceURL.absoluteString),
+                filename: "attachment",
+                onProgress: onProgress)
+            return Outcome(frame: outcome.frame, outputBytes: outcome.sourceBytes)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch ManagedExtractorProcessError.cancellation {
+            throw CancellationError()
+        } catch {
+            throw ProcessPackageError(
+                message: ProcessPackageFailureMapper.message(error))
+        }
     }
 }

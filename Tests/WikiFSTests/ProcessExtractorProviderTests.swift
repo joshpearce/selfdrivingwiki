@@ -110,6 +110,35 @@ struct ProcessExtractorProviderTests {
         }
     }
 
+    /// Regression (#1286): a decoded terminal frame must conclude the
+    /// operation promptly. Each conversion through one prepared operation
+    /// finishes well inside the manifest's (load-scaled) duration limit; a
+    /// regression back to waiting for wrapper-process exit (or for
+    /// pool-scheduled cleanup tasks) surfaces here as a per-conversion timeout
+    /// long before the suite's 3-minute limit can mask it. The bound is
+    /// deliberately coarse at 1× — healthy conversions finish in ~2 s — so it
+    /// only trips on the hang it guards against, not on load jitter; on
+    /// small-core CI runners it scales via `TestTimingScale`.
+    @Test func repeatedConversionsConcludePromptlyAfterTerminalFrame() async throws {
+        let environment = try await InstalledFixtureEnvironment.install()
+        defer { environment.cleanup() }
+        let preparation = try await environment.provider.preparePDF(
+            revision: environment.revision,
+            manifest: environment.manifest)
+        let clock = ContinuousClock()
+        let perConversionLimit = Duration.milliseconds(TestTimingScale.milliseconds(8_000))
+
+        for index in 0..<10 {
+            let start = clock.now
+            let markdown = try await preparation.extractor.convert(
+                pdfData: Data("success".utf8),
+                filename: "repeat-\(index).pdf",
+                onProgress: nil)
+            #expect(markdown == "# Fixture\n")
+            #expect(clock.now - start < perConversionLimit)
+        }
+    }
+
     @Test func preparationRejectionsAreTyped() async throws {
         let environment = try await InstalledFixtureEnvironment.install()
         defer { environment.cleanup() }
@@ -290,7 +319,12 @@ struct ProcessExtractorProviderTests {
             limits: ExtractorOperationLimits(
                 maximumInputByteCount: 65_536,
                 maximumMarkdownOutputByteCount: 65_536,
-                maximumDurationMilliseconds: 10_000,
+                // Fixture subprocesses are healthy in ~2 s, but CI's 3-vCPU
+                // runner has starved fixture startup past the 10 s 1× window
+                // ("ran 18.3 s of the 10.0 s limit"). Scale the limit with the
+                // machine (see `TestTimingScale`) so the bound still catches
+                // real hangs without tripping on scheduler noise.
+                maximumDurationMilliseconds: TestTimingScale.milliseconds(10_000),
                 maximumProgressEventCount: 8))
     }
 }
@@ -481,21 +515,8 @@ private final class InstalledFixtureEnvironment: @unchecked Sendable {
     }
 
     private static func findFixtureExecutable() throws -> URL {
-        let repositoryRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let buildRoot = repositoryRoot.appendingPathComponent(".build", isDirectory: true)
-        let enumerator = FileManager.default.enumerator(
-            at: buildRoot,
-            includingPropertiesForKeys: [.isExecutableKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants])
-        while let candidate = enumerator?.nextObject() as? URL {
-            if candidate.lastPathComponent == "ManagedExtractorFixture",
-               FileManager.default.isExecutableFile(atPath: candidate.path) {
-                return candidate
-            }
-        }
-        throw EnvironmentError.missingFixtureExecutable
+        try ManagedExtractorFixtureLocator.locate(
+            name: "ManagedExtractorFixture",
+            repositoryRootFilePath: #filePath)
     }
 }

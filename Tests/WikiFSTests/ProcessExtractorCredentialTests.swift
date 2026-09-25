@@ -63,7 +63,8 @@ private func makeOperation(
     manifest: ExtractorManifest,
     resolver: (any ExtractorOperationCredentialResolving)?,
     executor: StubCredentialExecutor,
-    configuration: (@Sendable (ExtractorPackageRevisionID) -> ExtractorOperationConfiguration?)? = nil
+    configuration: (@Sendable (ExtractorPackageRevisionID) -> ExtractorOperationConfiguration?)? = nil,
+    operationSupport: (any ExtractorOperationSupportProviding)? = nil
 ) throws -> PreparedProcessOperation {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("op-\(UUID().uuidString)", isDirectory: true)
@@ -87,6 +88,7 @@ private func makeOperation(
         launchGate: nil,
         operationCredentials: resolver,
         operationConfiguration: configuration,
+        operationSupport: operationSupport,
         runtimeResolution: nil)
 }
 
@@ -152,6 +154,16 @@ final class StubCredentialExecutor: ManagedProcessExecuting, @unchecked Sendable
             standardOutputByteCount: 0,
             standardError: Data(),
             executableURL: operation.paths.packageRoot)
+    }
+}
+
+private struct FixedOperationSupportProvider: ExtractorOperationSupportProviding {
+    let grant: ExtractorOperationSupportGrant
+
+    func operationSupport(
+        for revision: ExtractorPackageRevisionID
+    ) -> ExtractorOperationSupportGrant? {
+        grant
     }
 }
 
@@ -262,9 +274,15 @@ struct ProcessExtractorCredentialTests {
                 endpoint: "http://127.0.0.1:8000",
                 timeoutMilliseconds: ExtractorHostLimits.maximumDurationMilliseconds + 1)
         }
+        // The test unwraps the valid fixture below.
+        // swiftlint:disable:next silent_try_optional
         let valid = try? ExtractorOperationConfiguration(
             endpoint: "http://127.0.0.1:8000", timeoutMilliseconds: 600_000)
-        #expect(valid?.timeoutMilliseconds == 600_000)
+        guard case .doclingServe(_, .some(let timeout)) = valid else {
+            Issue.record("expected a docling configuration")
+            return
+        }
+        #expect(timeout == 600_000)
     }
 
     // MARK: Redaction
@@ -318,12 +336,15 @@ struct ProcessExtractorCredentialTests {
             kind: .pdf, input: Data(), filename: "x.pdf", onProgress: nil)
         // Success: credentials directory holds no request subdirectories.
         let credentialsRoot = operation.directoryRoot.appendingPathComponent("credentials")
-        #expect(
-            (try? FileManager.default.contentsOfDirectory(atPath: credentialsRoot.path))?.isEmpty ?? true)
+        // A missing cleanup directory is equivalent to an empty directory.
+        // swiftlint:disable:next silent_try_optional
+        let remainingCredentials = try? FileManager.default.contentsOfDirectory(
+            atPath: credentialsRoot.path)
+        #expect(remainingCredentials?.isEmpty ?? true)
 
         // Failure: the executor throws AFTER the file was verified to exist.
         let failingExecutor = StubCredentialExecutor()
-        failingExecutor.failWith = ManagedExtractorProcessError.timeout
+        failingExecutor.failWith = ManagedExtractorProcessError.timeout(detail: "timeout")
         let failingOperation = try makeOperation(
             manifest: manifest, resolver: resolver, executor: failingExecutor)
         do {
@@ -335,8 +356,39 @@ struct ProcessExtractorCredentialTests {
         }
         let failingCredentialsRoot =
             failingOperation.directoryRoot.appendingPathComponent("credentials")
+        // A missing cleanup directory is equivalent to an empty directory.
+        // swiftlint:disable:next silent_try_optional
+        let remainingFailingCredentials = try? FileManager.default.contentsOfDirectory(
+            atPath: failingCredentialsRoot.path)
+        #expect(remainingFailingCredentials?.isEmpty ?? true)
+    }
+
+    @Test func operationSupportStagingFailurePreventsLaunchAndOutput() async throws {
+        let manifest = try v2Manifest(requirements: [])
+        let executor = StubCredentialExecutor()
+        let missingSource = FileManager.default.temporaryDirectory
+            .appendingPathComponent("missing-support-\(UUID().uuidString)")
+        let grant = try #require(ExtractorOperationSupportGrant(
+            role: .podcastTokenHelper,
+            sourceURL: missingSource,
+            destinationFileName: "podcast-token-helper",
+            expectedSHA256: String(repeating: "0", count: 64),
+            expectedByteCount: 1))
+        let operation = try makeOperation(
+            manifest: manifest,
+            resolver: nil,
+            executor: executor,
+            operationSupport: FixedOperationSupportProvider(grant: grant))
+
+        await #expect(throws: ExtractorOperationSupportError.sourceUnavailable) {
+            _ = try await operation.execute(
+                kind: .pdf, input: Data("pdf".utf8), filename: "x.pdf", onProgress: nil)
+        }
+        #expect(executor.capturedRequests.isEmpty)
         #expect(
-            (try? FileManager.default.contentsOfDirectory(atPath: failingCredentialsRoot.path))?.isEmpty ?? true)
+            FileManager.default.fileExists(
+                atPath: operation.directoryRoot.appendingPathComponent("output/result.md").path)
+                == false)
     }
 
     @Test func rotationAffectsNextCredentialExecute() async throws {
@@ -413,6 +465,54 @@ struct ProcessExtractorCredentialTests {
         #expect(resolver.callCount == 0)
     }
 
+    /// A credential-free revision-3 package (the podcast transcript shape)
+    /// still runs the final launch-seam admission/catalog gate: revocation
+    /// between preparation and spawn must refuse the launch even though the
+    /// registration declares no credential requirements.
+    @Test func credentialFreeRevisionThreeRemoteURLOperationRunsTheLaunchGate() async throws {
+        let manifest = try v2Manifest(requirements: [], protocolRevision: .v3)
+        let executor = StubCredentialExecutor()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("op-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let revision = try revision(for: manifest)
+
+        let gate = LaunchGateBox()
+        let operation = PreparedProcessOperation(
+            directoryRoot: root,
+            packageRoot: root.appendingPathComponent("package"),
+            homeRoot: root.appendingPathComponent("home"),
+            temporaryRoot: root.appendingPathComponent("tmp"),
+            cacheRoot: root.appendingPathComponent("cache"),
+            sharedRuntimeCacheRoot: nil,
+            sharedModelCacheRoot: nil,
+            revision: revision,
+            manifest: manifest,
+            registration: manifest.registrations[0],
+            registrationID: manifest.registrations[0].id,
+            protocolRevision: manifest.protocolRevision,
+            mimeTypes: ["audio/podcast"],
+            executor: executor,
+            launchGate: { try gate.refuse() },
+            operationCredentials: nil,
+            operationConfiguration: nil,
+            runtimeResolution: nil)
+
+        // The package was revoked after preparation: the launch gate throws
+        // (mapped through the redactor like every launch failure) and the
+        // executor is never invoked.
+        await #expect(throws: ProcessPackageError.self) {
+            _ = try await operation.execute(
+                kind: .podcastTranscript,
+                remoteURL: ExtractorRemoteSourceURL(
+                    validating: "https://example.com/feed.rss"),
+                filename: "feed",
+                onProgress: nil)
+        }
+        #expect(gate.callCount == 1)
+        #expect(executor.capturedRequests.isEmpty)
+    }
+
     @Test func ownerReadOnlyFileVerificationRejectsWrongMode() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("mode-\(UUID().uuidString)", isDirectory: true)
@@ -431,10 +531,58 @@ struct ProcessExtractorCredentialTests {
     }
 }
 
+/// Thread-safe launch-gate stub: counts invocations and always refuses, so a
+/// test can prove the executor never spawns after revocation.
+final class LaunchGateBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var callCount: Int {
+        lock.withLock { count }
+    }
+
+    func refuse() throws {
+        lock.withLock { count += 1 }
+        throw ExtractorOperationCredentialError.packageNotAdmitted
+    }
+}
+
 enum SelfTestSupport {
     static func writeWithMode(data: Data, url: URL, mode: mode_t) throws {
         try data.write(to: url)
         try FileManager.default.setAttributes(
             [.posixPermissions: Int(mode)], ofItemAtPath: url.path)
+    }
+}
+
+@Suite(.serialized)
+struct SharedCacheRootNormalizationTests {
+    @Test func normalizeTightensPreexistingSharedCacheRoot() throws {
+        // A shared cache root seeded by a manual `uv` run is world-traversable
+        // (0755). `createDirectory(attributes:)` does not fix an existing
+        // directory, so preparation must tighten it in place. Ownership is the
+        // boundary; seeded cache content must survive.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sdw-normalize-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root.path)
+        let seeded = root.appendingPathComponent("uv-cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: seeded, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try ProcessExtractorProvider.normalizeOwnerPrivateDirectory(root)
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: root.path)
+        #expect((attributes[.posixPermissions] as? NSNumber)?.uint16Value == 0o700)
+        #expect(FileManager.default.fileExists(atPath: seeded.path))
+    }
+
+    @Test func normalizeRejectsForeignOwnedDirectory() throws {
+        // A root this UID does not own must fail closed without a chmod.
+        // /private/tmp is root-owned and world-writable on macOS.
+        #expect(throws: ExtractorDirectoryAdmissionError.self) {
+            try ProcessExtractorProvider.normalizeOwnerPrivateDirectory(
+                URL(fileURLWithPath: "/private/tmp", isDirectory: true))
+        }
     }
 }

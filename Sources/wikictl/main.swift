@@ -23,7 +23,10 @@ func run() async -> Int32 {
     do {
         invocation = try ArgumentParser.parse(arguments) { ProcessInfo.processInfo.environment[$0] }
     } catch let failure as ArgumentParser.Failure {
-        FileHandle.standardError.write(Data("wikictl: \(failure)\n\n\(ArgumentParser.usageText)\n".utf8))
+        // Scoped help exists (#1224), so the error path points at the nearest
+        // help surface instead of dumping the full usage on every typo.
+        FileHandle.standardError.write(
+            Data("wikictl: \(failure)\nRun `wikictl --help` (or `wikictl <command> --help`) for usage.\n".utf8))
         return 2
     } catch {
         FileHandle.standardError.write(Data("wikictl: \(error)\n".utf8))
@@ -31,8 +34,11 @@ func run() async -> Int32 {
     }
 
     // Help and version don't need a wiki — print and exit before wiki resolution.
-    if case .help = invocation.command {
-        print(ArgumentParser.usageText)
+    // The scope selects which surface to print: top-level, one family
+    // (`wikictl source --help`), one subcommand (`source add --help`), or one
+    // OKF operation (`page okf verify --help`) (#1224).
+    if case .help(let scope) = invocation.command {
+        print(CLIReference.helpText(for: scope))
         return 0
     }
 
@@ -98,6 +104,19 @@ func run() async -> Int32 {
         return await runDaemonChatStop(wikiSelector: invocation.wikiSelector, chatID: chatID)
     }
 
+    // Job inspection is read-only end to end. It bypasses WikiCtlRunner's
+    // writable wiki-store profile and opens both SQLite files without
+    // migrations or checkpoints.
+    if case .job(let action) = invocation.command {
+        do {
+            print(try await runJobCommand(action, wikiSelector: invocation.wikiSelector))
+            return 0
+        } catch {
+            FileHandle.standardError.write(Data("wikictl: \(error.localizedDescription)\n".utf8))
+            return 1
+        }
+    }
+
     do {
         let output = try await makeRunner().runOrdinary(
             command: invocation.command,
@@ -117,6 +136,24 @@ func run() async -> Int32 {
         expected head \(conflict.expectedVersionID), \
         but actual head is \(actual). \
         Re-read the page, reapply your edit, and retry once.
+
+        """
+        FileHandle.standardError.write(Data(message.utf8))
+        return 3
+    } catch let conflict as SourceMarkdownConflictError {
+        // CAS conflict on a processed-markdown rewrite — the chain's head
+        // moved after the caller read it (another writer won the race). Exit
+        // code 3 (same convention as the page CAS) signals the agent to
+        // re-read, reapply once, and retry once — never loop.
+        let actual = conflict.currentHead?.rawValue ?? "(none)"
+        let message = """
+        wikictl: CAS conflict on source \(conflict.sourceID.rawValue) — \
+        expected head \(conflict.expectedHead.rawValue), \
+        but actual head is \(actual). \
+        Re-read the processed markdown (`source cat --markdown`), re-read \
+        head_version_id (`source info`), reapply your edit, and retry once. \
+        Nothing was written. If it conflicts again, report the conflict \
+        instead of retrying.
 
         """
         FileHandle.standardError.write(Data(message.utf8))
@@ -196,6 +233,13 @@ func execute(
                 store: store))
     case .admin(let action):
         return try AdminCommand.run(action, in: store)
+    case .extractor(.sync(let packageName, let force)):
+        return try await runExtractorSync(
+            packageName: packageName, force: force, in: store,
+            wikiID: wikiID, containerDirectory: containerDirectory)
+    case .job:
+        // Handled before the writable ordinary-command runner.
+        return SourceCommand.Result(payload: .text(""), didCommit: false)
     case .chat(let action):
         return try await runChatCommand(
             action,
@@ -218,6 +262,118 @@ func execute(
         // Phase C: handled before wiki resolution in `run()` — unreachable here.
         return SourceCommand.Result(payload: .text(""), didCommit: false)
     }
+}
+
+/// `wikictl extractor sync <package>` dispatch: enqueue-only queue wiring.
+/// The closure writes the durable `.extraction` item through
+/// `QueueStore.enqueue` — the same immediate durable store write
+/// `QueueEngine.enqueue` performs — WITHOUT constructing a `QueueEngine`
+/// (that needs a worker factory whose provider implementations live in
+/// targets `WikiCtlCore` cannot link) and WITHOUT waiting for completion
+/// (waiters are per-engine in-memory; a daemon-side completion could never
+/// resume a CLI waiter — it would hang). The app or the wikid daemon
+/// rehydrates and drains the persisted items on its next dispatch scan /
+/// launch.
+private func runExtractorSync(
+    packageName: String,
+    force: Bool,
+    in store: GRDBWikiStore,
+    wikiID: WikiID,
+    containerDirectory: URL
+) async throws -> SourceCommand.Result {
+    let queueStore = try QueueStore(
+        databaseURL: try DatabaseLocation.queueDatabaseURL())
+    defer { queueStore.close() }
+    // Discovery = durable machine catalog ∪ this process's reviewed overlay.
+    // The reviewed root is wherever an `ExtractorPackages/` tree is staged
+    // beside this binary (the build layout); when that does not resolve
+    // (an app-bundled helper), the durable catalog the app published at
+    // launch still carries the record.
+    let reviewedRoot = ExtractorSyncCommand.reviewedPackageRoot()
+    let catalog = try ExtractorSyncCommand.productionCatalogReader(
+        containerDirectory: containerDirectory,
+        reviewedPackageRoot: reviewedRoot)
+    let output = try await ExtractorSyncCommand.run(
+        packageName: packageName,
+        force: force,
+        in: store,
+        containerDirectory: containerDirectory,
+        catalog: catalog,
+        enqueueJob: { sourceID in
+            try queueStore.enqueue(QueueItemRequest(
+                queue: .extraction,
+                wikiID: wikiID,
+                payload: QueueItemPayload(sourceIDs: [sourceID]))).id
+        })
+    return SourceCommand.Result(payload: .text(output), didCommit: true)
+}
+
+/// Read durable job state without creating, migrating, or checkpointing either
+/// database. A missing queue database is an empty list, not an invitation to
+/// create the file.
+private func runJobCommand(
+    _ action: JobCommand.Action,
+    wikiSelector: String
+) async throws -> String {
+    let resolver = try WikiResolver.appGroupContainer()
+    guard let descriptor = resolver.descriptor(forSelector: wikiSelector) else {
+        throw PageCommand.Failure.message(
+            "no wiki matching \(wikiSelector.debugDescription) in the registry")
+    }
+
+    let queueURL = try DatabaseLocation.queueDatabaseURL()
+    let items: [QueueItem]
+    if FileManager.default.fileExists(atPath: queueURL.path) {
+        let queueStore = try QueueStore(readOnlyDatabaseURL: queueURL)
+        defer { queueStore.close() }
+        items = try queueStore.loadItems(wikiID: descriptor.id)
+    } else {
+        items = []
+    }
+
+    let selectedItems: [QueueItem]
+    let json: Bool
+    switch action {
+    case .list(let wantsJSON):
+        selectedItems = items
+        json = wantsJSON
+    case .get(let id, let wantsJSON):
+        guard let item = items.first(where: { $0.id == id }) else {
+            throw JobCommand.Failure.notFound(id)
+        }
+        selectedItems = [item]
+        json = wantsJSON
+    }
+
+    // The wiki leg goes through WikiReadService — the sanctioned read-only
+    // projection seam (the boundary script rejects bare GRDBWikiStore
+    // construction in this target). Existence of any processed markdown is
+    // what "extraction completed" means here: a byteless placeholder source
+    // has none.
+    let wikiReadService = WikiReadService(
+        databaseURL: resolver.databaseURL(for: descriptor))
+    let sourceIDs = Set(selectedItems.flatMap(\.payload.sourceIDs))
+    var completedSourceIDs = Set<SourceID>()
+    for sourceID in sourceIDs {
+        let head = try await wikiReadService.asyncRead { access in
+            try access.processedMarkdownHead(sourceID: sourceID)
+        }
+        if head != nil {
+            completedSourceIDs.insert(sourceID)
+        }
+    }
+    await wikiReadService.shutdown()
+
+    let output: String
+    switch action {
+    case .list:
+        output = try JobCommand.renderList(
+            items: selectedItems, completedSourceIDs: completedSourceIDs, json: json)
+    case .get:
+        output = try JobCommand.renderGet(
+            item: selectedItems[0], completedSourceIDs: completedSourceIDs, json: json)
+    }
+    return output
 }
 
 /// #637: split-out dispatch for the `wikictl chat …` subcommands. Resolves

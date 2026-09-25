@@ -43,8 +43,8 @@ public struct QueueExtractionWorkerFactory: QueueWorkerFactory {
             ExtractionBackend(rawValue: $0)
         }
 
-        // Ask the provider to resolve — if it returns nil (no PDF bytes,
-        // unconfigured backend), the item stays queued and is never dispatched.
+        // Ask the provider to resolve — if it returns nil (no bytes, no
+        // route), the item stays queued and is never dispatched.
         let resolved: ExtractionResolution?
         do {
             resolved = try await provider.resolveExtraction(
@@ -60,22 +60,33 @@ public struct QueueExtractionWorkerFactory: QueueWorkerFactory {
             DebugLog.store("QueueExtractionWorker.resolveExtraction blocked: \(error)")
             return ProviderID(rawValue: "blocked-extraction")
         } catch {
+            // Any other resolve failure is a real per-item fault: bad legacy
+            // identity data, admission failure, or a lost store. Route the
+            // item through the neutral capacity bucket so dispatch claims it
+            // and the worker surfaces the error on the item, instead of
+            // silently returning it to .queued forever.
             DebugLog.store("QueueExtractionWorker.resolveExtraction: \(error)")
-            return nil
+            return ProviderID(rawValue: "blocked-extraction")
         }
         guard let resolved else { return nil }
 
-        // Transcript sources get their own capacity bucket.
-        if resolved.transcriptFetch != nil { return ProviderID(rawValue: "transcript") }
-
-        // Map the backend to a provider ID that the engine's capacity config
-        // can route: local → "local-pdf2md", remote → backend-specific.
-        switch resolved.backend {
-        case .localPdf2md: return ProviderID(rawValue: "local-pdf2md")
-        case .acp: return ProviderID(rawValue: "remote-acp")
-        case .anthropic: return ProviderID(rawValue: "remote-anthropic")
-        case .gemini: return ProviderID(rawValue: "remote-gemini")
-        case .doclingServe: return ProviderID(rawValue: "remote-docling")
+        switch resolved {
+        case .transcript(let transcript):
+            // Transcript sources get their own (non-PDF) capacity bucket.
+            return ProviderID(rawValue: transcript.capacityID)
+        case .attachment(let attachment):
+            // Attachment acquisition shares the transcript (non-PDF) bucket.
+            return ProviderID(rawValue: attachment.capacityID)
+        case .bytes(let bytes):
+            // Map the backend to a provider ID that the engine's capacity
+            // config can route: local → "local-pdf2md", remote → backend-specific.
+            switch bytes.backend {
+            case .localPdf2md: return ProviderID(rawValue: "local-pdf2md")
+            case .acp: return ProviderID(rawValue: "remote-acp")
+            case .anthropic: return ProviderID(rawValue: "remote-anthropic")
+            case .gemini: return ProviderID(rawValue: "remote-gemini")
+            case .doclingServe: return ProviderID(rawValue: "remote-docling")
+            }
         }
     }
 
@@ -84,9 +95,17 @@ public struct QueueExtractionWorkerFactory: QueueWorkerFactory {
     }
 
     public func worker(for item: QueueItem, output: QueueWorkerOutputScope) async throws -> any QueueWorker {
-        QueueExtractionWorker(provider: provider, emitProgress: { id, line in
-            output.emitProgress(itemID: id, line: line)
-        })
+        QueueExtractionWorker(
+            provider: provider,
+            emitProgress: { id, line in
+                output.emitProgress(itemID: id, line: line)
+            },
+            emitReportBegin: { operation, scope in
+                output.emitReportBegin(operation: operation, scope: scope)
+            },
+            emitReport: { mutation in
+                output.emitReport(mutation)
+            })
     }
 }
 
@@ -108,11 +127,40 @@ public struct QueueExtractionWorkerFactory: QueueWorkerFactory {
 /// `markCompleted` will throw `.invalidStateTransition` (caught + logged),
 /// and the item will be re-dispatched on resume. Extraction is idempotent
 /// (re-extraction produces the same markdown), so this is safe.
+///
+/// **Reporting:** the worker records route resolution, conversion, and
+/// persistence phases, and emits a target output result ONLY after the
+/// persistence boundary returns the created-version evidence. The scope
+/// records EVERY payload source (display compatibility for batch payloads),
+/// but execution still processes only the first — unobserved targets stay
+/// `.planned` (Not Reported). No-route keeps its existing skip semantics
+/// (worker returns normally → item `.completed`, target `.skipped`).
 struct QueueExtractionWorker: QueueWorker {
     let provider: any QueueExtractionProvider
     let emitProgress: @Sendable (QueueItem.ID, String) -> Void
+    /// Durable report emission through the attempt-scoped output boundary.
+    /// `nil` for legacy unscoped dispatches (tests).
+    var emitReportBegin: (@Sendable (QueueReportOperation, QueueReportScope) -> Void)? = nil
+    var emitReport: (@Sendable (QueueReportMutation) -> Void)? = nil
 
     func execute(_ item: QueueItem) async throws {
+        let startedAt = ContinuousClock.now
+        // Every progress line carries its elapsed time ([mm:ss]) so a silent
+        // stretch is visible in the Activity trail without a debugger.
+        @Sendable func stamp(_ line: String) -> String {
+            let seconds = Int((ContinuousClock.now - startedAt).components.seconds)
+            return String(format: "[%02d:%02d] %@", (seconds / 60) % 100, seconds % 60, line)
+        }
+
+        // Begin the report with the FULL payload inventory before any
+        // execution — batch payloads display every target, but only the
+        // first is ever executed (unchanged semantics).
+        emitReportBegin?(
+            .extract,
+            .targets(item.payload.sourceIDs.map { sourceID in
+                QueueReportTargetRecord(target: .source(sourceID), state: .planned)
+            }))
+
         guard let sourceID = item.payload.sourceIDs.first else {
             throw QueueExtractionError.missingSourceID
         }
@@ -122,33 +170,38 @@ struct QueueExtractionWorker: QueueWorker {
             ExtractionBackend(rawValue: $0)
         }
 
-        // Resolve the extractor + PDF bytes, OR a transcript fetch closure
-        // (main-actor hop in the app impl).
+        emitReport?(QueueReportMutation(
+            phase: .staging,
+            targetUpserts: [QueueReportTargetRecord(
+                target: .source(sourceID),
+                state: .processing)]))
+
+        // Resolve the extraction (main-actor hop in the app impl).
         guard let resolved = try await provider.resolveExtraction(
             wikiID: item.wikiID,
             sourceID: sourceID,
             backendOverride: backendOverride
         ) else {
-            // No PDF bytes and not a transcript source — skip extraction
-            // (the worker returns normally → item .completed).
+            // No bytes and no transcript route — skip extraction (the worker
+            // returns normally → item .completed). Recorded as skipped with
+            // its reason, never as success or zero output.
+            emitReport?(QueueReportMutation(
+                phase: .finished,
+                availability: .available,
+                resultSummary: "Skipped: no extraction route for this source",
+                targetUpserts: [QueueReportTargetRecord(
+                    target: .source(sourceID),
+                    state: .skipped(reason: "No extraction route for this source"))]))
             return
         }
 
-        let markdown: String
-
-        if let fetch = resolved.transcriptFetch {
-            // Transcript extraction: network/subprocess fetch (no local bytes).
-            emitProgress(item.id, "Fetching transcript…")
-            markdown = try await fetch()
-        } else {
-            // Bytes-based extraction: readiness check + convert.
-            guard let extractor = resolved.extractor,
-                  let pdfData = resolved.pdfData else {
-                throw QueueExtractionError.missingSourceID
-            }
-
+        // Exhaustive over the tagged execution model: a bytes conversion and
+        // a transcript fetch cannot be confused, and every resolution carries
+        // exactly its own persistence payload.
+        switch resolved {
+        case .bytes(let bytes):
             // Readiness check — preserve graceful fallback.
-            let readiness = await extractor.readiness()
+            let readiness = await bytes.extractor.readiness()
             guard readiness.isReady else {
                 let message: String
                 switch readiness {
@@ -156,37 +209,102 @@ struct QueueExtractionWorker: QueueWorker {
                 case .notInstalled(let msg): message = msg
                 case .ready: message = ""  // unreachable
                 }
+                emitReport?(QueueReportMutation(
+                    phase: .finished,
+                    targetUpserts: [QueueReportTargetRecord(
+                        target: .source(sourceID),
+                        state: .failed(reason: message))]))
                 throw QueueExtractionError.notReady(message)
             }
 
+            emitReport?(QueueReportMutation(phase: .running))
             // Convert (off-main — MarkdownExtractor is Sendable).
-            markdown = try await extractor.convert(
-                pdfData: pdfData,
-                filename: resolved.filename
+            let markdown = try await bytes.extractor.convert(
+                pdfData: bytes.sourceBytes,
+                filename: bytes.filename
             ) { [itemID = item.id] line in
-                emitProgress(itemID, line)
+                emitProgress(itemID, stamp(line))
             }
-        }
 
-        // Persist (main-actor hop in the app impl). Legacy providers retain
-        // their original contract. Package-aware providers use the typed seam.
-        if let packageProvider = provider as? any InstalledPackageExtractionPersisting,
-           resolved.packageProvenance != nil {
-            try await packageProvider.persistInstalledPackageExtraction(
+            emitReport?(QueueReportMutation(phase: .persisting))
+            let outputReference = try await provider.persistBytesExtraction(
                 wikiID: item.wikiID,
                 sourceID: sourceID,
-                markdown: markdown,
-                backend: resolved.backend,
-                modelVersion: resolved.modelVersion,
-                packageProvenance: resolved.packageProvenance)
-        } else {
-            try await provider.persistExtraction(
+                resolution: bytes,
+                markdown: markdown)
+
+            // The target output result is emitted ONLY after the persistence
+            // boundary returned; the output reference is attached only where
+            // the persistence layer knows the created version. Empty
+            // conversion text is NOT reinterpreted as no-content (existing
+            // result semantics preserved).
+            emitReport?(QueueReportMutation(
+                phase: .finished,
+                availability: .available,
+                resultSummary: "Extraction persisted",
+                targetUpserts: [QueueReportTargetRecord(
+                    target: .source(sourceID),
+                    state: .succeeded,
+                    result: outputReference.map { QueueTargetResult.outputReference($0) })]))
+
+        case .transcript(let transcript):
+            emitProgress(item.id, stamp("Fetching transcript…"))
+            emitReport?(QueueReportMutation(phase: .running))
+            let outcome = try await transcript.fetch { [itemID = item.id] line in
+                emitProgress(itemID, stamp(line))
+            }
+
+            emitReport?(QueueReportMutation(phase: .persisting))
+            let outputReference = try await provider.persistTranscriptExtraction(
                 wikiID: item.wikiID,
                 sourceID: sourceID,
-                markdown: markdown,
-                backend: resolved.backend,
-                modelVersion: resolved.modelVersion,
-                technique: resolved.technique)
+                resolution: transcript,
+                outcome: outcome)
+
+            emitReport?(QueueReportMutation(
+                phase: .finished,
+                availability: .available,
+                resultSummary: "Transcript persisted",
+                targetUpserts: [QueueReportTargetRecord(
+                    target: .source(sourceID),
+                    state: .succeeded,
+                    result: outputReference.map { QueueTargetResult.outputReference($0) })]))
+
+        case .attachment(let attachment):
+            emitProgress(item.id, stamp("Acquiring attachment…"))
+            emitReport?(QueueReportMutation(phase: .running))
+            let outcome = try await attachment.fetch { [itemID = item.id] line in
+                emitProgress(itemID, stamp(line))
+            }
+
+            emitReport?(QueueReportMutation(phase: .persisting))
+            let outputReference = try await provider.persistAttachmentExtraction(
+                wikiID: item.wikiID,
+                sourceID: sourceID,
+                resolution: attachment,
+                outcome: outcome)
+
+            // Routing keys off the RESULT MIME (data), never the extractor
+            // kind: a Markdown result IS the product, while a bytes result
+            // gains a follow-on `.extraction` item so the standard PDF/HTML
+            // format route produces the Markdown version. The enqueue is a
+            // durable store write; the app or the daemon drains it on its
+            // next dispatch scan.
+            var followOnNote = ""
+            if outcome.isMarkdownResult == false {
+                try await provider.enqueueFollowOnExtraction(
+                    wikiID: item.wikiID, sourceID: sourceID)
+                followOnNote = " (format route queued)"
+            }
+
+            emitReport?(QueueReportMutation(
+                phase: .finished,
+                availability: .available,
+                resultSummary: "Attachment persisted\(followOnNote)",
+                targetUpserts: [QueueReportTargetRecord(
+                    target: .source(sourceID),
+                    state: .succeeded,
+                    result: outputReference.map { QueueTargetResult.outputReference($0) })]))
         }
     }
 }

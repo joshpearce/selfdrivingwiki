@@ -69,11 +69,31 @@ enforces the boundary.
 | --- | --- | --- |
 | `id` | string | 1 to 64 characters, lowercase ASCII letters, digits, hyphens. |
 | `displayName` | string | 1 to 128 bytes. |
-| `kinds` | array | Nonempty subset of `pdf`, `html`, and `docx`. |
-| `mimeTypes` | array | Nonempty set of normalized lowercase MIME types. |
+| `kinds` | array | Nonempty subset of `pdf`, `html`, `docx`, `podcast-transcript`, `apple-podcast-transcript`, `youtube-transcript`, and `zotero`. |
+| `mimeTypes` | array | Nonempty set of normalized lowercase MIME types. A `podcast-transcript` registration must declare its route MIME, typically the synthetic `audio/podcast` source MIME. An `apple-podcast-transcript` registration declares the synthetic `audio/apple-podcast` source MIME. A `youtube-transcript` registration declares the synthetic `video/youtube` source MIME. A `zotero` registration declares the synthetic `application/zotero` source MIME. |
 | `filenameExtensions` | array, optional | Lowercase ASCII letters and digits, no leading dot, at most 32 characters. |
 
 Duplicate values inside one registration are rejected. Duplicate registration IDs in one manifest are rejected.
+
+### Sync declarations (manifest revision 3)
+
+Revision 3 adds one optional registration field: `sync`, the acquisition-sync declaration. A registration that carries `sync` is syncable: `wikictl extractor sync <short-name>` loads the declared config sidecar, interpolates the URL template, and enqueues one byteless source per configured item. The host side of that flow is generic — every package-specific fact is here, in package data. The short name is the package ID's last label (`org.selfdrivingwiki.zotero` → `zotero`).
+
+| Field | Shape | Rules |
+| --- | --- | --- |
+| `configFileName` | string | The sidecar file name in the App Group container. At most 128 bytes, no path separators, not `.` or `..`. |
+| `urlTemplate` | string | The byteless source URL template with `{placeholder}` tokens. At most 512 bytes. Tokens must be declared field names plus `{itemKey}`, which must appear exactly once. Sample interpolation must form a valid absolute HTTPS URL. |
+| `fields` | array | One entry per config field: `name` (1–64 ASCII alphanumerics, starts with a letter), `required`, optional bounded `pattern`, optional `isList`. At most 8 fields, unique names, EXACTLY ONE list field. |
+| `itemValidation` | object, optional | Validation for the list field's items: `minimumLength` and `maximumLength` (UTF-8 bytes, 1–256), plus exactly one of `alphabet` (a string of unique characters) or `pattern` (a bounded regex). Neither means length-only validation. Patterns are whole-value matches. |
+| `sourceMIMEType` | string, optional | The MIME type of the created byteless sources. When absent, the registration must declare exactly one MIME type. |
+
+A sync declaration supports at most one REQUIRED credential requirement on its registration: the sync's credential gate has one subject. Zero required requirements is allowed — a package with no required credentials syncs without the gate. Patterns must compile; they are validated at decode time so a broken declaration fails admission, never a later sync run.
+
+Revision 1 and 2 reject the `sync` key outright (unknown-field policy), so only a revision-3 manifest can declare syncability. Revision-1/2 canonical bytes and package digests are unchanged.
+
+#### Catalog read tolerance
+
+A catalog record whose persisted `manifestRevision` is newer than the reading host understands is skipped with a diagnostic, not treated as corruption: the whole catalog still reads, and the record's reservations survive. A mixed-version machine (app published a newer record, CLI not yet updated) degrades to "that package is invisible to this host" instead of an unreadable catalog.
 
 ### Capabilities
 
@@ -178,6 +198,74 @@ The reviewed packages in `ExtractorPackages/` are complete reviewed packages:
 - `Defuddle/manifest.json` — HTML article extraction, `runtime` launch with the `bun` command, no capabilities, 120-second duration limit, 32 MiB input and output limits.
 - `Pdf2md/manifest.json` — PDF conversion, `runtime` launch with the `uv` command and `run --script` arguments, `network`, `shared-runtime-cache`, and `model-download` capabilities, 30-minute duration limit, 128 MiB input limit.
 - `DoclingServe/manifest.json` — PDF conversion through a self-hosted Docling Serve, `direct` launch, manifest revision 2 with an optional `api-token` credential requirement, `network` capability.
+- `PodcastTranscript/manifest.json` — RSS podcast transcript conversion, `uv run --script` launch, manifest revision 1 with protocol revision 3 (the `remote-url` transport and the `podcast-transcript` kind are registration data, not manifest fields), `network` and `shared-runtime-cache` capabilities.
+- `ApplePodcastTranscript/manifest.json` — Apple Podcasts episode TTML transcript conversion, same launch and manifest shapes, registering only `apple-podcast-transcript` for `audio/apple-podcast`, `network` capability only. The signed `podcast-token-helper` is deliberately NOT a package file: code signing rewrites Mach-O bytes, which would break the digest contract. The host stages the helper into the private operation root for this exact revision; the request's operation configuration carries only the staged helper's relative path.
+- `YouTubeTranscript/manifest.json` — YouTube caption conversion, `uv run --script` launch, manifest revision 1 with protocol revision 3, registering only `youtube-transcript` for `video/youtube`, `network` and `shared-runtime-cache` capabilities (the shared cache keeps uv's CPython install and wheel cache warm across operations). The package fetches only the captions YouTube exposes through `youtube-transcript-api` (an unofficial interface that can change or be blocked); it never downloads media and never runs speech-to-text.
+- `Zotero/manifest.json` — Zotero attachment acquisition, `uv run --script` launch, manifest revision 3 with protocol revision 4. A worked example (see below): one `zotero` registration for the synthetic `application/zotero` MIME, a REQUIRED `zotero-api-key` secret requirement, the acquisition-sync declaration, and the `network` + `shared-runtime-cache` capabilities. The package downloads ONE attachment file plus its item metadata through the Zotero Web API and never converts formats.
+
+### Worked example: the Zotero package
+
+The Zotero package is the reference for a credential-declaring, sync-declaring, revision-4 package:
+
+```json
+{
+  "manifestRevision": 3,
+  "packageID": "org.selfdrivingwiki.zotero",
+  "version": "1.0.2",
+  "displayName": "Zotero Attachment",
+  "protocolRevision": 4,
+  "entryPoint": "bin/zotero-extractor",
+  "launch": {"mode": "runtime", "command": "uv", "arguments": ["run", "--script"]},
+  "registrations": [
+    {
+      "id": "attachment",
+      "displayName": "Zotero Attachment",
+      "kinds": ["zotero"],
+      "mimeTypes": ["application/zotero"],
+      "credentialRequirements": [
+        {
+          "id": "zotero-api-key",
+          "kind": "secret",
+          "optional": false,
+          "label": "Zotero API Key",
+          "purpose": "Read your Zotero library and download attachment files."
+        }
+      ],
+      "sync": {
+        "configFileName": "zotero-config.json",
+        "urlTemplate": "https://api.zotero.org/users/{libraryID}/items/{itemKey}/file",
+        "fields": [
+          {"name": "libraryID", "required": true},
+          {"name": "attachments", "required": true, "isList": true}
+        ],
+        "itemValidation": {
+          "minimumLength": 8,
+          "maximumLength": 8,
+          "alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        }
+      }
+    }
+  ],
+  "capabilities": ["network", "shared-runtime-cache"],
+  "files": [
+    {"path": "PROVENANCE.md", "digest": "…"},
+    {"path": "bin/zotero", "digest": "…"},
+    {"path": "bin/zotero-extractor", "digest": "…"}
+  ],
+  "limits": {
+    "maximumInputByteCount": 1048576,
+    "maximumMarkdownOutputByteCount": 134217728,
+    "maximumDurationMilliseconds": 600000,
+    "maximumProgressEventCount": 64
+  }
+}
+```
+
+Manifest revision 3 exists because the registration declares a sync surface (revision 2 would suffice for the credential requirement alone). The requirement is REQUIRED (`optional: false`) — acquisition cannot proceed without the key, and a missing Keychain value fails the operation with the typed missing-credential state rather than a launch without a key. The sync declaration names the same `zotero-config.json` file the app has always written, so existing configs keep working; `{itemKey}` substitutes one attachment key per item, and the item validation pins the 8-character A–Z0–9 key shape. The output bound is the full 128 MiB host maximum because the attachment file IS the revision-4 output. The duration bound is 600 s so the first operation on a machine can pay uv's one-time CPython download into the shared runtime cache.
+
+### Protocol revisions across manifest revisions
+
+The manifest revision and the protocol revision are independent. A manifest-revision-1 package may declare protocol revision 3: a new protocol transport or a new kind does not change the manifest format, and the digest namespace stays tied to the manifest revision. A host that does not support a protocol revision or a kind fails closed at validation. The machine catalog persists each record's manifest revision explicitly; records written before that field existed derive it from the protocol revision, which implied it before protocol revision 3.
 - `Docx2md/manifest.json` — Word `.docx` conversion, `runtime` launch with the `bun` command, no capabilities, 120-second duration limit, 32 MiB input and output limits.
 
 Validate any package folder with `swift run extractor-package-tool validate <folder>`. The tool prints the package ID, version, package digest, registration IDs, and protocol revision on success.

@@ -44,7 +44,10 @@ public enum SourceCommand {
         case list(json: Bool)
         case cat(Selector, markdown: Bool)
         case export(Selector, out: String?, markdown: Bool)
-        case editMarkdown(Selector, content: BodySource)
+        /// Replace the processed-markdown HEAD with compare-and-swap:
+        /// `expectedHead` is the `head_version_id` the caller read (REQUIRED
+        /// on the CLI — a blind rewrite is not offered). Exit 3 on conflict.
+        case editMarkdown(Selector, content: BodySource, expectedHead: SourceMarkdownVersionID)
         case rename(Selector, to: String)
         case search(query: String, limit: Int)
         case setActive(Selector, versionID: SourceMarkdownVersionID)
@@ -68,8 +71,11 @@ public enum SourceCommand {
     }
 
     /// Run one action against `store`. `cwd` is the directory for `export`'s
-    /// default output path (injected for testability). All actions are pure
-    /// reads — `didCommit` is always false.
+    /// default output path (injected for testability). READ actions never
+    /// commit (`didCommit == false`); the mutating actions — `addFile`,
+    /// `editMarkdown`, `rename`, `setActive`, and the `okf` status/verify/
+    /// correct operations — DO commit (`didCommit == true`), and `main` posts
+    /// the Darwin notification on `didCommit`.
     ///
     /// `bm25Leg` is the pre-resolved Tantivy BM25 leg for the `.search` action
     /// (#637). Post-#634 this is the SOLE BM25 leg (FTS5 was dropped); `nil`
@@ -93,9 +99,9 @@ public enum SourceCommand {
             return try cat(selector, markdown: markdown, in: store)
         case .export(let selector, let out, let markdown):
             return try export(selector, out: out, markdown: markdown, in: store, cwd: cwd)
-        case .editMarkdown(let selector, let contentSource):
+        case .editMarkdown(let selector, let contentSource, let expectedHead):
             let content = try resolveBodySource(contentSource)
-            return try editMarkdown(selector, content: content, in: store)
+            return try editMarkdown(selector, content: content, expectedHead: expectedHead, in: store)
         case .rename(let selector, let to):
             return try rename(selector, to: to, in: store)
         case .search(let query, let limit):
@@ -364,16 +370,27 @@ public enum SourceCommand {
 
     // MARK: - edit-markdown
 
-    /// Replace the processed-markdown HEAD for a source. Errors when no markdown
-    /// chain exists yet (extract first). Commits — the caller posts the Darwin
-    /// notification on `didCommit`.
-    private static func editMarkdown(_ selector: Selector, content: String, in store: WikiStore) throws -> Result {
+    /// Replace the processed-markdown HEAD with compare-and-swap. The
+    /// `expectedHead` id is REQUIRED (the parser enforces it) and the write
+    /// goes ONLY through `appendUserProcessedMarkdown`, whose single
+    /// transaction verifies the chain's active head still equals it: on
+    /// mismatch it throws `SourceMarkdownConflictError` before any write (the
+    /// CLI maps that to exit 3). Errors when no markdown chain exists yet
+    /// (extract first). Commits — the caller posts the Darwin notification on
+    /// `didCommit`.
+    private static func editMarkdown(
+        _ selector: Selector, content: String, expectedHead: SourceMarkdownVersionID,
+        in store: WikiStore
+    ) throws -> Result {
         let id = try resolve(selector, in: store)
         guard try store.hasProcessedMarkdown(sourceID: id) else {
-            throw Failure.message("no processed markdown for this source")
+            throw Failure.message("no processed markdown for this source — extract it first, then edit")
         }
-        try store.appendProcessedMarkdown(sourceID: id, content: content, origin: .user, note: nil, technique: nil)
-        return Result(payload: .text(""), didCommit: true)
+        try store.appendUserProcessedMarkdown(sourceID: id, content: content, expectedHead: expectedHead)
+        // #1228: report the new head (the same `head_version_id: ` stderr
+        // convention as `page get`/`page add`) so the next edit needs no read.
+        let head = try store.processedMarkdownHead(sourceID: id)
+        return Result(payload: .text(""), didCommit: true, stderrOutput: markdownHeadDiagnostic(head))
     }
 
     // MARK: - rename
@@ -420,16 +437,31 @@ public enum SourceCommand {
             throw Failure.message("no processed markdown for this source")
         }
         try store.setActiveMarkdown(sourceID: id, to: versionID)
+        // #1228: report the nominated head (the actual active version after
+        // the ref upsert), not just the requested id.
+        let head = try store.processedMarkdownHead(sourceID: id)
         return Result(
             payload: .text("Set active markdown to \(versionID.rawValue)."),
-            didCommit: true)
+            didCommit: true,
+            stderrOutput: markdownHeadDiagnostic(head))
+    }
+
+    /// #1228: the `head_version_id: <id>` stderr line, mirroring `page get`'s
+    /// convention so agents thread follow-up writes the same way in both
+    /// families. nil when no head exists (the caller already guarded).
+    private static func markdownHeadDiagnostic(_ version: SourceMarkdownVersion?) -> String? {
+        guard let version else { return nil }
+        return "head_version_id: \(version.id.rawValue)\n"
     }
 
     // MARK: - info
 
     /// Print identity (filename, display name, mime, size) and origin provenance
     /// (provider agent, plan/URL, external identity, fetched-at) for a source.
-    /// Mirrors `set-active`'s selector parsing. Read-only.
+    /// Also prints `head_version_id` when a processed-markdown chain exists —
+    /// the documented read an agent performs before a CAS
+    /// `source edit-markdown --expect-head <id>` write (mirrors how `page get`
+    /// exposes the page head). Read-only.
     private static func info(_ selector: Selector, in store: WikiStore) throws -> Result {
         let id = try resolve(selector, in: store)
         let summaries = try store.listSources()
@@ -443,6 +475,11 @@ public enum SourceCommand {
         lines.append("display\t\(display.isEmpty ? summary.filename : display)")
         lines.append("mime\t\(summary.mimeType ?? "")")
         lines.append("size\t\(summary.byteSize)")
+        // The active processed-markdown head, when a chain exists — the id an
+        // agent passes to `source edit-markdown --expect-head`.
+        if let head = try store.processedMarkdownHead(sourceID: id) {
+            lines.append("head_version_id\t\(head.id.rawValue)")
+        }
         if let origin = try store.sourceOrigin(sourceID: id) {
             lines.append("provider\t\(origin.agentName)")
             lines.append("activity\t\(origin.activityKind)")
@@ -466,11 +503,13 @@ public enum SourceCommand {
     ///
     /// wikictl is a CLI process (no `@MainActor`), so the store write happens
     /// directly after the off-main materialize — the Phase-0 `@MainActor`
-    /// invariant applies to the APP process, not wikictl. The service is
-    /// constructed with `podcastFetcher: nil` (no bundled signing helper in the
-    /// CLI context), so podcast refresh throws `.signatureUnavailable` and only
-    /// website sources are refreshable from the CLI. Commits — the caller posts
-    /// the Darwin notification on `didCommit`.
+    /// invariant applies to the APP process, not wikictl. RSS podcast
+    /// (`audio/podcast`) sources are queue-routed: `materialize(origin:)`
+    /// throws `.transcriptQueueRequired`, whose message names the app's
+    /// extraction queue (a feed source HAS a URL — the direct re-fetch path
+    /// just no longer exists). Only website sources are refreshable from the
+    /// CLI. Commits — the caller posts the Darwin notification on
+    /// `didCommit`.
     public static func runRefresh(
         _ selector: Selector,
         in store: WikiStore,
@@ -480,11 +519,7 @@ public enum SourceCommand {
         guard let origin = try store.sourceOrigin(sourceID: id) else {
             throw Failure.message("source has no origin provenance: \(id.rawValue)")
         }
-        #if PODCAST_TRANSCRIPTS
-        let service = SourceRefreshService(fetcher: fetcher, podcastFetcher: nil)
-        #else
         let service = SourceRefreshService(fetcher: fetcher)
-        #endif
         let material = try await service.materialize(origin: origin)
         try persistRefreshMaterial(material, sourceID: id, in: store)
         return Result(

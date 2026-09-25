@@ -74,16 +74,25 @@ final class SessionLookupBox: @unchecked Sendable {
 /// the main actor for each call. The actual `convert()` runs off-main inside
 /// the worker (the `MarkdownExtractor` is `Sendable`).
 @MainActor
-final class AppQueueExtractionProvider: InstalledPackageExtractionPersisting {
+final class AppQueueExtractionProvider: QueueExtractionProvider {
     private let extractionServices: any ExtractionServices
     private let sessionBox: SessionLookupBox
+    /// The queue database URL for the attachment drain's follow-on
+    /// format-route enqueue. Opened lazily (enqueue-only — never a queue
+    /// engine); nil disables the follow-on (tests). A second handle on the
+    /// same WAL database is safe: the store configures a busy timeout and
+    /// GRDB serializes per handle.
+    private let queueDatabaseURL: URL?
+    private var followOnQueueStore: QueueStore?
 
     init(
         extractionServices: any ExtractionServices,
-        sessionBox: SessionLookupBox
+        sessionBox: SessionLookupBox,
+        queueDatabaseURL: URL? = nil
     ) {
         self.extractionServices = extractionServices
         self.sessionBox = sessionBox
+        self.queueDatabaseURL = queueDatabaseURL
     }
 
     // MARK: - QueueExtractionProvider
@@ -98,67 +107,115 @@ final class AppQueueExtractionProvider: InstalledPackageExtractionPersisting {
             return nil
         }
 
-        // Check if this is a transcript source (YouTube, podcast, etc.) —
-        // transcript sources have no local bytes; the markdown comes from a
-        // network/subprocess fetch. Merged from the former
-        // `AppQueueTranscriptionProvider` + `QueueTranscriptionProvider`.
+        // Transcript sources have no local bytes; the markdown comes from a
+        // URL-backed fetch resolved through the extraction services.
         if let origin = store.sourceOrigin(for: sourceID),
            let providerKind = origin.provider {
             switch providerKind {
             case .youtube:
-                let videoID = origin.externalIdentity
-                    ?? MediaEmbedURL.youtube(origin.plan ?? "")?.externalIdentity
-                guard let videoID else { return nil }
-                let svc = YouTubeTranscriptService()
-                return ExtractionResolution(
-                    transcriptFetch: { @Sendable in
-                        try await svc.transcript(forVideoID: videoID).markdown
+                // YouTube transcripts run through the reviewed/selected
+                // extractor package — the same route shape as the podcast
+                // siblings. The stored plan URL wins when it validates, so
+                // watch, short, Shorts, and embed rows keep their source
+                // contract; a legacy row with only a video ID resolves to
+                // the canonical watch URL. Invalid data never launches a
+                // package.
+                guard let sourceURL = YouTubeSourceURL.resolveOperationURL(
+                    plan: origin.plan,
+                    externalIdentity: origin.externalIdentity) else {
+                    return nil
+                }
+                let adapter = try await extractionServices.prepareYouTubeTranscript()
+                let producer = adapter.packageProvenance
+                return .transcript(TranscriptExtractionResolution(
+                    fetch: { onProgress in
+                        let outcome = try await adapter.transcript(
+                            for: sourceURL, onProgress: onProgress)
+                        return TranscriptFetchOutcome(
+                            markdown: outcome.markdown,
+                            reportedMetadata: outcome.reportedMetadata)
                     },
-                    technique: "youtube-captions",
-                    filename: "transcript")
+                    filename: "transcript",
+                    resultMode: .installedPackage(producer)))
 
             case .podcast:
+                // RSS podcast transcripts run through the reviewed/selected
+                // extractor package. The source URL becomes the typed
+                // operation input only after host URL validation.
                 guard let planURLString = origin.plan,
-                      let sourceURL = URL(string: planURLString) else {
+                      let validatedURL = ExtractorRemoteSourceURL(rawValue: planURLString) else {
                     return nil
                 }
-                let svc = RSSPodcastTranscriptService()
-                return ExtractionResolution(
-                    transcriptFetch: { @Sendable in
-                        try await svc.transcript(forFeedURL: sourceURL).markdown
+                let adapter = try await extractionServices.preparePodcastTranscript()
+                let producer = adapter.packageProvenance
+                return .transcript(TranscriptExtractionResolution(
+                    fetch: { onProgress in
+                        let outcome = try await adapter.transcript(
+                            for: validatedURL.url, onProgress: onProgress)
+                        return TranscriptFetchOutcome(
+                            markdown: outcome.markdown,
+                            reportedMetadata: outcome.reportedMetadata)
                     },
-                    technique: "rss-podcast-transcript",
-                    filename: "transcript")
+                    filename: "transcript",
+                    resultMode: .installedPackage(producer)))
 
             case .applePodcast:
-                #if PODCAST_TRANSCRIPTS
+                // Apple transcripts run through the reviewed/selected
+                // extractor package — the same route shape as the RSS
+                // sibling. The package picks its Apple TTML workflow or its
+                // RSS fallback from the host-staged operation support, so a
+                // missing helper keeps the route usable. The source URL
+                // becomes the typed operation input only after host URL
+                // validation.
                 guard let planURLString = origin.plan,
-                      let pageURL = URL(string: planURLString),
-                      let episode = PodcastEpisodeURL.parse(planURLString) else {
+                      let validatedURL = ExtractorRemoteSourceURL(rawValue: planURLString) else {
                     return nil
                 }
-                let fetcher: any PodcastTranscriptFetching =
-                    ApplePodcastTranscriptService.bundled()
-                    ?? RSSPodcastTranscriptService(sourceURL: pageURL)
-                let materializer = ApplePodcastMaterializer(
-                    episode: episode, pageURL: pageURL, fetcher: fetcher)
-                return ExtractionResolution(
-                    transcriptFetch: { @Sendable in
-                        let result = try await materializer.materialize()
-                        return String(data: result.data, encoding: .utf8) ?? ""
+                let adapter = try await extractionServices.prepareApplePodcastTranscript()
+                let producer = adapter.packageProvenance
+                return .transcript(TranscriptExtractionResolution(
+                    fetch: { onProgress in
+                        let outcome = try await adapter.transcript(
+                            for: validatedURL.url, onProgress: onProgress)
+                        return TranscriptFetchOutcome(
+                            markdown: outcome.markdown,
+                            reportedMetadata: outcome.reportedMetadata)
                     },
-                    technique: "apple-ttml",
-                    filename: "transcript")
-                #else
-                return nil
-                #endif
+                    filename: "transcript",
+                    resultMode: .installedPackage(producer)))
+
+            case .zotero:
+                // Zotero attachment acquisition runs through the
+                // reviewed/selected extractor package. The sync command
+                // wrote the canonical Zotero file endpoint as the plan URL;
+                // it becomes the typed operation input only after host URL
+                // validation. The outcome is bytes-shaped: Markdown itself,
+                // or source bytes the host routes to its own format path.
+                guard let planURLString = origin.plan,
+                      let validatedURL = ExtractorRemoteSourceURL(rawValue: planURLString) else {
+                    return nil
+                }
+                let adapter = try await extractionServices.prepareZoteroAttachment()
+                let producer = adapter.packageProvenance
+                return .attachment(AttachmentExtractionResolution(
+                    fetch: { onProgress in
+                        let outcome = try await adapter.attachment(
+                            for: validatedURL.url, onProgress: onProgress)
+                        return AttachmentFetchOutcome(
+                            outputBytes: outcome.outputBytes,
+                            resultMIMEType: outcome.resultMIMEType,
+                            articleMetadata: outcome.articleMetadata,
+                            reportedMetadata: outcome.reportedMetadata)
+                    },
+                    filename: origin.externalIdentity ?? "attachment",
+                    producer: producer))
 
             default:
                 break
             }
         }
 
-        // Regular bytes-based extraction (PDF, HTML, etc.).
+        // Regular bytes-based extraction (PDF, HTML, DOCX).
         guard let source = store.sources.first(where: { $0.id == sourceID }),
               let bytes = store.sourceBytes(id: sourceID)
         else {
@@ -169,70 +226,171 @@ final class AppQueueExtractionProvider: InstalledPackageExtractionPersisting {
         let preparation = try await extractionServices.prepare(
             backendOverride: backendOverride)
 
-        return ExtractionResolution(
+        return .bytes(BytesExtractionResolution(
             extractor: preparation.extractor,
-            pdfData: bytes,
+            sourceBytes: bytes,
             filename: source.filename,
             backend: preparation.backend,
             modelVersion: preparation.modelVersion,
-            packageProvenance: preparation.packageProvenance
-        )
+            packageProducer: preparation.packageProvenance))
     }
 
-    func persistExtraction(
+    @discardableResult
+    func persistBytesExtraction(
         wikiID: WikiID,
         sourceID: SourceID,
-        markdown: String,
-        backend: ExtractionBackend,
-        modelVersion: String?,
-        technique: String?
-    ) async throws {
+        resolution: BytesExtractionResolution,
+        markdown: String
+    ) async throws -> QueueExtractionOutputReference? {
         guard let store = sessionBox.resolve(wikiID: wikiID) else {
-            DebugLog.extraction("AppQueueExtractionProvider: persistExtraction — no session for wikiID=\(wikiID)")
-            return
+            DebugLog.extraction("AppQueueExtractionProvider: persistBytesExtraction — no session for wikiID=\(wikiID)")
+            return nil
         }
-        if let technique {
-            // Transcript extraction — write as .transcript origin.
-            _ = store.appendTranscriptMarkdown(
-                for: sourceID, content: markdown, technique: technique)
+        if let packageProducer = resolution.packageProducer {
+            do {
+                let version = try store.internalStore.appendInstalledPackageMarkdown(
+                    sourceID: sourceID, content: markdown, package: packageProducer,
+                    origin: .extraction, toolVersion: resolution.modelVersion,
+                    sourceVersionID: nil, note: nil)
+                return QueueExtractionOutputReference(versionID: version.id.rawValue)
+            } catch {
+                DebugLog.store("AppQueueExtractionProvider: package provenance write failed (source=\(sourceID.rawValue)): \(error)")
+                throw error
+            }
         } else {
-            store.seedPdfMarkdown(
+            let version = store.seedPdfMarkdown(
                 for: sourceID,
                 content: markdown,
-                backend: backend,
-                modelVersion: modelVersion
+                backend: resolution.backend,
+                modelVersion: resolution.modelVersion
             )
+            return version.map { QueueExtractionOutputReference(versionID: $0.id.rawValue) }
         }
     }
 
-    func persistInstalledPackageExtraction(
+    @discardableResult
+    func persistTranscriptExtraction(
         wikiID: WikiID,
         sourceID: SourceID,
-        markdown: String,
-        backend: ExtractionBackend,
-        modelVersion: String?,
-        packageProvenance: ExtractionInstalledPackageProducer?
-    ) async throws {
-        guard let packageProvenance else {
-            try await persistExtraction(
-                wikiID: wikiID,
-                sourceID: sourceID,
-                markdown: markdown,
-                backend: backend,
-                modelVersion: modelVersion,
-                technique: nil)
-            return
-        }
+        resolution: TranscriptExtractionResolution,
+        outcome: TranscriptFetchOutcome
+    ) async throws -> QueueExtractionOutputReference? {
         guard let store = sessionBox.resolve(wikiID: wikiID) else {
-            DebugLog.extraction("AppQueueExtractionProvider: persistExtraction — no session for wikiID=\(wikiID)")
+            DebugLog.extraction("AppQueueExtractionProvider: persistTranscriptExtraction — no session for wikiID=\(wikiID)")
+            return nil
+        }
+        switch resolution.resultMode {
+        case .builtInTool(let tool):
+            // Built-in tool: keep the existing log-only discipline (the fetch
+            // succeeded; a store-write failure leaves a Console.app trace).
+            let version = store.appendTranscriptMarkdown(
+                for: sourceID, content: outcome.markdown, tool: tool)
+            return version.map { QueueExtractionOutputReference(versionID: $0.id.rawValue) }
+
+        case .installedPackage(let baseProducer):
+            // Package transcript: resolve the source's immutable initial
+            // version FIRST and fail before writing when absent (issue #251).
+            guard let initialVersion = store.initialContentVersion(for: sourceID) else {
+                DebugLog.store("AppQueueExtractionProvider: package transcript has no initial source version (source=\(sourceID.rawValue))")
+                throw AppendDerivedMarkdownError.missingInitialSourceVersion(sourceID)
+            }
+            // Exact provenance: revision, registration, protocol revision,
+            // and the redacted package-reported metadata.
+            let producer = ExtractionInstalledPackageProducer(
+                revision: baseProducer.revision,
+                registrationID: baseProducer.registrationID,
+                protocolRevision: baseProducer.protocolRevision,
+                reportedMetadata: outcome.reportedMetadata)
+            do {
+                let version = try store.internalStore.appendInstalledPackageMarkdown(
+                    sourceID: sourceID, content: outcome.markdown, package: producer,
+                    origin: .transcript, toolVersion: nil,
+                    sourceVersionID: initialVersion.id, note: nil)
+                return QueueExtractionOutputReference(versionID: version.id.rawValue)
+            } catch {
+                DebugLog.store("AppQueueExtractionProvider: package transcript write failed (source=\(sourceID.rawValue)): \(error)")
+                throw error
+            }
+        }
+    }
+
+    @discardableResult
+    func persistAttachmentExtraction(
+        wikiID: WikiID,
+        sourceID: SourceID,
+        resolution: AttachmentExtractionResolution,
+        outcome: AttachmentFetchOutcome
+    ) async throws -> QueueExtractionOutputReference? {
+        guard let store = sessionBox.resolve(wikiID: wikiID) else {
+            DebugLog.extraction("AppQueueExtractionProvider: persistAttachmentExtraction — no session for wikiID=\(wikiID)")
+            return nil
+        }
+        // Provenance fields the package reported (identifier = the Zotero
+        // parent item key; title becomes the display name).
+        let itemKey = outcome.articleMetadata?.identifier
+        let itemTitle = outcome.articleMetadata?.title
+
+        if outcome.isMarkdownResult {
+            // Markdown result: podcast-shaped package provenance write, and
+            // the retained Zotero columns ride along.
+            guard let initialVersion = store.initialContentVersion(for: sourceID) else {
+                DebugLog.store("AppQueueExtractionProvider: attachment markdown has no initial source version (source=\(sourceID.rawValue))")
+                throw AppendDerivedMarkdownError.missingInitialSourceVersion(sourceID)
+            }
+            guard let markdown = String(data: outcome.outputBytes, encoding: .utf8) else {
+                throw ProcessPackageRunError.invalidOutputEncoding
+            }
+            let producer = ExtractionInstalledPackageProducer(
+                revision: resolution.producer.revision,
+                registrationID: resolution.producer.registrationID,
+                protocolRevision: resolution.producer.protocolRevision,
+                reportedMetadata: outcome.reportedMetadata)
+            let version = try store.internalStore.appendInstalledPackageMarkdown(
+                sourceID: sourceID, content: markdown, package: producer,
+                origin: .extraction, toolVersion: nil,
+                sourceVersionID: initialVersion.id, note: nil)
+            try store.internalStore.setAcquisitionProvenance(
+                sourceID: sourceID,
+                externalItemKey: itemKey,
+                externalItemTitle: itemTitle,
+                displayName: itemTitle)
+            return QueueExtractionOutputReference(versionID: version.id.rawValue)
+        }
+
+        // Bytes result: the output-file bytes ARE the source content. The
+        // mutator stores the blob, sets the real MIME/ext/byte size, and
+        // populates the retained columns in one transaction.
+        guard let mimeType = outcome.resultMIMEType else {
+            throw ProcessPackageRunError.unexpectedBytesResult
+        }
+        let version = try store.internalStore.attachAcquiredBytes(
+            sourceID: sourceID,
+            bytes: outcome.outputBytes,
+            mimeType: mimeType.rawValue,
+            externalItemKey: itemKey,
+            externalItemTitle: itemTitle,
+            displayName: itemTitle)
+        return QueueExtractionOutputReference(versionID: version.id.rawValue)
+    }
+
+    func enqueueFollowOnExtraction(wikiID: WikiID, sourceID: SourceID) async throws {
+        let store: QueueStore
+        if let followOnQueueStore {
+            store = followOnQueueStore
+        } else if let queueDatabaseURL {
+            store = try QueueStore(databaseURL: queueDatabaseURL)
+            followOnQueueStore = store
+        } else {
+            DebugLog.extraction("AppQueueExtractionProvider: no queue database URL; follow-on format route not enqueued (source=\(sourceID.rawValue))")
             return
         }
         do {
-            _ = try store.internalStore.appendInstalledPackageMarkdown(
-                sourceID: sourceID, content: markdown, package: packageProvenance,
-                toolVersion: modelVersion, sourceVersionID: nil, note: nil)
+            _ = try store.enqueue(QueueItemRequest(
+                queue: .extraction,
+                wikiID: wikiID,
+                payload: QueueItemPayload(sourceIDs: [sourceID])))
         } catch {
-            DebugLog.store("AppQueueExtractionProvider: package provenance write failed (source=\(sourceID.rawValue)): \(error)")
+            DebugLog.store("AppQueueExtractionProvider: follow-on format-route enqueue failed (source=\(sourceID.rawValue)): \(error)")
             throw error
         }
     }

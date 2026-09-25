@@ -38,7 +38,7 @@ extension WikiStoreModel {
     /// after mutations, per SWIFTUI-RULES §3.1).
     public func tabTitle(for selection: WikiSelection) -> String {
         switch selection {
-        case .newChat: return "Chat"
+        case .newChat: return "New Chat"
         case .changeLog: return "Activity"
         case .page(let id):
             return summaries.first { $0.id == id }?.title
@@ -49,7 +49,9 @@ extension WikiStoreModel {
         case .bookmark(let id):
             return bookmarkNodes.first(where: { $0.id.rawValue == id })?.label ?? "Bookmark"
         case .chat(let id):
-            return chats.first { $0.id == id }?.title ?? "Chat"
+            // Empty titles are normal (durable new chats) — one shared label
+            // everywhere: "New Chat", same as the sidebar cell.
+            return chats.first { $0.id == id }?.title.nonEmpty ?? "New Chat"
         }
     }
 

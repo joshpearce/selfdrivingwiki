@@ -5,7 +5,7 @@ import WikiFSTypes
 
 /// `ExtractionConfig` load/save round-trip, defaulting, resilient decode, and
 /// the one-time migration of the retired typed selection keys into the generic
-/// route-record table — mirrors `ZoteroConfigTests`'s temp-directory pattern.
+/// route-record table — mirrors the sync-sidecar tests' temp-directory pattern.
 struct ExtractionConfigTests {
 
     private func tempDirectory() -> URL {
@@ -166,19 +166,6 @@ struct ExtractionConfigTests {
         #expect(loaded.acpProviderId == nil)
     }
 
-    // MARK: - Podcast backend (a transcript setting, not a route selection)
-
-    @Test func podcastBackendRoundTrips() throws {
-        let dir = tempDirectory()
-        var config = ExtractionConfig()
-        config.podcastBackend = .appleTranscript
-        try config.save(to: dir)
-
-        let loaded = ExtractionConfig.load(from: dir)
-        #expect(loaded == persisted(config))
-        #expect(loaded.podcastBackend == .appleTranscript)
-    }
-
     /// The retired `htmlBackend` key is a decode-only migration input: a
     /// decode adopts it into an HTML route record, and a re-encode never
     /// writes the key again.
@@ -192,22 +179,13 @@ struct ExtractionConfigTests {
         #expect(object?["htmlBackend"] == nil)
     }
 
-    @Test func podcastBackendDecodesAsNilWhenAbsent() throws {
-        let json = Data(#"{"backend":"anthropic"}"#.utf8)
-        let config = try JSONDecoder().decode(ExtractionConfig.self, from: json)
-        #expect(config.podcastBackend == nil)
-    }
-
-    /// Unknown raw values for the retired optional keys degrade silently to
-    /// nil — the whole config still loads and no route record is produced.
-    @Test func unknownHtmlAndPodcastBackendValuesDegradeToNil() throws {
+    /// Keyed decoding ignores the retired podcast backend key. Existing config
+    /// files still load, while the unknown HTML value contributes no route.
+    @Test func retiredPodcastBackendKeyIsIgnored() throws {
         let json = Data(#"""
-        {"backend":"anthropic","htmlBackend":"whisper","podcastBackend":"rev_ai"}
+        {"backend":"anthropic","htmlBackend":"whisper","podcastBackend":"apple_transcript"}
         """#.utf8)
         let config = try JSONDecoder().decode(ExtractionConfig.self, from: json)
-        #expect(config.podcastBackend == nil)
-        // The unknown HTML/podcast values contribute nothing, but the backend
-        // key still migrates into its PDF host record.
         #expect(config.extractorSelection(for: .canonicalPDF) == host("anthropic"))
         #expect(config.extractorSelection(for: .canonicalHTML) == nil)
     }
@@ -720,7 +698,8 @@ struct ExtractionConfigTests {
         logical: LogicalExtractorReference,
         version: String,
         digestByte: UInt8,
-        kinds: Set<ExtractorKind>
+        kinds: Set<ExtractorKind>,
+        protocolRevision: ExtractorProtocolRevision = .v1
     ) throws -> ActiveExtractorRegistration {
         let revision = ExtractorPackageRevisionID(
             packageID: logical.packageID,
@@ -729,6 +708,106 @@ struct ExtractionConfigTests {
         return ActiveExtractorRegistration(
             reference: ExtractorReference(revision: revision, registrationID: logical.registrationID),
             kinds: kinds,
-            protocolRevision: .v1)
+            protocolRevision: protocolRevision)
+    }
+
+    /// The podcast transcript route resolves through the same generic
+    /// precedence, and protocol revision 3 registrations are selectable: a
+    /// saved installed reference whose only active registration is v3
+    /// resolves to it (a v2-only gate would permanently resolve
+    /// `.unavailableInstalled` while the rest of the suite looks green).
+    @Test func podcastRouteSelectionResolvesRevision3Registration() throws {
+        let reviewed = LogicalExtractorReference(
+            packageID: try ExtractorPackageID(validating: "org.selfdrivingwiki.podcast-transcript"),
+            registrationID: try ExtractorRegistrationID(validating: "feed"))
+
+        // No record → the bundled default reviewed lineage; with no active
+        // registration it fails closed with the redacted diagnostic.
+        let empty = ExtractionConfig()
+        let defaulted = ExtractorSelectionResolver.resolvePodcastTranscript(
+            configuration: empty, activeRegistrations: [])
+        #expect(defaulted.selection
+            == .unavailableInstalled(kind: .podcastTranscript, reference: reviewed))
+
+        // Saved installed reference + active revision-3 registration → the
+        // exact reference.
+        let logical = LogicalExtractorReference(
+            packageID: try ExtractorPackageID(validating: "org.example.podcast"),
+            registrationID: try ExtractorRegistrationID(validating: "feed"))
+        let active = try activeRegistration(
+            logical: logical, version: "1.0.0", digestByte: 5, kinds: [.podcastTranscript],
+            protocolRevision: .v3)
+        var config = ExtractionConfig()
+        config.setExtractorSelection(.installed(logical), for: .canonicalPodcastTranscript)
+        let decision = ExtractorSelectionResolver.resolvePodcastTranscript(
+            configuration: config, activeRegistrations: [active])
+        #expect(decision.selection == .installed(kind: .podcastTranscript, reference: active.reference))
+        #expect(decision.diagnostic == nil)
+
+        // Inactive → fail closed, identity retained.
+        let unavailable = ExtractorSelectionResolver.resolvePodcastTranscript(
+            configuration: config, activeRegistrations: [])
+        #expect(unavailable.selection == .unavailableInstalled(kind: .podcastTranscript, reference: logical))
+        #expect(unavailable.diagnostic == .unavailableInstalled(logical))
+
+        // Explicit `.none` disables the route (no reviewed-default revival).
+        var disabled = ExtractionConfig()
+        disabled.setExtractorSelection(ExtractionBackendReference.none, for: .canonicalPodcastTranscript)
+        #expect(ExtractorSelectionResolver.resolvePodcastTranscript(
+            configuration: disabled, activeRegistrations: [active]).selection == .noSelection)
+
+        // The route-aware entry dispatches the canonical podcast route.
+        #expect(ExtractorSelectionResolver.resolve(
+            .canonicalPodcastTranscript, configuration: empty, activeRegistrations: []) != nil)
+    }
+
+    /// The YouTube route resolves through the same generic precedence: the
+    /// bundled default reviewed lineage with no record, an exact installed
+    /// reference when active, fail-closed retention when it is not, and an
+    /// explicit `.none` staying disabled (no reviewed-default revival).
+    @Test func youtubeRouteSelectionUsesTheGenericPrecedence() throws {
+        let reviewed = LogicalExtractorReference(
+            packageID: try ExtractorPackageID(validating: "org.selfdrivingwiki.youtube-transcript"),
+            registrationID: try ExtractorRegistrationID(validating: "captions"))
+
+        // No record → the bundled default reviewed lineage; with no active
+        // registration it fails closed with the redacted diagnostic.
+        let empty = ExtractionConfig()
+        let defaulted = ExtractorSelectionResolver.resolveYouTubeTranscript(
+            configuration: empty, activeRegistrations: [])
+        #expect(defaulted.selection
+            == .unavailableInstalled(kind: .youtubeTranscript, reference: reviewed))
+        #expect(defaulted.diagnostic == .unavailableInstalled(reviewed))
+
+        // Saved installed reference + active revision-3 registration → the
+        // exact reference.
+        let logical = LogicalExtractorReference(
+            packageID: try ExtractorPackageID(validating: "org.example.youtube"),
+            registrationID: try ExtractorRegistrationID(validating: "captions"))
+        let active = try activeRegistration(
+            logical: logical, version: "1.0.0", digestByte: 6, kinds: [.youtubeTranscript],
+            protocolRevision: .v3)
+        var config = ExtractionConfig()
+        config.setExtractorSelection(.installed(logical), for: .canonicalYouTubeTranscript)
+        let decision = ExtractorSelectionResolver.resolveYouTubeTranscript(
+            configuration: config, activeRegistrations: [active])
+        #expect(decision.selection == .installed(kind: .youtubeTranscript, reference: active.reference))
+        #expect(decision.diagnostic == nil)
+
+        // Inactive → fail closed, identity retained.
+        let unavailable = ExtractorSelectionResolver.resolveYouTubeTranscript(
+            configuration: config, activeRegistrations: [])
+        #expect(unavailable.selection == .unavailableInstalled(kind: .youtubeTranscript, reference: logical))
+        #expect(unavailable.diagnostic == .unavailableInstalled(logical))
+
+        // Explicit `.none` disables the route (no reviewed-default revival).
+        var disabled = ExtractionConfig()
+        disabled.setExtractorSelection(ExtractionBackendReference.none, for: .canonicalYouTubeTranscript)
+        #expect(ExtractorSelectionResolver.resolveYouTubeTranscript(
+            configuration: disabled, activeRegistrations: [active]).selection == .noSelection)
+
+        // The route-aware entry dispatches the canonical YouTube route.
+        #expect(ExtractorSelectionResolver.resolve(
+            .canonicalYouTubeTranscript, configuration: empty, activeRegistrations: []) != nil)
     }
 }

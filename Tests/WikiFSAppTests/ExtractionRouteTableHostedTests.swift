@@ -164,14 +164,16 @@ struct ExtractionRouteTableHostedTests {
         }.count
     }
 
-    @Test("Settings opens on the defaults pane, which mounts the route table")
+    @Test("the defaults pane mounts the route table")
     func rendersRouteTableWithoutCrash() async throws {
         let lease = await HostedAppKitTestGate.shared.acquire()
         defer { lease.release() }
         let dir = try tempDirectory("route-table-render")
+        // Packages is the opening pane now, so mount the defaults pane
+        // explicitly for the route-table assertions.
         // A real registration whose MIME is outside the host routes: the table
-        // then holds four rows (PDF, HTML, Word, and the registration-derived
-        // epub route). Row views only exist after the async snapshot load rebuilds
+        // then holds seven rows: six canonical routes and one registration-derived
+        // EPUB route. Row views only exist after the async snapshot load rebuilds
         // routeRows, so the wait below observes the actual load instead of the
         // initial layout.
         let view = makeView(directory: dir, snapshot: snapshot(registrations: [
@@ -191,16 +193,15 @@ struct ExtractionRouteTableHostedTests {
         let window = mount(view)
 
         try await waitUntil {
-            self.tableViewRowCounts(window).contains(5)
+            self.tableViewRowCounts(window).contains(7)
         }
         // The hosted hierarchy contains a native table (row views) inside a
         // clip view — the scrollable, window-bounded layout.
         let content = try #require(window.contentView)
         #expect(containsDescendant(content) { $0 is NSClipView })
-        // Four route rows plus the podcast transcript row. The packages pane
-        // is a separate tab, so its table is not mounted here — which is also
-        // what pins the default pane.
-        #expect(tableViewRowCounts(window) == [5])
+        // Six canonical routes plus the registration-derived EPUB route.
+        // The packages pane is not mounted on the default tab.
+        #expect(tableViewRowCounts(window) == [7])
         // Under the metrics ceiling every row has to be visible, not merely
         // present. The transcript row is last, so a table sized one row short
         // hides exactly it.
@@ -241,6 +242,59 @@ struct ExtractionRouteTableHostedTests {
         }
         let content = try #require(window.contentView)
         #expect(content.fittingSize.height > 0)
+    }
+
+    /// Regression (hidden package rows): a packages list longer than the
+    /// visible-row ceiling must not hide rows inside the table's own scroll
+    /// area. A nested scroll view under macOS overlay scrollbars shows no
+    /// scrollbar until scrolled, and wheel events over a nested AppKit table
+    /// are routinely claimed by the surrounding SwiftUI form — so rows past
+    /// the cap were unreachable (the installed Zotero package sorted last
+    /// and could not be selected or removed). The table sizes to its full
+    /// content instead, and the Settings form is the only scroll authority.
+    @Test("a packages table past the visible-row ceiling keeps every row reachable")
+    func packagesTableBeyondCeilingKeepsEveryRowReachable() async throws {
+        let lease = await HostedAppKitTestGate.shared.acquire()
+        defer { lease.release() }
+        let dir = try tempDirectory("package-table-reachability")
+        var loaded = snapshot()
+        loaded.rows = try (0..<20).map { index in
+            let raw = "org.example.pkg\(String(format: "%02d", index))"
+            return ExtractorPackageSettingsRow(
+                kind: .pdf,
+                packageID: raw,
+                version: "1.0.0",
+                digestPrefix: String(repeating: "c", count: 12),
+                registrationID: "pdf",
+                revision: ExtractorPackageRevisionID(
+                    packageID: try ExtractorPackageID(validating: raw),
+                    version: try ExtractorPackageVersion(validating: "1.0.0"),
+                    digest: try ExtractorPackageDigest(hex: String(repeating: "c", count: 64))))
+        }
+        let window = mount(makeView(directory: dir, snapshot: loaded, pane: .packages))
+        try await waitUntil { self.tableViewRowCounts(window) == [20] }
+
+        let table = try #require(tableViews(window).first)
+        // The measured row height must match the metric the frame is sized
+        // with — if the real rows are taller than `textRowHeight`, every
+        // height computed from it clips rows off the bottom.
+        let measuredRowHeight = table.rect(ofRow: 0).height
+        #expect(abs(measuredRowHeight - SettingsTableMetrics.textRowHeight) < 1.5)
+
+        // No row may live below the table's internal fold: the table shows
+        // all of its rows, so the section scrolls as one piece.
+        #expect(clippedRowCount(table) == 0)
+
+        // The section outgrows the 560pt window, so SOMETHING must scroll —
+        // and it must not be the table's own nested clip view.
+        let tableClip = try #require(table.enclosingScrollView?.contentView)
+        #expect(tableClip.documentRect.height <= tableClip.bounds.height + 0.5)
+        let content = try #require(window.contentView)
+        let scrollingAncestor = containsDescendant(content) { view in
+            guard let clip = view as? NSClipView, clip !== tableClip else { return false }
+            return clip.documentRect.height > clip.bounds.height + 0.5
+        }
+        #expect(scrollingAncestor)
     }
 
     @Test("a non-ready route status dialog mounts with recovery controls")
@@ -298,6 +352,7 @@ struct ExtractionRouteTableHostedTests {
             rootView: ExtractionSettingsView.PackageConfigurationDialog(
                 title: "Example Extractor",
                 requirements: [requirement],
+                credentials: Self.stubCredentials,
                 authorizeRequirement: { _ in .succeeded(nil) },
                 revokeRequirement: { _ in .succeeded(nil) },
                 onCredentialMutation: { _ in }))
@@ -340,11 +395,13 @@ struct ExtractionRouteTableHostedTests {
     func routeTableSourceContract() throws {
         let source = try sourceView()
 
-        // The table and its columns.
+        // The table and its columns. Status lives with the package in the
+        // Packages table (its symbol opens the recovery sheet), so the
+        // defaults table is just Format + picker.
         #expect(source.contains("Table(defaultsRows)"))
         #expect(source.contains("TableColumn(\"Format\")"))
         #expect(source.contains("TableColumn(\"Default extractor\")"))
-        #expect(source.contains("TableColumn(\"Status\")"))
+        #expect(source.contains("TableColumn(\"Status\")") == false)
 
         // Stable route-derived accessibility identifiers and labels.
         #expect(source.contains("extraction.routes.table"))
@@ -360,7 +417,10 @@ struct ExtractionRouteTableHostedTests {
         #expect(source.contains("\"Not installed\""))
         #expect(source.contains("\"Starting\""))
         #expect(source.contains("\"Failed\""))
-        #expect(source.contains("extraction.routes.status"))
+        // The route status prefix and the focus-restore flow are gone with
+        // the column; package status carries "extraction.packages.status".
+        #expect(source.contains("extraction.routes.status") == false)
+        #expect(source.contains("focusedRoutePicker") == false)
         #expect(source.contains("Show status details"))
         #expect(source.contains("ExtractorStatusDialog("))
         #expect(source.contains("Technical Details"))
@@ -385,12 +445,12 @@ struct ExtractionRouteTableHostedTests {
         #expect(source.contains("rebuildRouteRows()"))
         #expect(source.contains("NSViewRepresentable") == false)
 
-        // ACP and Docling configuration follows the PDF route selection only.
-        // #1159: the Configure… button lives IN the route table (a per-row
-        // Configuration column) and opens a dialog (macos-design progressive
-        // disclosure) rather than inline sections.
-        #expect(source.contains("switch routeSelections[row.id]"))
-        #expect(source.contains("TableColumn(\"Configuration\")"))
+        // ACP and Docling configuration is package-level now: the Packages
+        // table's status symbol opens the recovery sheet, which presents the
+        // shared service dialogs above the pane switcher (macos-design
+        // progressive disclosure) rather than inline sections.
+        #expect(source.contains("switch routeSelections[row.id]") == false)
+        #expect(source.contains("TableColumn(\"Configuration\")") == false)
         #expect(source.contains("Button(\"Configure…\")"))
         #expect(source.contains(".sheet(item: $serviceConfigurationDialog)"))
         #expect(source.contains("ACPConfigurationDialog("))
@@ -400,14 +460,15 @@ struct ExtractionRouteTableHostedTests {
         #expect(source.contains("MIME type: \\(routeRow.route.mimeType.rawValue)"))
         #expect(source.contains("Text(\"\\(routeRow.route.mimeType.rawValue)\")") == false)
 
-        // The podcast transcript default is a row of the same table, not its
-        // own section: it is a default extractor like any other, even though a
-        // host adapter resolves it rather than a package registration.
-        #expect(source.contains("podcastBackendBinding"))
-        #expect(source.contains("Picker(\"Podcast Transcript\", selection: podcastBackendBinding)"))
-        #expect(source.contains("case podcastTranscript(PodcastTranscriptionBackend?)"))
-        #expect(source.contains("extraction.routes.picker.podcast"))
-        #expect(source.contains("Podcast transcripts are not package-backed in protocol revision 1."))
+        // The podcast transcript defaults are standard route rows of the same
+        // table (registration-driven, resolved through the reviewed
+        // podcast-transcript and apple-podcast-transcript packages). The
+        // bespoke Apple TTML backend row is GONE with the packaging.
+        #expect(source.contains("podcastBackendBinding") == false)
+        #expect(source.contains("Picker(\"Apple Transcript\"") == false)
+        #expect(source.contains("extraction.routes.picker.podcast") == false)
+        #expect(source.contains("Podcast feed transcripts run through the reviewed podcast-transcript package."))
+        #expect(source.contains("not package-backed") == false)
         #expect(!source.contains("Text(\"Transcripts\")"))
     }
 
@@ -415,12 +476,12 @@ struct ExtractionRouteTableHostedTests {
     func paneSwitcherDefaultsToTheDefaultsPane() throws {
         // The order is what the segmented control renders, so defaults sits on
         // the leading edge as well as being the initial selection.
-        #expect(ExtractionSettingsPane.allCases == [.defaults, .packages])
-        #expect(ExtractionSettingsPane.defaults.title == "Defaults")
+        #expect(ExtractionSettingsPane.allCases == [.packages, .defaults])
         #expect(ExtractionSettingsPane.packages.title == "Packages")
+        #expect(ExtractionSettingsPane.defaults.title == "Defaults")
 
         let source = try sourceView()
-        #expect(source.contains("initialPane: ExtractionSettingsPane = .defaults"))
+        #expect(source.contains("initialPane: ExtractionSettingsPane = .packages"))
         #expect(source.contains(".pickerStyle(.segmented)"))
         #expect(source.contains("extraction.pane.switcher"))
         #expect(source.contains("case .defaults: defaultsPane"))
@@ -430,28 +491,27 @@ struct ExtractionRouteTableHostedTests {
         #expect(source.contains(".sheet(item: $serviceConfigurationDialog) { dialog in\n            serviceConfigurationSheet(dialog)"))
     }
 
-    @Test("the transcript row keeps its own id space and tracks its selection")
-    func transcriptRowIsItsOwnIdentity() throws {
-        let routeRow = ExtractorRouteSettingsRow(
-            descriptor: ExtractorRouteDescriptor(
-                route: .canonicalPDF,
-                displayName: "PDF",
-                systemImage: "doc.richtext"),
-            savedSelection: nil,
-            resolvedSelection: nil,
-            choices: [],
-            status: .ready)
+    @Test("table row identifiers are unique")
+    func tableRowIdentifiersAreUnique() throws {
+        let rows = [
+            ExtractorRouteDescriptor(
+                route: .canonicalPDF, displayName: "PDF", systemImage: "doc.richtext"),
+            ExtractorRouteDescriptor(
+                route: .canonicalHTML, displayName: "HTML", systemImage: "doc.text"),
+            ExtractorRouteDescriptor(
+                route: .canonicalApplePodcastTranscript,
+                displayName: "Apple Podcasts transcript",
+                systemImage: "quote.bubble"),
+        ].map { descriptor in
+            ExtractionDefaultsTableRow.route(ExtractorRouteSettingsRow(
+                descriptor: descriptor,
+                savedSelection: nil,
+                resolvedSelection: nil,
+                choices: [],
+                status: .ready))
+        }
 
-        let route = ExtractionDefaultsTableRow.route(routeRow)
-        let prompt = ExtractionDefaultsTableRow.podcastTranscript(nil)
-        let chosen = ExtractionDefaultsTableRow.podcastTranscript(.appleTranscript)
-
-        // A transcript is not a route, so it cannot collide with one.
-        #expect(route.id != prompt.id)
-        // The transcript row is one row whichever backend it names, so the
-        // table updates it in place instead of replacing it.
-        #expect(prompt.id == chosen.id)
-        #expect(prompt != chosen)
+        #expect(Set(rows.map(\.id)).count == rows.count)
     }
 
     @Test("picker options show only extractor names")
@@ -642,7 +702,10 @@ struct ExtractorRouteRecoveryPresenterTests {
             authorization: .needsAuthorization)]
         let unauthorized = ExtractorRouteRecoveryPresenter.present(
             row: docling, extractorName: "Docling Serve", facts: doclingFacts)
-        #expect(unauthorized.status == .needsSetup(.unauthorizedDoclingCredential))
+        #expect(unauthorized.status == .needsSetup(.unauthorizedCredential))
+        // The Docling-named fixture row must render generic copy: the branch
+        // matches any package with an unauthorized required credential.
+        #expect(unauthorized.summary == "Authorize the package to use the configured credential.")
         #expect(unauthorized.primaryAction == .authorizeCredential)
 
         doclingFacts.credentialRequirements = []

@@ -152,46 +152,25 @@ public enum DefuddleExtractionPlugin {
     }
 }
 
-public enum YouTubeTranscriptPlugin {
-    public static let id = PluginID("wiki.extraction.youtube-transcript")
-    public static let key = ExtractionBackendKey(kind: .youtubeTranscript, backendID: "youtube")
+// `YouTubeTranscriptPlugin` was REMOVED with the YouTube caption packaging:
+// YouTube transcripts run through the reviewed youtube-transcript package,
+// whose prepared `.youtubeTranscript` adapter carries exact package
+// provenance. The former built-in fetcher registration could not carry
+// provenance and had no production composition site. The direct
+// `YouTubeTranscriptService` + `TranscriptSubprocess` path was deleted with
+// it.
 
-    public static func definition(
-        makeFetcher: @escaping @Sendable () async -> any YouTubeTranscriptFetching
-    ) -> PluginDefinition {
-        adapterDefinition(id: id, label: "YouTube transcripts", key: key) {
-            .youtubeTranscript(await makeFetcher())
-        }
-    }
-}
-
-public enum RSSPodcastTranscriptPlugin {
-    public static let id = PluginID("wiki.extraction.rss-podcast-transcript")
-    public static let key = ExtractionBackendKey(kind: .rssPodcastTranscript, backendID: "rss")
-
-    public static func definition(
-        makeFetcher: @escaping @Sendable () async -> any RSSFeedTranscriptFetching
-    ) -> PluginDefinition {
-        adapterDefinition(id: id, label: "RSS podcast transcripts", key: key) {
-            .rssPodcastTranscript(await makeFetcher())
-        }
-    }
-}
-
-public enum ApplePodcastTranscriptPlugin {
-    public static let id = PluginID("wiki.extraction.apple-podcast-transcript")
-    public static let key = ExtractionBackendKey(
-        kind: .applePodcastTranscript,
-        backendID: PodcastTranscriptionBackend.appleTranscript.rawValue)
-
-    public static func definition(
-        makeFetcher: @escaping @Sendable () async -> any PodcastTranscriptFetching
-    ) -> PluginDefinition {
-        adapterDefinition(id: id, label: "Apple Podcasts transcripts", key: key) {
-            .applePodcastTranscript(await makeFetcher())
-        }
-    }
-}
+// `RSSPodcastTranscriptPlugin` was REMOVED: RSS podcast transcripts run
+// through the reviewed podcast-transcript package, whose prepared
+// `.podcastTranscript` adapter carries exact package provenance. The former
+// built-in fetcher registration could not carry provenance and was never
+// part of a production composition.
+//
+// `ApplePodcastTranscriptPlugin` was REMOVED with the Apple TTML packaging:
+// Apple Podcasts transcripts run through the reviewed
+// apple-podcast-transcript package, whose prepared
+// `.applePodcastTranscript` adapter carries exact package provenance. The
+// former built-in registration had no production composition site.
 
 private func adapterDefinition(
     id: PluginID,

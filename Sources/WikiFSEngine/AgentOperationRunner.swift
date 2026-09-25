@@ -599,7 +599,7 @@ public enum AgentOperationRunner {
     /// sink (e.g. on a second turn) is a no-op for already-summarized rows.
     ///
     /// **Chat-level summary (issue #411):** the FIRST summarizable message's
-    /// summary is mirrored into `chats.summary` (the chats-list subtitle) as it
+    /// summary is cached on the message as it
     /// is written. This is the only writer of that column — the launcher no
     /// longer computes its own always-truncated version, which is what made the
     /// subtitle abbreviate even in Model mode.
@@ -638,44 +638,48 @@ public enum AgentOperationRunner {
         store: WikiStoreModel,
         launcher: AgentLauncher
     ) async {
-        let messages = store.chatMessages(chatID: chatID)
-        let pending = messages.filter { msg in
-            msg.summary == nil
-                && (MessageSummarizer.textToSummarize(from: msg.event)?.isEmpty == false)
+        // v54 (#1266): pending summaries are detected on the durable
+        // transcript (`chat_transcript_items`), not the compatibility
+        // `chat_messages` projection.
+        var items: [PersistedChatTranscriptItem] = []
+        var after: ChatTranscriptCursor?
+        // Page budget: guards against a concurrent-writer livelock.
+        for _ in 0..<1000 {
+            let page = store.readChatTranscriptPage(
+                chatID: chatID, after: after, limit: 200)
+            items.append(contentsOf: page.items)
+            guard let next = page.nextCursor else { break }
+            after = next
         }
-        let chatSummaryMessageID = MessageSummarizer.chatSummaryMessageID(in: messages)
+        let pending = MessageSummarizer.pendingSummaryTargets(from: items)
         guard !pending.isEmpty else { return }
         guard let services = launcher.providerServices else {
-            Self.writeDefaultSummaries(
-                chatID: chatID,
-                pending: pending,
-                store: store,
-                chatSummaryMessageID: chatSummaryMessageID)
+            Self.writeDefaultSummaries(chatID: chatID, pending: pending, store: store)
             return
         }
         do {
             let preparation = try await services.prepareSummarization()
             switch preparation {
             case .defaultTruncation:
-                Self.writeDefaultSummaries(
-                    chatID: chatID, pending: pending, store: store,
-                    chatSummaryMessageID: chatSummaryMessageID)
+                Self.writeDefaultSummaries(chatID: chatID, pending: pending, store: store)
             case .model(let preparation):
                 await Self.runModelSummarization(
                     chatID: chatID,
                     pending: pending,
                     services: services,
                     preparation: preparation,
-                    store: store,
-                    chatSummaryMessageID: chatSummaryMessageID)
+                    store: store)
                 await services.release(preparation.selection.token)
+            case .appleIntelligence:
+                // In process, no snapshot or lease — nothing to release.
+                await Self.runAppleIntelligenceSummarization(
+                    chatID: chatID,
+                    pending: pending,
+                    services: services,
+                    store: store)
             }
         } catch AgentProviderRuntimeError.unavailable {
-            Self.writeDefaultSummaries(
-                chatID: chatID,
-                pending: pending,
-                store: store,
-                chatSummaryMessageID: chatSummaryMessageID)
+            Self.writeDefaultSummaries(chatID: chatID, pending: pending, store: store)
         } catch {
             DebugLog.agent("AgentOperationRunner: summarization preparation failed: \(error)")
         }
@@ -683,15 +687,14 @@ public enum AgentOperationRunner {
 
     @MainActor
     private static func writeDefaultSummaries(
-        chatID: ChatID, pending: [ChatMessage], store: WikiStoreModel,
-        chatSummaryMessageID: PageID?
+        chatID: ChatID,
+        pending: [(cursor: ChatTranscriptCursor, text: String)],
+        store: WikiStoreModel
     ) {
-        for msg in pending {
-            guard let text = MessageSummarizer.textToSummarize(from: msg.event) else { continue }
-            let summary = MessageSummarizer.defaultSummary(for: text)
+        for target in pending {
+            let summary = MessageSummarizer.defaultSummary(for: target.text)
             guard !summary.isEmpty else { continue }
-            store.updateMessageSummary(chatID: chatID, messageID: msg.id, summary: summary, kind: .defaultTruncation)
-            if msg.id == chatSummaryMessageID { store.updateChatSummary(chatID: chatID, summary: summary) }
+            store.updateMessageSummary(chatID: chatID, cursor: target.cursor, summary: summary, kind: .defaultTruncation)
         }
     }
 
@@ -699,30 +702,63 @@ public enum AgentOperationRunner {
     @MainActor
     private static func runModelSummarization(
         chatID: ChatID,
-        pending: [ChatMessage],
+        pending: [(cursor: ChatTranscriptCursor, text: String)],
         services: any AgentProviderServices,
         preparation: AgentOperationPreparation,
-        store: WikiStoreModel,
-        chatSummaryMessageID: PageID?
+        store: WikiStoreModel
     ) async {
-        for msg in pending {
-            guard let text = MessageSummarizer.textToSummarize(from: msg.event) else { continue }
+        for target in pending {
             do {
                 guard let summary = try await services.modelSummary(
-                    text: text,
+                    text: target.text,
                     preparation: preparation) else {
-                    DebugLog.ingest("summarizePendingMessages: summarizer returned nil for message id=\(msg.id.rawValue.prefix(8))")
+                    // Issue #1276 strict tier: nil is a FAILED summarization
+                    // (launch failure, empty reply, preamble-only reply) —
+                    // `MessageSummarizer.oneShotReply` swallows the error and
+                    // returns nil. Degrade to the truncation summary exactly
+                    // like the thrown path; never a silent unsummarized row
+                    // (#1279 found this branch skipping the fallback).
+                    DebugLog.agent("AgentOperationRunner: model summary returned nil — degrading to truncation")
+                    Self.writeDefaultSummaries(chatID: chatID, pending: [target], store: store)
                     continue
                 }
                 store.updateMessageSummary(
-                    chatID: chatID, messageID: msg.id,
+                    chatID: chatID, cursor: target.cursor,
                     summary: summary, kind: .model)
-                if msg.id == chatSummaryMessageID {
-                    store.updateChatSummary(chatID: chatID, summary: summary)
-                }
             } catch {
-                DebugLog.agent("AgentOperationRunner: model summary failed: \(error.localizedDescription)")
+                // Issue #1276 strict tier: a launch failure (e.g. an adapter
+                // the strict sandbox fences) must DEGRADE to the default
+                // truncation summary — never leave the message unsummarized.
+                DebugLog.agent("AgentOperationRunner: model summary failed — degrading to truncation: \(error.localizedDescription)")
+                Self.writeDefaultSummaries(chatID: chatID, pending: [target], store: store)
             }
+        }
+    }
+
+    /// Drive Apple Intelligence summarization for the pending batch. Mirrors
+    /// `runModelSummarization` without the preparation and the release: the
+    /// AI turn runs in process, so there is no token to retire. The same
+    /// strict-tier degradation applies — a nil result (empty reply, error,
+    /// timeout) degrades to the truncation summary, never a silent
+    /// unsummarized row.
+    @MainActor
+    private static func runAppleIntelligenceSummarization(
+        chatID: ChatID,
+        pending: [(cursor: ChatTranscriptCursor, text: String)],
+        services: any AgentProviderServices,
+        store: WikiStoreModel
+    ) async {
+        for target in pending {
+            guard let summary = await services.appleIntelligenceSummary(text: target.text) else {
+                DebugLog.agent("AgentOperationRunner: Apple Intelligence summary returned nil — degrading to truncation")
+                Self.writeDefaultSummaries(chatID: chatID, pending: [target], store: store)
+                continue
+            }
+            // Non-throwing: `WikiStoreModel.updateMessageSummary` logs write
+            // failures itself (same as `writeDefaultSummaries` above).
+            store.updateMessageSummary(
+                chatID: chatID, cursor: target.cursor,
+                summary: summary, kind: .model)
         }
     }
 }

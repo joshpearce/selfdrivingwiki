@@ -65,6 +65,15 @@ public enum ExtractorSelectionResolver {
         if route == .canonicalPDF { return resolvePDF(configuration: configuration, activeRegistrations: activeRegistrations) }
         if route == .canonicalHTML { return resolveHTML(configuration: configuration, activeRegistrations: activeRegistrations) }
         if route == .canonicalDOCX { return resolveDOCX(configuration: configuration, activeRegistrations: activeRegistrations) }
+        if route == .canonicalPodcastTranscript {
+            return resolvePodcastTranscript(configuration: configuration, activeRegistrations: activeRegistrations)
+        }
+        if route == .canonicalApplePodcastTranscript {
+            return resolveApplePodcastTranscript(configuration: configuration, activeRegistrations: activeRegistrations)
+        }
+        if route == .canonicalYouTubeTranscript {
+            return resolveYouTubeTranscript(configuration: configuration, activeRegistrations: activeRegistrations)
+        }
         return nil
     }
 
@@ -90,6 +99,44 @@ public enum ExtractorSelectionResolver {
         activeRegistrations: [ActiveExtractorRegistration]
     ) -> ExtractionSelectionDecision {
         resolve(.canonicalDOCX, kind: .docx, configuration: configuration, activeRegistrations: activeRegistrations)
+    }
+
+    /// Podcast transcript resolution uses the same generic precedence. The
+    /// bundled default record (the reviewed podcast-transcript lineage)
+    /// supplies the no-configured-record default; an explicit `.none`
+    /// disables; a saved installed reference that no longer resolves keeps
+    /// its identity and fails closed with the diagnostic. The state machine
+    /// lives entirely in the generic `resolve` — no podcast-specific policy.
+    public static func resolvePodcastTranscript(
+        configuration: ExtractionConfig,
+        activeRegistrations: [ActiveExtractorRegistration]
+    ) -> ExtractionSelectionDecision {
+        resolve(.canonicalPodcastTranscript, kind: .podcastTranscript, configuration: configuration, activeRegistrations: activeRegistrations)
+    }
+
+    /// Apple Podcasts transcript resolution: the same generic precedence
+    /// over the Apple route and the `apple-podcast-transcript` kind. The
+    /// bundled default record supplies the reviewed Apple lineage when the
+    /// user has never configured the route; an explicit `.none` disables;
+    /// an unresolvable saved reference fails closed. No Apple-specific
+    /// policy lives here.
+    public static func resolveApplePodcastTranscript(
+        configuration: ExtractionConfig,
+        activeRegistrations: [ActiveExtractorRegistration]
+    ) -> ExtractionSelectionDecision {
+        resolve(.canonicalApplePodcastTranscript, kind: .applePodcastTranscript, configuration: configuration, activeRegistrations: activeRegistrations)
+    }
+
+    /// YouTube transcript resolution: the same generic precedence over the
+    /// YouTube route and the `youtube-transcript` kind. The bundled default
+    /// record supplies the reviewed YouTube lineage when the user has never
+    /// configured the route; an explicit `.none` disables; an unresolvable
+    /// saved reference fails closed. No YouTube-specific policy lives here.
+    public static func resolveYouTubeTranscript(
+        configuration: ExtractionConfig,
+        activeRegistrations: [ActiveExtractorRegistration]
+    ) -> ExtractionSelectionDecision {
+        resolve(.canonicalYouTubeTranscript, kind: .youtubeTranscript, configuration: configuration, activeRegistrations: activeRegistrations)
     }
 
     /// The single generic precedence: the stored route record first, then the
@@ -131,10 +178,7 @@ public enum ExtractorSelectionResolver {
     ) -> ExtractorReference? {
         activeRegistrations
             .filter {
-                // #1159: protocol revision 2 registrations are selectable
-                // alongside revision 1.
-                ($0.protocolRevision == .v1 || $0.protocolRevision == .v2)
-                    && $0.kinds.contains(kind)
+                $0.kinds.contains(kind)
                     && $0.reference.revision.packageID == logicalReference.packageID
                     && $0.reference.registrationID == logicalReference.registrationID
             }

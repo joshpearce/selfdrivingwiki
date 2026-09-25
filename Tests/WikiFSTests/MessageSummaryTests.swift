@@ -17,7 +17,7 @@ import WikiFSCore
 ///   - **Default backend** — pure truncation via `ChatSummary.summaryExtract`.
 ///   - **Model backend** — driven end-to-end via `FakeAgentBackend` (AC.4
 ///     automated model half).
-///   - **Store round-trip** — `updateMessageSummary` + `chatMessages` read-back
+///   - **Store round-trip** — `updateMessageSummary` + transcript page read-back
 ///     on a real in-memory SQLite DB (AC.1 + AC.6).
 @Suite
 struct MessageSummaryTests {
@@ -107,6 +107,28 @@ struct MessageSummaryTests {
         #expect(MessageSummarizer.mode(for: cleared) == .defaultTruncation)
     }
 
+    @Test func mode_appleIntelligencePin_returnsAppleIntelligence() {
+        // The reserved built-in pin ⇒ Apple Intelligence, NOT Model — even
+        // though no configured provider carries that id. A plain unknown pin
+        // (mode_nonEmptyPin_returnsModel's shape) stays Model; only the exact
+        // reserved constant switches modes (§5.1 invariant extended by
+        // plans/apple-intelligence-summarizer.md).
+        let config = AgentProvidersConfig(providers: [
+            AgentProvider(id: ProviderID(rawValue: "claude"), label: "Claude", command: ["claude"], enabled: true, isDefault: true),
+        ]).settingStageProvider(.appleIntelligence, forStage: "summarizer")
+        #expect(config.stageProviderIds["summarizer"] == .appleIntelligence)
+        #expect(MessageSummarizer.mode(for: config) == .appleIntelligence)
+    }
+
+    @Test func mode_similarButUnequalPin_staysModel() {
+        // A look-alike id must NOT trip the reserved constant (the enum case
+        // is the compiler-checked boundary, the raw string is not).
+        let config = AgentProvidersConfig(providers: [
+            AgentProvider(id: ProviderID(rawValue: "claude"), label: "Claude", command: ["claude"], enabled: true, isDefault: true),
+        ]).settingStageProvider(ProviderID(rawValue: "apple-intelligence-2"), forStage: "summarizer")
+        #expect(MessageSummarizer.mode(for: config) == .model)
+    }
+
     // MARK: - Default backend (§4.2 — pure truncation, zero model compute)
 
     @Test func defaultSummary_reusesChatSummaryExtract() {
@@ -144,10 +166,27 @@ struct MessageSummaryTests {
     func unavailableProviderRuntimeFallsBackToDefaultSummary() async throws {
         let store = try TestStoreFactory.inMemory()
         let model = WikiStoreModel(store: store)
-        let chat = try #require(model.startChat(kind: .edit, firstMessage: "Question"))
-        model.appendChatEvents(
+        let chat = try store.createChat(kind: .edit, title: "Question")
+        // v54 (#1266): seed through the durable transcript — the rows the
+        // summarizer scans and writes to (`createChat` only makes the row;
+        // `startChat` would seed `chat_messages` directly and desync the
+        // transcript/compatibility lockstep the durable append maintains).
+        _ = try store.appendChatTranscriptItems(
             chatID: chat.id,
-            events: [.assistantText(String(repeating: "summary source ", count: 20))])
+            items: [
+                .message(ChatTranscriptMessageItem(
+                    messageID: ChatMessageID(rawValue: "user-1"),
+                    turnID: ChatTurnID(rawValue: "turn-1"),
+                    role: .user,
+                    text: "Question",
+                    createdAt: Date())),
+                .message(ChatTranscriptMessageItem(
+                    messageID: ChatMessageID(rawValue: "assistant-1"),
+                    turnID: ChatTurnID(rawValue: "turn-2"),
+                    role: .assistant,
+                    text: String(repeating: "summary source ", count: 20),
+                    createdAt: Date())),
+            ])
         let launcher = AgentLauncher(
             providerServices: UnavailableAgentProviderServices())
 
@@ -156,16 +195,86 @@ struct MessageSummaryTests {
             store: model,
             launcher: launcher)
 
+        let page = try store.readChatTranscriptPage(chatID: chat.id, after: nil, limit: 10)
         let summarized = try #require(
-            model.chatMessages(chatID: chat.id).first { message in
-                if case .assistantText = message.event { return true }
+            page.items.first { item in
+                if case .message(let message) = item.item { return message.role == .assistant }
                 return false
             })
-        #expect(summarized.summaryKind == .defaultTruncation)
         #expect(summarized.summary?.isEmpty == false)
+        // The Default summarizer kind is recorded on the transcript row.
+        #expect(store.scalarText(
+            "SELECT summary_kind FROM chat_transcript_items WHERE chat_id = '\(chat.id.rawValue)' AND cursor = \(summarized.cursor.rawValue);")
+            == ChatMessageSummaryKind.defaultTruncation.rawValue)
     }
 
     // MARK: - Model backend (§4.3 — injectable AgentBackend seam, AC.4)
+
+    @Test @MainActor
+    func modelSummaryLaunchFailureDegradesToDefaultTruncation() async throws {
+        // Issue #1276 strict tier: a model-summary LAUNCH failure (e.g. an
+        // adapter the strict sandbox fences) must DEGRADE to the default
+        // truncation summary — never leave the row unsummarized.
+        let store = try TestStoreFactory.inMemory()
+        let model = WikiStoreModel(store: store)
+        let chat = try store.createChat(kind: .edit, title: "Question")
+        _ = try store.appendChatTranscriptItems(
+            chatID: chat.id,
+            items: [
+                .message(ChatTranscriptMessageItem(
+                    messageID: ChatMessageID(rawValue: "user-1"),
+                    turnID: ChatTurnID(rawValue: "turn-1"),
+                    role: .user,
+                    text: "Question",
+                    createdAt: Date())),
+                .message(ChatTranscriptMessageItem(
+                    messageID: ChatMessageID(rawValue: "assistant-1"),
+                    turnID: ChatTurnID(rawValue: "turn-2"),
+                    role: .assistant,
+                    text: String(repeating: "summary source ", count: 20),
+                    createdAt: Date())),
+            ])
+
+        // A REAL runtime prepares the summarizer snapshot (valid token); the
+        // fake then throws on modelSummary — the strict-fence launch failure.
+        let config = AgentProvidersConfig(
+            providers: [
+                AgentProvider(
+                    id: ProviderID(rawValue: "claude"),
+                    label: "Claude",
+                    command: ["/usr/local/bin/claude"]),
+            ],
+            selectedModelIds: [:],
+            ingestStageModelIds: ["summarizer": ModelID(rawValue: "summary-model")],
+            stageProviderIds: ["summarizer": ProviderID(rawValue: "claude")])
+        let runtime = AgentProviderRuntime(
+            readConfiguration: { config },
+            resolveCommand: { providers in
+                Dictionary(uniqueKeysWithValues: providers.compactMap { provider in
+                    provider.command.map { (provider.id, $0) }
+                })
+            },
+            readCredential: { _ in nil },
+            resolvePermissionPolicy: { _ in .bypass })
+        let launcher = AgentLauncher(
+            providerServices: ThrowingModelSummaryServices(runtime: runtime))
+
+        await AgentOperationRunner.summarizePendingMessagesForTesting(
+            chatID: chat.id,
+            store: model,
+            launcher: launcher)
+
+        let page = try store.readChatTranscriptPage(chatID: chat.id, after: nil, limit: 10)
+        let summarized = try #require(
+            page.items.first { item in
+                if case .message(let message) = item.item { return message.role == .assistant }
+                return false
+            })
+        #expect(summarized.summary?.isEmpty == false, "the row degrades to a truncation summary")
+        #expect(store.scalarText(
+            "SELECT summary_kind FROM chat_transcript_items WHERE chat_id = '\(chat.id.rawValue)' AND cursor = \(summarized.cursor.rawValue);")
+            == ChatMessageSummaryKind.defaultTruncation.rawValue)
+    }
 
     @Test func modelSummary_streamsAssistantTextAsSummary() async {
         // The model half of AC.4, automated: one assistant turn in → summary
@@ -184,6 +293,40 @@ struct MessageSummaryTests {
         #expect(counts.0 == 1, "startCount")
         #expect(counts.1 == 1, "sendCount")
         #expect(counts.2 == 1, "cancelCount")
+    }
+
+    @Test func modelSummary_stripsKnownPreambleFromBackendReply() async {
+        // The summarizer backend is itself an ACP agent and may prepend the
+        // known skills-budget warning to its own reply. The warning must
+        // never land in a cached per-message summary (chat_messages.summary,
+        // which feeds the outline's response text).
+        let backend = FakeAgentBackend(behaviors: [
+            FakeSessionBehavior(events: [
+                .assistantText("\(AgentPresentationPreamble.knownWarningSentence)\n\nA concise summary."),
+                .messageStop,
+            ])
+        ])
+        let profile = BackendProfile()
+        let result = await MessageSummarizer.modelSummary(
+            text: "Some long assistant text that needs summarizing.",
+            backend: backend,
+            profile: profile)
+        #expect(result == "A concise summary.")
+    }
+
+    @Test func modelSummary_warningOnlyReply_returnsNil() async {
+        // A reply that is only the known preamble yields nothing usable —
+        // the caller leaves summary = NULL so the message is retriable.
+        let backend = FakeAgentBackend(behaviors: [
+            FakeSessionBehavior(events: [
+                .assistantText(AgentPresentationPreamble.knownWarningSentence),
+                .messageStop,
+            ])
+        ])
+        let profile = BackendProfile()
+        let result = await MessageSummarizer.modelSummary(
+            text: "Content.", backend: backend, profile: profile)
+        #expect(result == nil)
     }
 
     @Test func modelSummary_resultEventFallback() async {
@@ -272,65 +415,17 @@ struct MessageSummaryTests {
         #expect(result == "Full delta chunks.")
     }
 
-    // MARK: - resolveProfile (production backend wiring, §4.3)
+    // MARK: - Production backend wiring (issue #1276)
 
-    @Test func resolveProfile_emptyPin_returnsNil() {
-        // Defense in depth: resolveProfile reads the pin directly and bails
-        // when it's empty — even though the caller should have confirmed model
-        // mode before calling.
-        let config = AgentProvidersConfig(providers: [
-            AgentProvider(id: ProviderID(rawValue: "claude"), label: "Claude", command: ["claude"], enabled: true, isDefault: true),
-        ])
-        let creds = InMemoryACPCredentialStore()
-        let profile = MessageSummarizer.resolveProfile(
-            config: config,
-            credentialStore: creds,
-            resolveCommand: { _ in ["/usr/bin/true"] })
-        #expect(profile == nil)
-    }
-
-    @Test func resolveProfile_pinnedProvider_buildsHints() throws {
-        let config = AgentProvidersConfig(providers: [
-            AgentProvider(id: ProviderID(rawValue: "claude"), label: "Claude", command: ["claude"], enabled: true, isDefault: true),
-        ]).settingStageProvider(ProviderID(rawValue: "claude"), forStage: "summarizer")
-        let creds = InMemoryACPCredentialStore()
-        try creds.setAPIKey("secret-key", forProvider: "claude")
-        let profile = MessageSummarizer.resolveProfile(
-            config: config,
-            credentialStore: creds,
-            resolveCommand: { _ in ["/usr/bin/claude"] })
-        #expect(profile != nil)
-        // The provider hint carries the resolved executable.
-        #expect(profile?.providerHints[HintKey.acpAgentPath.rawValue] == "/usr/bin/claude")
-        // The API key is threaded into hints.
-        #expect(profile?.providerHints[HintKey.acpAgentApiKey.rawValue] == "secret-key")
-    }
-
-    @Test func resolveProfile_unresolvableCommand_returnsNil() {
-        let config = AgentProvidersConfig(providers: [
-            AgentProvider(id: ProviderID(rawValue: "claude"), label: "Claude", command: ["claude"], enabled: true, isDefault: true),
-        ]).settingStageProvider(ProviderID(rawValue: "claude"), forStage: "summarizer")
-        let profile = MessageSummarizer.resolveProfile(
-            config: config,
-            credentialStore: InMemoryACPCredentialStore(),
-            resolveCommand: { _ in nil })  // command not resolved
-        #expect(profile == nil)
-    }
-
-    @Test func resolveProfile_disabledPinnedProviderReturnsNilWithoutRewritingPin() {
-        let config = AgentProvidersConfig(providers: [
-            AgentProvider(id: ProviderID(rawValue: "claude"), label: "Claude", command: ["claude"], enabled: true, isDefault: true),
-            AgentProvider(id: ProviderID(rawValue: "gemini"), label: "Gemini", command: ["gemini", "--acp"], enabled: false, isDefault: false),
-        ]).settingStageProvider(ProviderID(rawValue: "gemini"), forStage: "summarizer")
-
-        let profile = MessageSummarizer.resolveProfile(
-            config: config,
-            credentialStore: InMemoryACPCredentialStore(),
-            resolveCommand: { _ in ["/usr/bin/true"] })
-
-        #expect(config.stageProviderIds["summarizer"] == ProviderID(rawValue: "gemini"))
-        #expect(profile == nil)
-    }
+    // NOTE: `MessageSummarizer.resolveProfile` was REMOVED in issue #1276 —
+    // it had no production caller and built a shared-tempDirectory, unsandboxed
+    // profile. The production wiring is `AgentProviderRuntime.
+    // prepareSummarization` → `backend(from:stage:)`, which builds the
+    // read-only sandboxed profile from the snapshot's own `LLMSandboxScratch`.
+    // Its coverage lives in `AgentProviderRuntimeTests.
+    // summarizerBackendOwnsReadOnlySandboxScratch`; the mode-decision and
+    // redaction behavior is covered by the tests above and
+    // `AgentProviderRuntimeTests.modelSummaryAndRedaction`.
 
     // MARK: - Store round-trip (AC.1 + AC.6, integration)
 
@@ -342,18 +437,17 @@ struct MessageSummaryTests {
     }
 
     @Test func summaryNullForNewMessages() throws {
-        // AC.1 (read side): newly-appended messages have nil summary fields.
+        // AC.1 (read side): newly-appended transcript items have nil summary.
         let store = try TestStoreFactory.inMemory()
         let chat = try store.createChat(kind: .edit, title: "Chat")
-        _ = try store.appendChatMessages(
-            chatID: chat.id,
-            events: [.userText("q"), .assistantText("Some answer.")])
-        let messages = try store.chatMessages(chatID: chat.id)
-        #expect(messages.count == 2)
-        for msg in messages {
-            #expect(msg.summary == nil, "summary should be nil for \(msg.event)")
-            #expect(msg.summaryKind == nil)
-            #expect(msg.summaryAt == nil)
+        _ = try Self.appendAssistant(
+            store, chatID: chat.id, id: "a1", text: "Some answer.")
+        let items = try store
+            .readChatTranscriptPage(chatID: chat.id, after: nil, limit: 10)
+            .items
+        #expect(items.count == 1)
+        for item in items {
+            #expect(item.summary == nil, "summary should be nil for \(item.item)")
         }
     }
 
@@ -361,19 +455,21 @@ struct MessageSummaryTests {
         // AC.6 (compute-once path): write a summary, read it back — cached.
         let store = try TestStoreFactory.inMemory()
         let chat = try store.createChat(kind: .edit, title: "Chat")
-        let inserted = try store.appendChatMessages(
-            chatID: chat.id,
-            events: [.assistantText("Long answer.")])
-        let target = try #require(inserted.first)
+        let target = try Self.appendAssistant(
+            store, chatID: chat.id, id: "a1", text: "Long answer.")
         try store.updateMessageSummary(
-            chatID: chat.id, messageID: target.id,
+            chatID: chat.id, cursor: target.cursor,
             summary: "Cached one-liner.", kind: .model)
 
-        let after = try store.chatMessages(chatID: chat.id)
-        let updated = try #require(after.first { $0.id == target.id })
+        let items = try store
+            .readChatTranscriptPage(chatID: chat.id, after: nil, limit: 10)
+            .items
+        let updated = try #require(items.first { $0.cursor == target.cursor })
         #expect(updated.summary == "Cached one-liner.")
-        #expect(updated.summaryKind == .model)
-        #expect(updated.summaryAt != nil)
+        // The kind round-trips through the `summary_kind` column.
+        #expect(store.scalarText(
+            "SELECT summary_kind FROM chat_transcript_items WHERE chat_id = '\(chat.id.rawValue)' AND cursor = \(target.cursor.rawValue);")
+            == ChatMessageSummaryKind.model.rawValue)
     }
 
     @Test func summaryWrittenForOneMessage_doesNotAffectOthers() throws {
@@ -381,43 +477,46 @@ struct MessageSummaryTests {
         // granularity, not per-chat).
         let store = try TestStoreFactory.inMemory()
         let chat = try store.createChat(kind: .edit, title: "Chat")
-        let inserted = try store.appendChatMessages(
-            chatID: chat.id,
-            events: [.assistantText("first."), .assistantText("second.")])
+        let first = try Self.appendAssistant(
+            store, chatID: chat.id, id: "a1", text: "first.")
+        _ = try Self.appendAssistant(
+            store, chatID: chat.id, id: "a2", text: "second.")
         try store.updateMessageSummary(
-            chatID: chat.id, messageID: inserted[0].id,
+            chatID: chat.id, cursor: first.cursor,
             summary: "first summary.", kind: .defaultTruncation)
 
-        let after = try store.chatMessages(chatID: chat.id)
-        #expect(after[0].summary == "first summary.")
-        #expect(after[1].summary == nil)
-        #expect(after[1].summaryKind == nil)
+        let items = try store
+            .readChatTranscriptPage(chatID: chat.id, after: nil, limit: 10)
+            .items
+        #expect(items.count == 2)
+        #expect(items.first { $0.cursor == first.cursor }?.summary == "first summary.")
+        #expect(items.first { $0.cursor != first.cursor }?.summary == nil)
     }
 
     @Test func idempotency_alreadySummarized_isSkippedByFilter() throws {
-        // AC.6 (cache short-circuit): the summarizePendingMessages filter
-        // (`msg.summary == nil`) skips already-summarized rows. Verify the
-        // round-trip supports this: after a write, the message's summary is
-        // non-nil so it would be filtered out on the next pass.
+        // AC.6 (cache short-circuit): the summarizer's pending filter
+        // (`summary == nil`) skips already-summarized rows. After a write, the
+        // pending set derived from the transcript is empty.
         let store = try TestStoreFactory.inMemory()
         let chat = try store.createChat(kind: .edit, title: "Chat")
-        let inserted = try store.appendChatMessages(
-            chatID: chat.id, events: [.assistantText("text.")])
+        let inserted = try Self.appendAssistant(
+            store, chatID: chat.id, id: "a1", text: "text.")
         try store.updateMessageSummary(
-            chatID: chat.id, messageID: inserted[0].id,
+            chatID: chat.id, cursor: inserted.cursor,
             summary: "done.", kind: .defaultTruncation)
 
-        // Re-read: the message now has a non-nil summary, so a filter like
-        // `messages.filter { $0.summary == nil }` excludes it.
-        let messages = try store.chatMessages(chatID: chat.id)
-        let pending = messages.filter { $0.summary == nil }
-        #expect(pending.isEmpty, "already-summarized message should be filtered out")
+        // Re-read: the pending set excludes the summarized item.
+        let items = try store
+            .readChatTranscriptPage(chatID: chat.id, after: nil, limit: 10)
+            .items
+        #expect(MessageSummarizer.pendingSummaryTargets(from: items).isEmpty,
+                "already-summarized message should be filtered out")
     }
 
     // MARK: - Model-level messageVersion (#858)
 
     /// The core bug: `ChatSummary` has no per-message fields, so writing a
-    /// `chat_messages.summary` leaves the `chats` array `==` after
+    /// per-message summary leaves the `chats` array `==` after
     /// `reloadChats()`. `.onChange(of: chats)` would never fire. The
     /// `messageVersion` counter fixes this — it bumps unconditionally in
     /// `reloadChats()`, giving SwiftUI an always-changing observable.
@@ -425,18 +524,17 @@ struct MessageSummaryTests {
         let store = try TestStoreFactory.inMemory()
         let model = WikiStoreModel(store: store)
         let chat = try store.createChat(kind: .edit, title: "Chat")
-        let inserted = try store.appendChatMessages(
-            chatID: chat.id, events: [.assistantText("Long answer.")])
-        let target = try #require(inserted.first)
+        let target = try Self.appendAssistant(
+            store, chatID: chat.id, id: "a1", text: "Long answer.")
 
         model.reloadChats()
         let chatsBefore = model.chats
         let versionBefore = model.messageVersion
 
-        // Write a per-message summary — changes `chat_messages` but NOT any
-        // `ChatSummary` field (summary is per-message, not per-chat).
+        // Write a per-message summary — changes the transcript item but NOT
+        // any `ChatSummary` field (summary is per-message, not per-chat).
         try store.updateMessageSummary(
-            chatID: chat.id, messageID: target.id,
+            chatID: chat.id, cursor: target.cursor,
             summary: "Cached.", kind: .model)
 
         model.reloadChats()
@@ -448,11 +546,28 @@ struct MessageSummaryTests {
         #expect(model.messageVersion > versionBefore,
                 "messageVersion must bump even when chats is ==")
 
-        // The summary IS in the DB — readable via chatMessages.
-        let msgs = model.chatMessages(chatID: chat.id)
-        let updated = try #require(msgs.first { $0.id == target.id })
+        // The summary IS in the DB — readable via the transcript page.
+        let items = try store
+            .readChatTranscriptPage(chatID: chat.id, after: nil, limit: 10)
+            .items
+        let updated = try #require(items.first { $0.cursor == target.cursor })
         #expect(updated.summary == "Cached.")
-        #expect(updated.summaryKind == .model)
+    }
+
+    /// Append one assistant transcript item (the durable rows the summarizer
+    /// scans); returns the persisted item with its cursor.
+    private static func appendAssistant(
+        _ store: GRDBWikiStore, chatID: ChatID, id: String, text: String
+    ) throws -> PersistedChatTranscriptItem {
+        let inserted = try store.appendChatTranscriptItems(
+            chatID: chatID,
+            items: [.message(ChatTranscriptMessageItem(
+                messageID: ChatMessageID(rawValue: id),
+                turnID: ChatTurnID(rawValue: "turn-\(id)"),
+                role: .assistant,
+                text: text,
+                createdAt: Date()))])
+        return try #require(inserted.first)
     }
 
     /// `messageVersion` bumps on every `reloadChats()` call, even back-to-back
@@ -472,6 +587,237 @@ struct MessageSummaryTests {
 
         #expect(v1 > v0)
         #expect(v2 > v1)
+    }
+
+    // MARK: - Chat titles (summarizer-stage model)
+
+    @Test func textToSummarize_stripsBackendPreambleLines() {
+        // A message that ONLY carries the ACP skills-budget warning has
+        // nothing to summarize — it must never become a summary, the
+        // chats.summary, or a title input.
+        let warning = "\(AgentPresentationPreamble.knownWarningSentence) "
+        #expect(MessageSummarizer.textToSummarize(from: .assistantText(warning)) == nil)
+
+        // A message that OPENS with the warning keeps the content after it.
+        let withContent = MessageSummarizer.textToSummarize(from: .assistantText(
+            warning + "\n\nTidal pools form where the tide recedes twice a day."))
+        #expect(withContent == "Tidal pools form where the tide recedes twice a day.")
+
+        // Thinking dumps are preamble for the same reason.
+        let thinking = MessageSummarizer.textToSummarize(from: .assistantText(
+            "Thinking:\n\nTidal pools differ from the open shore in several ways."))
+        #expect(thinking == "Tidal pools differ from the open shore in several ways.")
+    }
+
+    /// The summarizer now removes ONLY the known skill warning — never an
+    /// arbitrary `Warning:` line — and keeps a final incomplete prefix.
+    @Test func textToSummarizeRemovesKnownSkillWarning() {
+        let sentence = AgentPresentationPreamble.knownWarningSentence
+        // Complete warning-only: nothing to summarize.
+        #expect(MessageSummarizer.textToSummarize(from: .assistantText(sentence)) == nil)
+        #expect(MessageSummarizer.textToSummarize(from: .assistantText(sentence + "\n\n")) == nil)
+
+        // Warning plus answer: the answer survives, and leading blank lines
+        // after the warning go with it.
+        let withAnswer = MessageSummarizer.textToSummarize(from: .assistantText(
+            sentence + "\n\n\nVenturi masks use jet entrainment."))
+        #expect(withAnswer == "Venturi masks use jet entrainment.")
+
+        // A provider suffix on the same line is part of the known family.
+        #expect(MessageSummarizer.textToSummarize(from: .assistantText(sentence + " (12 tools)")) == nil)
+    }
+
+    @Test func textToSummarizePreservesIncompleteAndUnrelatedWarnings() {
+        // A final incomplete prefix of the warning is content.
+        let partial = "Warning: Skill descriptions were shortened"
+        #expect(MessageSummarizer.textToSummarize(from: .assistantText(partial)) == partial)
+
+        // Unrelated Warning: lines are content too — the old broad leading-
+        // Warning: strip is gone.
+        let unrelated = "Warning: Provider timeout after 30s"
+        #expect(MessageSummarizer.textToSummarize(from: .assistantText(unrelated)) == unrelated)
+
+        // Thinking: preambles keep their separate treatment, including after
+        // an unrelated warning.
+        let mixed = MessageSummarizer.textToSummarize(from: .assistantText(
+            "Thinking:\n\nShoreline features differ by tide stage."))
+        #expect(mixed == "Shoreline features differ by tide stage.")
+    }
+
+    @Test func sanitizeTitle_stripsQuotesFencesLabelsAndPeriod() {
+        #expect(MessageSummarizer.sanitizeTitle("\"Venturi Effects Explained\"") == "Venturi Effects Explained")
+        #expect(MessageSummarizer.sanitizeTitle("```Venturi Effects```") == "Venturi Effects")
+        #expect(MessageSummarizer.sanitizeTitle("Title: Venturi Effects") == "Venturi Effects")
+        #expect(MessageSummarizer.sanitizeTitle("Venturi Effects.") == "Venturi Effects")
+        #expect(MessageSummarizer.sanitizeTitle("Venturi Effects\n\nSome extra reasoning") == "Venturi Effects")
+        #expect(MessageSummarizer.sanitizeTitle("  \n  Venturi Effects  \n ") == "Venturi Effects")
+        #expect(MessageSummarizer.sanitizeTitle("\u{201C}Curly Quotes\u{201D}") == "Curly Quotes")
+        #expect(MessageSummarizer.sanitizeTitle("\"Bootstrap Order in Dependency Graphs\".") == "Bootstrap Order in Dependency Graphs")
+    }
+
+    @Test func sanitizeTitle_capsLength() {
+        let long = String(repeating: "a", count: 200)
+        let capped = MessageSummarizer.sanitizeTitle(long, maxLength: 80)
+        #expect(capped.count == 80)
+    }
+
+    @Test func sanitizeTitle_garbageReturnsEmpty() {
+        #expect(MessageSummarizer.sanitizeTitle("\"\"") == "")
+        #expect(MessageSummarizer.sanitizeTitle("Title:") == "")
+        #expect(MessageSummarizer.sanitizeTitle("   ") == "")
+    }
+
+    @Test func modelTitle_buildsTitleFromQuestionAndAnswer() async {
+        let backend = FakeAgentBackend(behaviors: [
+            FakeSessionBehavior(events: [.assistantText("Venturi Effects Explained"), .messageStop])
+        ])
+        let title = await MessageSummarizer.modelTitle(
+            question: "How does a venturi mask work?",
+            answer: "A venturi mask uses a jet entrainment system...",
+            backend: backend,
+            profile: BackendProfile(model: "test-model"))
+        #expect(title == "Venturi Effects Explained")
+        // One-shot session: start, send, cancel.
+        let counts = await (backend.startCount, backend.sendCount, backend.cancelCount)
+        #expect(counts.0 == 1, "startCount")
+        #expect(counts.1 == 1, "sendCount")
+        #expect(counts.2 == 1, "cancelCount")
+    }
+
+    @Test func modelTitle_sanitizedModelOutput() async {
+        // A model that wraps the title in quotes and appends a period still
+        // yields clean sidebar text.
+        let backend = FakeAgentBackend(behaviors: [
+            FakeSessionBehavior(events: [.assistantText("\"Bootstrap Order in Dependency Graphs\"."), .messageStop])
+        ])
+        let title = await MessageSummarizer.modelTitle(
+            question: "What loads first in a dependency graph?",
+            answer: nil,
+            backend: backend,
+            profile: BackendProfile())
+        #expect(title == "Bootstrap Order in Dependency Graphs")
+    }
+
+    @Test func modelTitle_emptyQuestion_returnsNilWithoutSession() async {
+        let backend = FakeAgentBackend(behaviors: [])
+        let title = await MessageSummarizer.modelTitle(
+            question: "   ",
+            answer: "unused",
+            backend: backend,
+            profile: BackendProfile())
+        #expect(title == nil)
+        let starts = await backend.startCount
+        #expect(starts == 0)
+    }
+
+    @Test func modelTitle_unusableOutput_returnsNil() async {
+        let backend = FakeAgentBackend(behaviors: [
+            FakeSessionBehavior(events: [.assistantText("\"\""), .messageStop])
+        ])
+        let title = await MessageSummarizer.modelTitle(
+            question: "A real question?",
+            answer: nil,
+            backend: backend,
+            profile: BackendProfile())
+        #expect(title == nil)
+    }
+
+    @Test func modelTitle_startFailurePreservesExistingTitleSignal() async {
+        // A backend that fails to start (issue #1276: e.g. the sandbox
+        // front-end is unusable) yields nil — the caller keeps the existing
+        // title signal in place instead of writing an empty/garbage title.
+        let backend = FakeAgentBackend(behaviors: [
+            FakeSessionBehavior(shouldFailOnStart: true)
+        ])
+        let title = await MessageSummarizer.modelTitle(
+            question: "How does a venturi mask work?",
+            answer: "A venturi mask uses a jet entrainment system...",
+            backend: backend,
+            profile: BackendProfile())
+        #expect(title == nil)
+        let counts = await (backend.startCount, backend.sendCount, backend.cancelCount)
+        #expect(counts.0 == 1, "the start was attempted exactly once")
+        #expect(counts.1 == 0, "no turn is sent after a failed start")
+        #expect(counts.2 == 0, "no session exists to cancel")
+    }
+}
+
+/// A provider-services fake whose summarizer PREPARATION succeeds (a real
+/// `AgentProviderRuntime` behind the scenes, so the preparation token is
+/// genuine) but whose model summary always THROWS — the strict-fence launch
+/// failure shape (issue #1276). Everything else is unavailable.
+private struct ThrowingModelSummaryServices: AgentProviderServices {
+    struct LaunchFailure: Error {}
+
+    let runtime: AgentProviderRuntime
+
+    func prepareInteractive(
+        providerOverride: ProviderID?,
+        modelOverride: ModelID?,
+        configuredThinkingOptionID: ChatConfigurationValueID?,
+        priorEffectiveThinkingOptionID: ChatConfigurationValueID?
+    ) async throws -> AgentInteractivePreparation {
+        try await runtime.prepareInteractive(
+            providerOverride: providerOverride,
+            modelOverride: modelOverride,
+            configuredThinkingOptionID: configuredThinkingOptionID,
+            priorEffectiveThinkingOptionID: priorEffectiveThinkingOptionID)
+    }
+
+    func prepare(
+        _ operation: AgentProviderOperationKind,
+        providerOverride: ProviderID?,
+        modelOverride: ModelID?,
+        thinkingOverride: String?
+    ) async throws -> AgentOperationPreparation {
+        try await runtime.prepare(
+            operation,
+            providerOverride: providerOverride,
+            modelOverride: modelOverride,
+            thinkingOverride: thinkingOverride)
+    }
+
+    func preparation(
+        from token: AgentProviderAttemptToken,
+        stage: AgentProviderStage
+    ) async throws -> AgentOperationPreparation {
+        try await runtime.preparation(from: token, stage: stage)
+    }
+
+    func fallbackPreparation(
+        from token: AgentProviderAttemptToken,
+        stage: AgentProviderStage,
+        fallbackProviderID: ProviderID
+    ) async throws -> AgentOperationPreparation {
+        try await runtime.fallbackPreparation(
+            from: token,
+            stage: stage,
+            fallbackProviderID: fallbackProviderID)
+    }
+
+    func prepareSummarization() async throws -> AgentProviderSummaryPreparation {
+        try await runtime.prepareSummarization()
+    }
+
+    func discoverCatalog(
+        for provider: AgentProvider
+    ) async throws -> ACPProviderCatalogObservation {
+        throw LaunchFailure()
+    }
+
+    func modelSummary(
+        text: String,
+        preparation: AgentOperationPreparation
+    ) async throws -> String? {
+        throw LaunchFailure()
+    }
+
+    func release(_ token: AgentProviderAttemptToken) async {
+        await runtime.release(token)
+    }
+
+    func readiness() async -> Bool {
+        await runtime.readiness()
     }
 }
 #endif // os(macOS)

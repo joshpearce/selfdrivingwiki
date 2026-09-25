@@ -11,6 +11,7 @@ public enum ExtractionBackendKind: String, Codable, Hashable, Sendable {
     case youtubeTranscript
     case rssPodcastTranscript
     case applePodcastTranscript
+    case zotero
 }
 
 /// Stable registry identity for one extraction adapter.
@@ -31,9 +32,25 @@ public enum ExtractionBackendAdapter: Sendable {
     case pdf(ExtractionPreparation)
     case html(any HtmlMarkdownExtractor)
     case docx(any DocxMarkdownExtractor)
-    case youtubeTranscript(any YouTubeTranscriptFetching)
-    case rssPodcastTranscript(any RSSFeedTranscriptFetching)
-    case applePodcastTranscript(any PodcastTranscriptFetching)
+    /// The process-backed YouTube transcript adapter. Carries the prepared
+    /// package operation, so results keep exact package provenance — the
+    /// former built-in fetcher case could not, and is removed with the
+    /// YouTube caption packaging.
+    case youtubeTranscript(ProcessPackageYouTubeTranscript)
+    /// The process-backed RSS podcast transcript adapter. Carries the
+    /// prepared package operation, so results keep exact package provenance
+    /// — the former built-in fetcher case could not, and was removed.
+    case podcastTranscript(ProcessPackagePodcastTranscript)
+    /// The process-backed Apple Podcasts transcript adapter. Same prepared
+    /// operation shape as the RSS sibling; the built-in fetcher case was
+    /// removed with the Apple TTML packaging (the former built-in adapter
+    /// could not carry package provenance).
+    case applePodcastTranscript(ProcessPackageApplePodcastTranscript)
+    /// The process-backed Zotero attachment adapter. Same prepared
+    /// operation shape as the transcript siblings (remote-url request); the
+    /// revision-4 bytes-capable outcome carries either Markdown or source
+    /// bytes plus `resultMIMEType` and article metadata.
+    case zotero(ProcessPackageZoteroAttachment)
 }
 
 public struct RegisteredExtractionBackend: Sendable {
@@ -400,26 +417,22 @@ public extension ExtractionBackendRegistry {
         return RegisteredExtractionInputs(claims: claims)
     }
 
-    /// Snapshot of every active installed (exact) PDF, HTML, and DOCX
-    /// registration, highest revision first within a deterministic package
-    /// sort. Transcript kinds are out of scope for revision 1. A package that
-    /// stopped being admitted (removed, failed activation) simply stops
-    /// appearing.
+    /// Snapshot of every active installed registration — every kind with a
+    /// live registration — derived from the registration map, not a
+    /// hard-coded kind list, so a newly installed package kind appears
+    /// without a host change. A package that stopped being admitted (removed,
+    /// failed activation) simply stops appearing.
     func installedPackageRows() async -> [ExtractorPackageSettingsRow] {
         var rows: [ExtractorPackageSettingsRow] = []
-        for kind in [ExtractionBackendKind.pdf, .html, .docx] {
-            // Actor-isolated by default (extension of an actor), so the sync
-            // registry read needs no hop.
-            for match in installedMatches(kind: kind) {
-                guard case .installed(_, let reference) = match.key else { continue }
-                rows.append(ExtractorPackageSettingsRow(
-                    kind: kind,
-                    packageID: reference.revision.packageID.rawValue,
-                    version: reference.revision.version.rawValue,
-                    digestPrefix: String(reference.revision.digest.hex.prefix(12)),
-                    registrationID: reference.registrationID.rawValue,
-                    revision: reference.revision))
-            }
+        for (key, _) in registrations {
+            guard case .installed(let kind, let reference) = key else { continue }
+            rows.append(ExtractorPackageSettingsRow(
+                kind: kind,
+                packageID: reference.revision.packageID.rawValue,
+                version: reference.revision.version.rawValue,
+                digestPrefix: String(reference.revision.digest.hex.prefix(12)),
+                registrationID: reference.registrationID.rawValue,
+                revision: reference.revision))
         }
         return rows.sorted { $0.id < $1.id }
     }

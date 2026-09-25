@@ -40,7 +40,11 @@ public enum PageCommand {
         /// `appendPageVersion` and a mismatch throws `PageConflictError`
         /// (Phase 1: agent CAS writes).
         case add(id: PageID?, title: String, body: BodySource, expectHead: PageVersionID? = nil, workspace: String? = nil, author: String? = nil, provenance: [PageVersionSourceInput] = [])
-        case delete(id: PageID)
+        /// Delete the page through the store's protected contract (issue #219
+        /// hardening): bookmarks targeting the page are ALWAYS removed, and
+        /// `unlinkIncoming` picks whether incoming `[[link]]` spans become
+        /// plain text (true) or stay as ghost links (false, the default).
+        case delete(id: PageID, unlinkIncoming: Bool = false)
         /// Semantic search: find pages by meaning (cosine similarity via
         /// Swift-side `VectorCosine`), falling back to LIKE title match.
         case search(query: String, limit: Int)
@@ -103,8 +107,8 @@ public enum PageCommand {
             let body = try resolveBodySource(bodySource)
             return try upsert(id: id, title: title, body: body, expectHead: expectHead, workspace: workspace, author: author,
                               provenance: mergedAgentIngestProvenance(provenance), in: store, validator: validator, linter: linter)
-        case .delete(let id):
-            return try delete(id: id, in: store)
+        case .delete(let id, let unlinkIncoming):
+            return try delete(id: id, unlinkIncoming: unlinkIncoming, in: store)
         case .search(let query, let limit):
             return try search(query: query, limit: limit, bm25Leg: bm25Leg, in: store)
         case .history(let selector):
@@ -347,7 +351,11 @@ public enum PageCommand {
             let resultID = try store.workspaceWritePage(
                 workspaceID: WorkspaceID(rawValue: workspace), pageID: pageID, title: title, body: fixed,
                 author: author, provenance: provenance)
-            return Result(output: resultID?.rawValue ?? "", didCommit: true, stderrOutput: notice)
+            // #1228: resultID IS the staged version, so echo it directly —
+            // a workspace CAS chain threads exactly like a main-line one.
+            return Result(
+                output: resultID?.rawValue ?? "", didCommit: true,
+                stderrOutput: joinedStderr(notice, headVersionDiagnostic(resultID)))
         }
 
         // 3. The SHARED seam: identical create-or-update + `[[link]]` reparse as
@@ -356,7 +364,13 @@ public enum PageCommand {
         let outcome = try PageUpsert.upsert(in: store, id: id, title: title, body: fixed,
                                              expectedHeadVersionID: expectHead, author: author,
                                              provenance: provenance)
-        return Result(output: outcome.id.rawValue, didCommit: true, stderrOutput: notice)
+        // #1228: echo the new head so the agent's CAS loop can chain the next
+        // --expect-head write without a separate `page get`. Same stderr
+        // convention as `get`; stdout stays the page id (compatibility contract).
+        let head = try store.pageHeadVersionID(pageID: outcome.id)
+        return Result(
+            output: outcome.id.rawValue, didCommit: true,
+            stderrOutput: joinedStderr(notice, headVersionDiagnostic(head)))
     }
 
     /// Apply `MarkdownLinter.fix` to `body`, returning the normalized text. When
@@ -391,9 +405,24 @@ public enum PageCommand {
 
     // MARK: - delete
 
-    private static func delete(id: PageID, in store: WikiStore) throws -> Result {
-        try store.deletePage(id: id)
-        return Result(output: id.rawValue, didCommit: true)
+    /// Deletes through the shared protected contract. The stdout contract is
+    /// unchanged (the page id); a concise stderr notice reports the mandatory
+    /// bookmark cleanup and what happened to the incoming links. `didCommit`
+    /// reflects actual committed change: a missing target with no stale
+    /// bookmarks is an idempotent no-op and posts no change notification.
+    private static func delete(id: PageID, unlinkIncoming: Bool, in store: WikiStore) throws -> Result {
+        let result = try store.deleteResources(ResourceDeletionRequest(
+            target: .page(id),
+            linkPolicy: unlinkIncoming ? .unlink : .preserve))
+        let bookmarkCount = result.removedBookmarkIDs.count
+        let linkCount = result.incomingLinkCount
+        let linkDisposition = unlinkIncoming ? "unlinked" : "preserved as ghost links"
+        let notice = "removed \(bookmarkCount) bookmark\(bookmarkCount == 1 ? "" : "s"); "
+            + "\(linkCount) incoming link\(linkCount == 1 ? "" : "s") \(linkDisposition)"
+        let didCommit = !result.deletedTargets.isEmpty
+            || !result.removedBookmarkIDs.isEmpty
+            || !result.rewrittenPageIDs.isEmpty
+        return Result(output: id.rawValue, didCommit: didCommit, stderrOutput: notice)
     }
 
     // MARK: - search
@@ -432,7 +461,12 @@ public enum PageCommand {
     ) throws -> Result {
         let id = try resolve(selector, in: store)
         try store.revertPage(pageID: id, to: versionID)
-        return Result(output: "reverted \(id.rawValue) to \(versionID.rawValue)", didCommit: true)
+        // #1228: the head moved; report it (axi.md action-result coupling).
+        let head = try store.pageHeadVersionID(pageID: id)
+        return Result(
+            output: "reverted \(id.rawValue) to \(versionID.rawValue)",
+            didCommit: true,
+            stderrOutput: headVersionDiagnostic(head))
     }
 
     // MARK: - info (page provenance, #page-provenance)
@@ -513,5 +547,12 @@ public enum PageCommand {
     private static func headVersionDiagnostic(_ headVersionID: PageVersionID?) -> String? {
         guard let headVersionID else { return nil }
         return "head_version_id: \(headVersionID.rawValue)\n"
+    }
+
+    /// Join optional stderr fragments (the fence-validation notice, the
+    /// head_version_id echo) into one stderr payload; nil when both are empty.
+    private static func joinedStderr(_ parts: String?...) -> String? {
+        let joined = parts.compactMap { $0 }.joined()
+        return joined.isEmpty ? nil : joined
     }
 }

@@ -20,7 +20,13 @@ struct AgentProviderRuntimeTests {
             stageProviderIds: summarizer ? ["summarizer": alpha] : [:])
     }
 
-    private func runtime(config: LockedBox<AgentProvidersConfig>, counts: RuntimeCounts, factory: @escaping AgentProviderRuntime.BackendFactory = { _, _, _ in FakeAgentBackend() }) -> AgentProviderRuntime {
+    private func runtime(
+        config: LockedBox<AgentProvidersConfig>,
+        counts: RuntimeCounts,
+        factory: @escaping AgentProviderRuntime.BackendFactory = { _, _, _ in FakeAgentBackend() },
+        appleIntelligenceEngine: AppleIntelligenceSummarizer.Engine = .system,
+        isAppleIntelligenceAvailable: @escaping AgentProviderRuntime.AppleIntelligenceAvailabilityCheck = { true }
+    ) -> AgentProviderRuntime {
         AgentProviderRuntime(
             readConfiguration: { counts.incrementConfigurationReads(); return config.read() },
             resolveCommand: { providers in
@@ -31,7 +37,64 @@ struct AgentProviderRuntimeTests {
             },
             readCredential: { _ in counts.incrementCredentials(); return "key-not-public" },
             resolvePermissionPolicy: { _ in .bypass },
-            makeBackend: factory)
+            makeBackend: factory,
+            appleIntelligenceEngine: appleIntelligenceEngine,
+            isAppleIntelligenceAvailable: isAppleIntelligenceAvailable)
+    }
+
+    // MARK: - Apple Intelligence summarizer mode
+    // (plans/apple-intelligence-summarizer.md)
+
+    /// The AI-mode preparation: available → `.appleIntelligence`, unavailable →
+    /// degrade to `.defaultTruncation`. Availability is the injected seam, so
+    /// both branches run without Apple Intelligence hardware.
+    @Test func summarizerPreparation_appleIntelligencePin_gatesOnAvailability() async throws {
+        let config = LockedBox(
+            configuration().settingStageProvider(.appleIntelligence, forStage: "summarizer"))
+
+        let up = runtime(config: config, counts: RuntimeCounts(), isAppleIntelligenceAvailable: { true })
+        let prepared = try await up.prepareSummarization()
+        #expect(prepared == .appleIntelligence)
+
+        let down = runtime(config: config, counts: RuntimeCounts(), isAppleIntelligenceAvailable: { false })
+        let degraded = try await down.prepareSummarization()
+        #expect(degraded == .defaultTruncation)
+    }
+
+    /// The AI-mode service pair routes through the injected engine — the same
+    /// engine the runtime was constructed with.
+    @Test func appleIntelligenceServiceRoutesThroughTheInjectedEngine() async throws {
+        let config = LockedBox(
+            configuration().settingStageProvider(.appleIntelligence, forStage: "summarizer"))
+        let engine = AppleIntelligenceSummarizer.Engine { _, prompt in
+            // Echo the user turn so the test proves which call reached the
+            // engine with what shape.
+            "echo:\(prompt)"
+        }
+        let service = runtime(config: config, counts: RuntimeCounts(), appleIntelligenceEngine: engine)
+
+        let summary = await service.appleIntelligenceSummary(text: "Hello world. More.")
+        #expect(summary == "echo:Summarize this in one sentence:\n\nHello world. More.")
+
+        let title = await service.appleIntelligenceTitle(question: "What is origami?", answer: nil)
+        // The title path sanitizes like the ACP path: first line only
+        // (`MessageSummarizer.sanitizeTitle`), so the echoed multi-line
+        // prompt collapses to its first line.
+        #expect(title == "echo:Question:")
+    }
+
+    /// An AI pin with the availability seam down never builds a snapshot or a
+    /// lease — the degraded preparation is the plain truncation one.
+    @Test func summarizerPreparation_aiUnavailable_doesNotConsumeBackendResources() async throws {
+        let config = LockedBox(
+            configuration().settingStageProvider(.appleIntelligence, forStage: "summarizer"))
+        let counts = RuntimeCounts()
+        let service = runtime(config: config, counts: counts, isAppleIntelligenceAvailable: { false })
+        let degraded = try await service.prepareSummarization()
+        #expect(degraded == .defaultTruncation)
+        // No ACP snapshot path ran: zero command resolutions for the
+        // summarizer stage (the configuration read is the only touch).
+        #expect(counts.commandCalls == 0)
     }
 
     @Test("One configuration read freezes all stage models and chains")
@@ -258,6 +321,406 @@ struct AgentProviderRuntimeTests {
         #expect(!rendered.contains("/secret"))
         #expect(!rendered.contains("key-not-public"))
         #expect(!rendered.contains("do-not-leak"))
+        // Issue #1276: dispose tears the snapshot down (scratch removed) so
+        // the test leaves no temp directories behind.
+        await service.dispose()
+    }
+
+    // MARK: - Summarizer sandbox ownership + teardown ordering (issue #1276)
+
+    @Test("Summarizer preparation returns a read-only profile with a unique owned scratch")
+    func summarizerBackendOwnsReadOnlySandboxScratch() async throws {
+        let config = LockedBox(configuration(summarizer: true))
+        let counts = RuntimeCounts()
+        let service = runtime(config: config, counts: counts)
+
+        let first = try await service.prepareSummarization()
+        guard case .model(let firstPreparation) = first else {
+            Issue.record("expected model summarization")
+            return
+        }
+        let prepared = try await service.preparedBackend(
+            from: firstPreparation.selection.token,
+            stage: .summarizer)
+        let profile = prepared.profile
+        #expect(profile.isReadOnly)
+        let scratchURL = try #require(profile.scratchDirectory, "summarizer profiles own a scratch directory")
+        let sandbox = try #require(profile.sandbox, "summarizer profiles name a read-only sandbox")
+        // The invocation's SCRATCH_DIR is the EXACT owned directory (the
+        // seatbelt's canonical form of it) and the wiki database is NOT
+        // allowed — no define, no allowance.
+        #expect(sandbox.defines.first { $0.0 == "SCRATCH_DIR" }?.1 == SandboxProfile.canonical(scratchURL.path))
+        #expect(sandbox.defines.contains { $0.0 == "WIKI_DB" } == false)
+        #expect(sandbox.profile.contains("(deny file-write*)"))
+        // Issue #1276 strict tier: the summarizer carries the strict trailer —
+        // W^X scratch no-exec and the credential read denies — only when the
+        // WIKIFS_SUMMARIZER_STRICT=1 opt-in is set for this run (#1279
+        // flipped the default off after the adapter smoke matrix failed).
+        if AgentProviderRuntime.strictSummarizerEnabled {
+            #expect(sandbox.trailer.isEmpty == false, "the summarizer runs the strict profile tier")
+            #expect(sandbox.trailer.contains(
+                "(deny process-exec* (subpath (param \"SCRATCH_DIR\")))"))
+            #expect(sandbox.trailer.contains { $0.contains("/.ssh") })
+            #expect(sandbox.trailer.contains { $0.contains("/usr/bin/open") })
+        }
+        // The scratch-local temp root exists before any spawn.
+        #expect(FileManager.default.fileExists(atPath: scratchURL.appendingPathComponent(".tmp").path))
+
+        // Each preparation owns a UNIQUE scratch directory.
+        let second = try await service.prepareSummarization()
+        guard case .model(let secondPreparation) = second else {
+            Issue.record("expected second model summarization")
+            return
+        }
+        let prepared2 = try await service.preparedBackend(
+            from: secondPreparation.selection.token,
+            stage: .summarizer)
+        let scratch2 = try #require(prepared2.profile.scratchDirectory)
+        #expect(scratch2.path != scratchURL.path, "each snapshot owns its own scratch")
+
+        await service.release(firstPreparation.selection.token)
+        await service.release(secondPreparation.selection.token)
+        #expect(!FileManager.default.fileExists(atPath: scratchURL.path))
+        #expect(!FileManager.default.fileExists(atPath: scratch2.path))
+    }
+
+    @Test("Release waits for the active summary, shuts the backend down, then removes scratch")
+    func releaseWaitsForActiveSummaryBeforeBackendShutdownAndScratchRemoval() async throws {
+        let config = LockedBox(configuration(summarizer: true))
+        let counts = RuntimeCounts()
+        let order = TeardownOrder()
+        let gate = GateBox()
+        let gated = GatedSummarizerBackend(gate: gate, order: order, replyText: "one line summary")
+        let service = AgentProviderRuntime(
+            readConfiguration: { config.read() },
+            resolveCommand: { providers in
+                counts.incrementCommands()
+                return Dictionary(uniqueKeysWithValues: providers.compactMap { provider in
+                    provider.command.map { (provider.id, $0) }
+                })
+            },
+            readCredential: { _ in nil },
+            resolvePermissionPolicy: { _ in .bypass },
+            makeBackend: { _, _, _ in gated })
+
+        let preparation = try await summarizerPreparation(service)
+        let prepared = try await service.preparedBackend(
+            from: preparation.selection.token,
+            stage: .summarizer)
+        let scratchPath = try #require(prepared.profile.scratchDirectory).path
+        #expect(FileManager.default.fileExists(atPath: scratchPath))
+
+        // An ACTIVE summary: its `send` parks on the gate mid-turn.
+        let summaryTask = Task {
+            await order.record("summary-returned")
+            _ = try? await service.modelSummary(text: "long text", preparation: preparation)
+        }
+        try await waitFor { await order.values.contains("send-start") }
+
+        // Release must NOT tear anything down while the summary is active.
+        let releaseTask = Task {
+            await service.release(preparation.selection.token)
+            await order.record("release-done")
+        }
+        // Race-exposure window (250 ms): a BROKEN release would reach shutdown
+        // here. The hard ordering proof is the final sequence below; this
+        // bounded window is what makes a broken teardown LIKELY to be caught,
+        // rather than only possible.
+        do {
+            try await waitFor(
+                { await order.values.contains("shutdown") },
+                timeout: .milliseconds(250))
+            Issue.record("backend shutdown ran while the summary lease was still active")
+        } catch is TeardownTimeout {
+            // Expected: release is still quiescing.
+        }
+        #expect(FileManager.default.fileExists(atPath: scratchPath),
+                "scratch survives while a cached backend can still use it")
+
+        // Finish the summary — release then completes in the pinned order.
+        await gate.open()
+        try await waitForTask(releaseTask)
+        await summaryTask.value
+        let final = await order.values
+        let sendStart = try #require(final.firstIndex(of: "send-start"))
+        let sendEnd = try #require(final.firstIndex(of: "send-end"))
+        let shutdownIndex = try #require(final.firstIndex(of: "shutdown"))
+        let done = try #require(final.firstIndex(of: "release-done"))
+        #expect(sendEnd > sendStart)
+        #expect(shutdownIndex > sendEnd, "shutdown happens only after the summary drained")
+        #expect(done > shutdownIndex)
+        #expect(!FileManager.default.fileExists(atPath: scratchPath),
+                "scratch is removed only after the backend terminated")
+
+        // Retired snapshot: new work is rejected.
+        do {
+            _ = try await service.modelSummary(text: "more text", preparation: preparation)
+            Issue.record("post-release summary must be rejected")
+        } catch let error as AgentProviderRuntimeError {
+            #expect(error == .invalidToken)
+        }
+    }
+
+    @Test("Dispose waits for the active title, shuts the backend down, then removes scratch")
+    func disposeWaitsForActiveTitleBeforeBackendShutdownAndScratchRemoval() async throws {
+        let config = LockedBox(configuration(summarizer: true))
+        let counts = RuntimeCounts()
+        let order = TeardownOrder()
+        let gate = GateBox()
+        let gated = GatedSummarizerBackend(gate: gate, order: order, replyText: "Titled Nicely")
+        let service = AgentProviderRuntime(
+            readConfiguration: { config.read() },
+            resolveCommand: { providers in
+                counts.incrementCommands()
+                return Dictionary(uniqueKeysWithValues: providers.compactMap { provider in
+                    provider.command.map { (provider.id, $0) }
+                })
+            },
+            readCredential: { _ in nil },
+            resolvePermissionPolicy: { _ in .bypass },
+            makeBackend: { _, _, _ in gated })
+
+        let preparation = try await summarizerPreparation(service)
+        let prepared = try await service.preparedBackend(
+            from: preparation.selection.token,
+            stage: .summarizer)
+        let scratchPath = try #require(prepared.profile.scratchDirectory).path
+
+        // An ACTIVE title generation parks on the gate mid-turn.
+        let titleTask = Task {
+            _ = try? await service.modelTitle(
+                question: "What is a venturi mask?",
+                answer: "An oxygen delivery device…",
+                preparation: preparation)
+        }
+        try await waitFor { await order.values.contains("send-start") }
+
+        let disposeTask = Task {
+            await service.dispose()
+            await order.record("dispose-done")
+        }
+        do {
+            try await waitFor(
+                { await order.values.contains("shutdown") },
+                timeout: .milliseconds(250))
+            Issue.record("backend shutdown ran while the title lease was still active")
+        } catch is TeardownTimeout {
+            // Expected: dispose is still quiescing.
+        }
+        #expect(FileManager.default.fileExists(atPath: scratchPath))
+
+        await gate.open()
+        try await waitForTask(disposeTask)
+        await titleTask.value
+        let final = await order.values
+        let sendEnd = try #require(final.firstIndex(of: "send-end"))
+        let shutdownIndex = try #require(final.firstIndex(of: "shutdown"))
+        let done = try #require(final.firstIndex(of: "dispose-done"))
+        #expect(shutdownIndex > sendEnd)
+        #expect(done > shutdownIndex)
+        #expect(!FileManager.default.fileExists(atPath: scratchPath))
+    }
+
+    /// `prepareSummarization` unwrapped to its preparation.
+    private func summarizerPreparation(_ service: AgentProviderRuntime) async throws -> AgentOperationPreparation {
+        let result = try await service.prepareSummarization()
+        guard case .model(let preparation) = result else {
+            throw AgentProviderRuntimeError.noProvider
+        }
+        return preparation
+    }
+
+    @Test("Overlapping release and dispose tear the backend down exactly once")
+    func overlappingReleaseAndDisposeNeverDoubleShutdown() async throws {
+        let config = LockedBox(configuration(summarizer: true))
+        let order = TeardownOrder()
+        let gate = GateBox()
+        let gated = GatedSummarizerBackend(gate: gate, order: order, replyText: "summary")
+        let service = AgentProviderRuntime(
+            readConfiguration: { config.read() },
+            resolveCommand: { providers in
+                Dictionary(uniqueKeysWithValues: providers.compactMap { provider in
+                    provider.command.map { (provider.id, $0) }
+                })
+            },
+            readCredential: { _ in nil },
+            resolvePermissionPolicy: { _ in .bypass },
+            makeBackend: { _, _, _ in gated })
+
+        let preparation = try await summarizerPreparation(service)
+        let prepared = try await service.preparedBackend(
+            from: preparation.selection.token,
+            stage: .summarizer)
+        let scratchPath = try #require(prepared.profile.scratchDirectory).path
+
+        // One ACTIVE lease; both teardown paths race it.
+        let summaryTask = Task {
+            _ = try? await service.modelSummary(text: "text", preparation: preparation)
+        }
+        try await waitFor { await order.values.contains("send-start") }
+
+        let releaseTask = Task {
+            await service.release(preparation.selection.token)
+            await order.record("release-done")
+        }
+        let disposeTask = Task {
+            await service.dispose()
+            await order.record("dispose-done")
+        }
+
+        await gate.open()
+        try await waitForTask(releaseTask)
+        try await waitForTask(disposeTask)
+        await summaryTask.value
+
+        let values = await order.values
+        let shutdowns = values.filter { $0 == "shutdown" }
+        #expect(shutdowns.count == 1,
+                "exactly one shutdown across overlapping teardowns, got \(shutdowns.count)")
+        let sendEnd = try #require(values.firstIndex(of: "send-end"))
+        let shutdownIndex = try #require(values.firstIndex(of: "shutdown"))
+        #expect(shutdownIndex > sendEnd,
+                "even under overlap, shutdown never precedes the active lease draining")
+        #expect(!FileManager.default.fileExists(atPath: scratchPath))
+    }
+
+    @Test("Disposal during summarizer preparation removes the scratch and refuses")
+    func disposalDuringPreparationRemovesScratchAndRefuses() async throws {
+        let config = LockedBox(configuration(summarizer: true))
+        let commandGate = GateBox()
+        let signals = TeardownOrder()
+        // An ISOLATED scratch root: only this runtime instance writes here, so
+        // the cleanup assertion is deterministic even with sibling suites
+        // running concurrently (the shared-temp-root version flaked on CI).
+        let isolatedRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("disposal-race-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: isolatedRoot, withIntermediateDirectories: true)
+        defer {
+            do { try FileManager.default.removeItem(at: isolatedRoot) }
+            catch { Issue.record("isolated root cleanup failed: \(error)") }
+        }
+        let service = AgentProviderRuntime(
+            readConfiguration: { config.read() },
+            resolveCommand: { _ in
+                await signals.record("resolve-entered")
+                await commandGate.wait()
+                return [:]
+            },
+            readCredential: { _ in nil },
+            resolvePermissionPolicy: { _ in .bypass },
+            summarizerScratchParent: isolatedRoot)
+
+        // Park preparation inside command resolution, dispose underneath it.
+        let prepareTask = Task {
+            _ = try? await service.prepareSummarization()
+        }
+        try await waitFor { await signals.values.contains("resolve-entered") }
+        // The parked preparation owns exactly one scratch in the isolated root.
+        let parked = Self.summarizerScratchPaths(under: isolatedRoot)
+        #expect(parked.count == 1, "the parked preparation already owns its scratch")
+
+        await service.dispose()
+        await commandGate.open()
+        await prepareTask.value
+
+        // The disposed runtime never resurrects the snapshot: no active
+        // snapshot remains and the parked preparation's scratch is gone.
+        let activeAfter = await service.activeSnapshotCount()
+        #expect(activeAfter == 0)
+        // Bounded poll: the parked scratch must disappear.
+        try await waitFor(
+            { Self.summarizerScratchPaths(under: isolatedRoot).isEmpty },
+            timeout: .seconds(2),
+            pollInterval: .milliseconds(20))
+    }
+
+    /// Scratch dirs under `root` with the production `summarizer-` prefix.
+    private static func summarizerScratchPaths(under root: URL) -> [String] {
+        let contents = (try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil)) ?? []
+        return contents
+            .filter { $0.lastPathComponent.hasPrefix("summarizer-") }
+            .map { $0.path }
+    }
+
+    // MARK: - Catalog sandbox ordering (issue #1276, AC.4)
+
+    @Test("discoverCatalog returns the probe observation through the sandbox gate")
+    func discoverCatalogReturnsProbeObservation() async throws {
+        let config = LockedBox(configuration())
+        let counts = RuntimeCounts()
+        let observation = ACPProviderCatalogObservation(
+            providerID: alpha,
+            fingerprint: nil,
+            models: [],
+            currentModelID: nil,
+            thinkingCapability: nil)
+        let probedCommand = LockedBox<[String]?>(nil)
+        let service = AgentProviderRuntime(
+            readConfiguration: { config.read() },
+            resolveCommand: { providers in
+                counts.incrementCommands()
+                return Dictionary(uniqueKeysWithValues: providers.compactMap { provider in
+                    provider.command.map { (provider.id, $0) }
+                })
+            },
+            readCredential: { _ in "key" },
+            resolvePermissionPolicy: { _ in .bypass },
+            probeCatalog: { _, resolvedCommand, _ in
+                probedCommand.mutate { $0 = resolvedCommand }
+                return observation
+            })
+
+        let result = try await service.discoverCatalog(for: config.read().providers[0])
+        #expect(result == observation)
+        #expect(probedCommand.read() == ["/secret/alpha"])
+        #expect(counts.commandCalls == 1)
+    }
+
+    @Test("An unusable sandbox makes discoverCatalog fail before command resolution")
+    func catalogSandboxFailurePrecedesCommandResolution() async throws {
+        let config = LockedBox(configuration())
+        let counts = RuntimeCounts()
+        let service = AgentProviderRuntime(
+            readConfiguration: { config.read() },
+            resolveCommand: { providers in
+                counts.incrementCommands()
+                return Dictionary(uniqueKeysWithValues: providers.compactMap { provider in
+                    provider.command.map { (provider.id, $0) }
+                })
+            },
+            readCredential: { _ in nil },
+            resolvePermissionPolicy: { _ in .bypass },
+            probeCatalog: { _, _, _ in
+                Issue.record("the probe must never run when the sandbox is unusable")
+                throw ACPProviderModelProbeError.notConfigured
+            },
+            sandboxUsability: { _ in false })
+
+        await #expect(throws: ACPProviderModelProbeError.sandboxUnavailable) {
+            try await service.discoverCatalog(for: config.read().providers[0])
+        }
+        #expect(counts.commandCalls == 0,
+                "command resolution must not run before the sandbox gate passes")
+    }
+
+    @Test("discoverCatalog surfaces the typed sandbox-unavailable error")
+    func discoverCatalogSurfacesSandboxUnavailable() async throws {
+        let config = LockedBox(configuration())
+        let service = AgentProviderRuntime(
+            readConfiguration: { config.read() },
+            resolveCommand: { _ in [:] },
+            readCredential: { _ in nil },
+            resolvePermissionPolicy: { _ in .bypass },
+            sandboxUsability: { _ in false })
+
+        do {
+            _ = try await service.discoverCatalog(for: config.read().providers[0])
+            Issue.record("expected sandboxUnavailable")
+        } catch let error as ACPProviderModelProbeError {
+            #expect(error == .sandboxUnavailable)
+        }
     }
 }
 
@@ -288,4 +751,107 @@ private final class PolicyRecorder: Sendable {
     private let storage = Mutex<[PermissionPolicy]>([])
     var values: [PermissionPolicy] { storage.withLock { $0 } }
     func record(_ policy: PermissionPolicy) { storage.withLock { $0.append(policy) } }
+}
+
+// MARK: - Issue #1276 test doubles (nonblocking — no Thread.sleep, no semaphores)
+
+struct TeardownTimeout: Error {}
+
+/// A one-shot open/close gate the tests use to park a fake backend's `send`
+/// mid-turn, so release/dispose ordering is observable. Supports multiple
+/// waiters; `open()` is idempotent and releases them all.
+private actor GateBox {
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var opened = false
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { continuations.append($0) }
+    }
+    func open() {
+        opened = true
+        let waiters = continuations
+        continuations = []
+        for waiter in waiters { waiter.resume() }
+    }
+}
+
+/// Append-only event log for teardown-order assertions.
+private actor TeardownOrder {
+    private var storage: [String] = []
+    func record(_ event: String) { storage.append(event) }
+    var values: [String] { storage }
+}
+
+/// A scripted summarizer backend whose `send` parks on a `GateBox` until the
+/// test opens it. Records the release/dispose lifecycle events in order:
+/// send-start → (parked) → send-end → cancel → shutdown.
+private actor GatedSummarizerBackend: AgentBackend {
+    private let gate: GateBox
+    private let order: TeardownOrder
+    private let replyText: String
+    private var sessionCounter = 0
+
+    init(gate: GateBox, order: TeardownOrder, replyText: String) {
+        self.gate = gate
+        self.order = order
+        self.replyText = replyText
+    }
+
+    func start(
+        profile: BackendProfile,
+        systemPrompt: String,
+        onExit: @escaping @Sendable (Int) -> Void
+    ) async throws -> SessionHandle {
+        sessionCounter += 1
+        return SessionHandle(id: "gated-\(sessionCounter)")
+    }
+
+    func send(_ turn: TurnInput, into session: SessionHandle) async -> AsyncStream<AgentEvent> {
+        await order.record("send-start")
+        await gate.wait()
+        await order.record("send-end")
+        return AsyncStream { continuation in
+            continuation.yield(.assistantText(replyText))
+            continuation.yield(.messageStop)
+            continuation.finish()
+        }
+    }
+
+    func resume(sessionID: String, profile: BackendProfile) async throws -> SessionHandle? { nil }
+
+    func cancel(_ session: SessionHandle) async {
+        await order.record("cancel")
+    }
+
+    func shutdown() async {
+        await order.record("shutdown")
+    }
+}
+
+/// Poll a predicate until it holds or the timeout elapses. Task.sleep only —
+/// never a blocking wait (house rule, #1051).
+private func waitFor(
+    _ predicate: () async -> Bool,
+    timeout: Duration = .seconds(5),
+    pollInterval: Duration = .milliseconds(20)
+) async throws {
+    let deadline = ContinuousClock.now + timeout
+    while !(await predicate()) {
+        if ContinuousClock.now >= deadline { throw TeardownTimeout() }
+        try await Task.sleep(for: pollInterval)
+    }
+}
+
+/// Await a task's completion, racing it against a diagnosed timeout so a
+/// starved pool fails fast instead of hanging the suite.
+private func waitForTask(_ task: Task<Void, Never>, timeout: Duration = .seconds(10)) async throws {
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        group.addTask { await task.value }
+        group.addTask {
+            try await Task.sleep(for: timeout)
+            throw TeardownTimeout()
+        }
+        try await group.next()
+        group.cancelAll()
+    }
 }

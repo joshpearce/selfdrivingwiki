@@ -2,6 +2,8 @@
 import Foundation
 import Testing
 import WikiFSTypes
+import WikiFSEngine
+import WikiFSMarkdown
 @testable import WikiFS
 
 /// Tests for the PR2 §5.4 migration of `SourceDetailView`'s Extract /
@@ -30,6 +32,11 @@ import WikiFSTypes
 ///   helper / `#if PODCAST_TRANSCRIPTS` runtime guards layer on top in the
 ///   full `isTranscribable` view predicate — beyond the seam's scope).
 @Suite struct SourceDetailViewContentKindTests {
+
+    private static let registeredDocx = RegisteredExtractionInputs(claims: [.init(
+        kind: .docx,
+        mimeTypes: [MimeType.docx],
+        filenameExtensions: ["docx"])])
 
     // MARK: - Per-kind affordance (the closed table)
 
@@ -70,7 +77,14 @@ import WikiFSTypes
             provider: nil, ext: "docx") == .extract)
         // Ext fallback (nil mime + .docx) also extracts.
         #expect(SourceDetailView.extractionAffordance(
-            mimeType: nil, provider: .localFile, ext: "docx") == .extract)
+            mimeType: nil,
+            provider: .localFile,
+            ext: "docx",
+            registeredInputs: Self.registeredDocx) == .extract)
+        #expect(SourceDetailView.extractionAffordance(
+            mimeType: nil,
+            provider: .localFile,
+            ext: "docx") == .none)
         // Legacy .doc (application/msword) has no path — never Extract.
         #expect(SourceDetailView.extractionAffordance(
             mimeType: "application/msword", provider: .localFile, ext: "doc") == .none)
@@ -155,6 +169,88 @@ import WikiFSTypes
             mimeType: nil, provider: nil, ext: nil) == .none)
     }
 
+    @Test("Raw Source matches an active registered extractor by MIME")
+    func rawSourceUsesRegisteredExtractor() throws {
+        let registration = ExtractorRouteRegistrationSnapshot(
+            reference: try reference(packageID: "org.example.pdf2md"),
+            displayName: "PDF Extractor",
+            packageName: "pdf2md",
+            kinds: [.pdf],
+            mimeTypes: [try ExtractorMIMEType(validating: "application/pdf")],
+            filenameExtensions: [try ExtractorFileExtension(validating: "pdf")])
+
+        let match = SourceDetailView.rawSourceExtractorMatch(
+            mimeType: "application/pdf",
+            ext: "pdf",
+            registrations: [registration])
+
+        #expect(match?.packageName == "pdf2md")
+    }
+
+    @Test("Raw Source has no extractor action without an active match")
+    func rawSourceDoesNotOfferUnmatchedExtractor() {
+        let match = SourceDetailView.rawSourceExtractorMatch(
+            mimeType: "application/octet-stream",
+            ext: "bin",
+            registrations: [])
+
+        #expect(match == nil)
+    }
+
+    @Test("Raw Source offers every matching extractor, each with its run backend")
+    func rawSourceOffersAllMatchingExtractors() throws {
+        let pdf2md = ExtractorRouteRegistrationSnapshot(
+            reference: try reference(packageID: "org.selfdrivingwiki.pdf2md"),
+            displayName: "Local pdf2md",
+            packageName: "pdf2md",
+            kinds: [.pdf],
+            mimeTypes: [try ExtractorMIMEType(validating: "application/pdf")],
+            filenameExtensions: [try ExtractorFileExtension(validating: "pdf")])
+        let docling = ExtractorRouteRegistrationSnapshot(
+            reference: try reference(packageID: "org.selfdrivingwiki.docling-serve"),
+            displayName: "Docling Serve",
+            packageName: "docling-serve",
+            kinds: [.pdf],
+            mimeTypes: [try ExtractorMIMEType(validating: "application/pdf")],
+            filenameExtensions: [])
+
+        let matches = SourceDetailView.rawSourceExtractorMatches(
+            mimeType: "application/pdf",
+            ext: "pdf",
+            registrations: [docling, pdf2md])
+
+        #expect(matches.map(\.packageName) == ["docling-serve", "pdf2md"])
+        #expect(matches.map(\.backend) == [.doclingServe, .localPdf2md])
+    }
+
+    @Test("A package with no execution backend still matches and runs the route default")
+    func unknownPackageMatchesWithoutBackend() throws {
+        let exotic = ExtractorRouteRegistrationSnapshot(
+            reference: try reference(packageID: "org.example.mystery"),
+            displayName: "Mystery Extractor",
+            packageName: "mystery",
+            kinds: [.pdf],
+            mimeTypes: [try ExtractorMIMEType(validating: "application/pdf")],
+            filenameExtensions: [])
+
+        let matches = SourceDetailView.rawSourceExtractorMatches(
+            mimeType: "application/pdf",
+            ext: nil,
+            registrations: [exotic])
+
+        #expect(matches.count == 1)
+        #expect(matches[0].backend == nil)
+    }
+
+    private func reference(packageID: String) throws -> ExtractorReference {
+        ExtractorReference(
+            revision: ExtractorPackageRevisionID(
+                packageID: try ExtractorPackageID(validating: packageID),
+                version: try ExtractorPackageVersion(validating: "1.0.0"),
+                digest: try ExtractorPackageDigest(hex: String(repeating: "00", count: 32))),
+            registrationID: try ExtractorRegistrationID(validating: "main"))
+    }
+
     // MARK: - Exhaustive partition (closed-table invariant)
 
     @Test("Affordance partition is exhaustive and mutually exclusive")
@@ -168,6 +264,8 @@ import WikiFSTypes
             switch path {
             case .pdfBackend, .htmlToMarkdown, .docxBackend: expected = .extract
             case .podcastTranscript, .youtubeTranscript: expected = .transcribe
+            // Zotero acquisition is sync-driven; no manual button (yet).
+            case .zoteroAttachment:                      expected = .none
             case nil:                                    expected = .none
             }
             // We can't call extractionAffordance with the kind directly; pick

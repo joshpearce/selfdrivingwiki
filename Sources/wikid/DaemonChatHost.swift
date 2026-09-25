@@ -64,11 +64,42 @@ final class DaemonChatHost: @unchecked Sendable {
         let resolvedChatID: ChatID
         if let existingChatID = request.chatID {
             resolvedChatID = existingChatID
+            // Title an untouched app-created empty chat from its first message,
+            // BEFORE the turn enters the durable queue or the ACP controller
+            // starts. One conditional UPDATE in the store — a chat the user
+            // renamed before sending is never overwritten, and the nil-ID
+            // compatibility path below keeps its creation-time title.
+            guard let store = storeResolver(request.wikiID) else {
+                throw DaemonChatError.noStore(request.wikiID)
+            }
+            // Write the PROVISIONAL title (first line of the question) in every
+            // summarizer mode, so the row never renders untitled after a send.
+            // In Model mode the post-turn pass upgrades this exact text to the
+            // model-generated title via setChatTitleIf — a manual rename (any
+            // other current title) makes that upgrade miss and wins. A message
+            // that derives no usable title (#1265) skips the write, leaving the
+            // row untitled and retriable on the next send.
+            do {
+                if let title = ChatSummary.title(fromFirstMessage: request.submission.userText) {
+                    try store.setChatTitleIfEmpty(chatID: resolvedChatID, title: title)
+                }
+            } catch WikiStoreError.chatNotFound {
+                // The row is gone (deleted while the daemon held no session).
+                // Fail the send now with the truthful error instead of running
+                // a turn that cannot be persisted.
+                throw WikiStoreError.chatNotFound(resolvedChatID)
+            } catch {
+                // Best-effort: a title write failure must not block the
+                // message send (the turn's own store writes still validate).
+                DebugLog.store("DaemonChatHost.setChatTitleIfEmpty failed for \(resolvedChatID.rawValue): \(error)")
+            }
         } else {
             guard let store = storeResolver(request.wikiID) else {
                 throw DaemonChatError.noStore(request.wikiID)
             }
-            let title = ChatSummary.title(fromFirstMessage: request.submission.userText)
+            // Issue #1265: a message that derives no usable title creates the
+            // row genuinely untitled — first-send titling can still name it.
+            let title = ChatSummary.title(fromFirstMessage: request.submission.userText) ?? ""
             let config = AgentProvidersConfig.loadOrSeed(from: containerDirectory)
             let thinking = config.resolveThinkingCapability(
                 chatOverrideProviderID: request.providerId,
@@ -252,6 +283,12 @@ final class DaemonChatHost: @unchecked Sendable {
         await evictIdleController(chatID: chatID)
     }
 
+    /// Drive the post-turn summarizer pass directly (tests): per-message
+    /// summaries plus the empty-title refresh.
+    func summarizePendingMessagesForTesting(chatID: ChatID, wikiID: WikiID) {
+        summarizePendingMessages(chatID: chatID, wikiID: wikiID)
+    }
+
     func liveControllerCountForTesting() async -> Int {
         await registry.count()
     }
@@ -415,78 +452,201 @@ final class DaemonChatHost: @unchecked Sendable {
     /// RC5: this is the daemon-native generalization of the app's
     /// `summarizePendingMessages` + `runModelSummarization`.
     ///
-    /// Also mirrors the FIRST summarizable message's summary into
-    /// `chats.summary` (issue #411) — the sole writer of that column now that
-    /// the launcher's always-truncated path is gone.
     private func summarizePendingMessages(
         chatID: ChatID, wikiID: WikiID
     ) {
         guard let store = storeResolver(wikiID) else { return }
 
-        let messages: [ChatMessage]
+        // v54 (#1266): pending summaries are detected on the durable
+        // transcript (`chat_transcript_items`), the same rows the outline
+        // reads — not on the compatibility `chat_messages` projection.
+        let pending: [(cursor: ChatTranscriptCursor, text: String)]
         do {
-            messages = try store.chatMessages(chatID: chatID)
+            pending = try Self.pendingSummaryTargets(chatID: chatID, store: store)
         } catch {
-            DebugLog.store("DaemonChatHost.summarizePendingMessages: chatMessages failed: \(error)")
+            DebugLog.store("DaemonChatHost.summarizePendingMessages: transcript read failed: \(error)")
             return
         }
-
-        let pending = messages.filter { msg in
-            msg.summary == nil
-                && (MessageSummarizer.textToSummarize(from: msg.event)?.isEmpty == false)
-        }
         guard !pending.isEmpty else { return }
-
-        // The message whose summary doubles as `chats.summary` (issue #411).
-        let chatSummaryMessageID = MessageSummarizer.chatSummaryMessageID(in: messages)
 
         let services = providerServices
         Task { @MainActor in
             do {
                 let preparation = try await services.prepareSummarization()
+                await Self.refreshChatTitle(
+                    chatID: chatID,
+                    store: store,
+                    services: services,
+                    preparation: preparation)
                 switch preparation {
                 case .defaultTruncation:
                     Self.writeDefaultSummaries(
-                        chatID: chatID, pending: pending, store: store,
-                        chatSummaryMessageID: chatSummaryMessageID)
+                        chatID: chatID, pending: pending, store: store)
                 case .model(let preparation):
                     await Self.runModelSummarization(
                         chatID: chatID,
                         pending: pending,
                         services: services,
                         preparation: preparation,
-                        store: store,
-                        chatSummaryMessageID: chatSummaryMessageID)
+                        store: store)
                     await services.release(preparation.selection.token)
+                case .appleIntelligence:
+                    // In process, no snapshot or lease — nothing to release.
+                    await Self.runAppleIntelligenceSummarization(
+                        chatID: chatID,
+                        pending: pending,
+                        services: services,
+                        store: store)
                 }
             } catch AgentProviderRuntimeError.unavailable {
                 Self.writeDefaultSummaries(
                     chatID: chatID,
                     pending: pending,
-                    store: store,
-                    chatSummaryMessageID: chatSummaryMessageID)
+                    store: store)
             } catch {
                 DebugLog.agent("DaemonChatHost: summarization preparation failed: \(error)")
             }
         }
     }
 
+    /// Read the full durable transcript (paged) and extract the summarizer's
+    /// pending set — unsummarized assistant items with their summarizable
+    /// text, keyed by the cursor `updateMessageSummary` writes to.
+    private static func pendingSummaryTargets(
+        chatID: ChatID, store: GRDBWikiStore
+    ) throws -> [(cursor: ChatTranscriptCursor, text: String)] {
+        var items: [PersistedChatTranscriptItem] = []
+        var after: ChatTranscriptCursor?
+        // Page budget: 1000 pages × 200 items is far beyond any real
+        // transcript; guards against a concurrent-writer livelock.
+        for _ in 0..<1000 {
+            let page = try store.readChatTranscriptPage(
+                chatID: chatID, after: after, limit: 200)
+            items.append(contentsOf: page.items)
+            guard let next = page.nextCursor else { break }
+            after = next
+        }
+        return MessageSummarizer.pendingSummaryTargets(from: items)
+    }
+
+    /// Upgrade the provisional chat title (durable-chat identity, first-send
+    /// titling). The first send writes the first line of the question as a
+    /// provisional title in every mode; this pass refines it. In a model-capable
+    /// mode (Model via ACP, or Apple Intelligence on-device) the summarizer
+    /// generates the title from the opening question and the assistant's first
+    /// reply, through the `chat-title-task` prompt, and replaces the UNTOUCHED
+    /// provisional text via `setChatTitleIf` — a manual rename makes the
+    /// upgrade miss. In Default mode the first-line title is already final;
+    /// only a still-empty legacy row gets the fallback write. Best-effort:
+    /// every failure is logged and leaves the title as-is.
+    @MainActor
+    private static func refreshChatTitle(
+        chatID: ChatID,
+        store: GRDBWikiStore,
+        services: any AgentProviderServices,
+        preparation: AgentProviderSummaryPreparation
+    ) async {
+        let chat: ChatSummary
+        do {
+            chat = try store.getChat(id: chatID)
+        } catch {
+            DebugLog.store("DaemonChatHost.refreshChatTitle: getChat failed: \(error)")
+            return
+        }
+
+        let messages: [ChatMessage]
+        do {
+            messages = try store.chatMessages(chatID: chatID)
+        } catch {
+            DebugLog.store("DaemonChatHost.refreshChatTitle: chatMessages failed: \(error)")
+            return
+        }
+        // The opening question and the first assistant reply, in store order.
+        guard case .userText(let questionText)? = messages.first(where: { msg in
+            if case .userText = msg.event { return true }
+            return false
+        })?.event else { return }
+        let answer = messages.lazy.compactMap { MessageSummarizer.textToSummarize(from: $0.event) }.first
+
+        // The provisional text the first send wrote, if derivation produced
+        // one (#1265 — a warning-only question leaves the row untitled). A
+        // current title that is neither empty nor this text is a manual
+        // rename — never touched, and the model call is skipped entirely.
+        let provisional = ChatSummary.title(fromFirstMessage: questionText)
+        let currentTitle = chat.title.trimmingCharacters(in: .whitespaces)
+        guard currentTitle.isEmpty || currentTitle == provisional else { return }
+
+        switch preparation {
+        case .model, .appleIntelligence:
+            do {
+                // The model-capable modes differ only in how the title turn
+                // runs — ACP subprocess with a preparation, or the in-process
+                // Apple Intelligence engine. The write-back, the nil fallback,
+                // and the failure fallback are shared.
+                let title: String?
+                switch preparation {
+                case .model(let prep):
+                    title = try await services.modelTitle(
+                        question: questionText,
+                        answer: answer,
+                        preparation: prep)
+                case .appleIntelligence:
+                    title = await services.appleIntelligenceTitle(
+                        question: questionText,
+                        answer: answer)
+                case .defaultTruncation:
+                    title = nil // unreachable — the outer switch excluded it
+                }
+                if let title {
+                    if currentTitle.isEmpty {
+                        try store.setChatTitleIfEmpty(chatID: chatID, title: title)
+                    } else if let provisional {
+                        // Upgrade the untouched provisional text; a rename in
+                        // flight makes this miss and keeps the rename.
+                        try store.setChatTitleIf(
+                            chatID: chatID, expectedTitle: provisional, title: title)
+                    }
+                } else if currentTitle.isEmpty, let provisional {
+                    // The model produced nothing usable — fall back to the
+                    // provisional text rather than leaving the row untitled.
+                    try store.setChatTitleIfEmpty(chatID: chatID, title: provisional)
+                }
+            } catch {
+                // Issue #1276 strict tier: a launch failure must degrade to
+                // the provisional title — the same contract as an unusable
+                // reply, never a silent untitled row.
+                DebugLog.store("DaemonChatHost.refreshChatTitle: model title failed — falling back to the provisional title: \(error)")
+                if currentTitle.isEmpty, let provisional {
+                    do {
+                        try store.setChatTitleIfEmpty(chatID: chatID, title: provisional)
+                    } catch {
+                        DebugLog.store("DaemonChatHost.refreshChatTitle: fallback title failed: \(error)")
+                    }
+                }
+            }
+        case .defaultTruncation:
+            guard currentTitle.isEmpty, let provisional else { return }
+            do {
+                try store.setChatTitleIfEmpty(chatID: chatID, title: provisional)
+            } catch {
+                DebugLog.store("DaemonChatHost.refreshChatTitle: fallback title failed: \(error)")
+            }
+        }
+    }
+
     @MainActor
     private static func writeDefaultSummaries(
-        chatID: ChatID, pending: [ChatMessage], store: GRDBWikiStore,
-        chatSummaryMessageID: PageID?
+        chatID: ChatID,
+        pending: [(cursor: ChatTranscriptCursor, text: String)],
+        store: GRDBWikiStore
     ) {
-        for msg in pending {
-            guard let text = MessageSummarizer.textToSummarize(from: msg.event) else { continue }
-            let summary = MessageSummarizer.defaultSummary(for: text)
+        for target in pending {
+            let summary = MessageSummarizer.defaultSummary(for: target.text)
             guard !summary.isEmpty else { continue }
             do {
                 try store.updateMessageSummary(
-                    chatID: chatID, messageID: msg.id,
+                    chatID: chatID, cursor: target.cursor,
                     summary: summary, kind: .defaultTruncation)
-                if msg.id == chatSummaryMessageID {
-                    try store.updateChatSummary(chatID: chatID, summary: summary)
-                }
             } catch {
                 DebugLog.store("DaemonChatHost: summary write failed: \(error)")
             }
@@ -497,34 +657,71 @@ final class DaemonChatHost: @unchecked Sendable {
     @MainActor
     private static func runModelSummarization(
         chatID: ChatID,
-        pending: [ChatMessage],
+        pending: [(cursor: ChatTranscriptCursor, text: String)],
         services: any AgentProviderServices,
         preparation: AgentOperationPreparation,
-        store: GRDBWikiStore,
-        chatSummaryMessageID: PageID?
+        store: GRDBWikiStore
     ) async {
-        for msg in pending {
-            guard let text = MessageSummarizer.textToSummarize(from: msg.event) else { continue }
+        for target in pending {
             let summary: String
             do {
                 guard let value = try await services.modelSummary(
-                    text: text,
-                    preparation: preparation) else { continue }
+                    text: target.text,
+                    preparation: preparation) else {
+                    // Issue #1276 strict tier: nil is a FAILED summarization
+                    // (launch failure, empty reply, preamble-only reply) —
+                    // `MessageSummarizer.oneShotReply` swallows the error and
+                    // returns nil. Degrade to the truncation summary exactly
+                    // like the thrown path; never a silent unsummarized row
+                    // (#1279 found this branch skipping the fallback).
+                    DebugLog.agent("DaemonChatHost: model summary returned nil — degrading to truncation")
+                    Self.writeDefaultSummaries(chatID: chatID, pending: [target], store: store)
+                    continue
+                }
                 summary = value
             } catch {
-                DebugLog.agent("DaemonChatHost: model summary failed: \(error.localizedDescription)")
+                // Issue #1276 strict tier: a launch failure must DEGRADE to
+                // the default truncation summary — never leave the message
+                // unsummarized.
+                DebugLog.agent("DaemonChatHost: model summary failed — degrading to truncation: \(error.localizedDescription)")
+                Self.writeDefaultSummaries(chatID: chatID, pending: [target], store: store)
                 continue
             }
             do {
                 try store.updateMessageSummary(
-                    chatID: chatID, messageID: msg.id,
+                    chatID: chatID, cursor: target.cursor,
                     summary: summary, kind: .model)
-                // Keep the model's one-sentence result verbatim in chats.summary.
-                if msg.id == chatSummaryMessageID {
-                    try store.updateChatSummary(chatID: chatID, summary: summary)
-                }
             } catch {
                 DebugLog.store("DaemonChatHost.runModelSummarization: write failed: \(error)")
+            }
+        }
+    }
+
+    /// Drive Apple Intelligence summarization for the pending batch. Mirrors
+    /// `runModelSummarization` without the preparation and the release: the
+    /// AI turn runs in process, so there is no token to retire. The same
+    /// strict-tier degradation applies — a nil result (empty reply, error,
+    /// timeout) degrades to the truncation summary, never a silent
+    /// unsummarized row.
+    @MainActor
+    private static func runAppleIntelligenceSummarization(
+        chatID: ChatID,
+        pending: [(cursor: ChatTranscriptCursor, text: String)],
+        services: any AgentProviderServices,
+        store: GRDBWikiStore
+    ) async {
+        for target in pending {
+            guard let summary = await services.appleIntelligenceSummary(text: target.text) else {
+                DebugLog.agent("DaemonChatHost: Apple Intelligence summary returned nil — degrading to truncation")
+                Self.writeDefaultSummaries(chatID: chatID, pending: [target], store: store)
+                continue
+            }
+            do {
+                try store.updateMessageSummary(
+                    chatID: chatID, cursor: target.cursor,
+                    summary: summary, kind: .model)
+            } catch {
+                DebugLog.store("DaemonChatHost.runAppleIntelligenceSummarization: write failed: \(error)")
             }
         }
     }

@@ -11,6 +11,9 @@ public enum WikiStoreError: Error, CustomStringConvertible {
     case sourceNotFound(SourceID)
     case sourceVersionNotFound(SourceVersionID)
     case sourceMarkdownVersionNotFound(SourceMarkdownVersionID)
+    /// Thrown by `appendUserProcessedMarkdown` when the source has no
+    /// processed-markdown chain yet — extract/seed first, then rewrite.
+    case noProcessedMarkdown(SourceID)
     case deletionRestricted(ResourceDeletionRestriction)
     case invalidBookmarkRow(id: String, reason: String)
     case invalidRendererEventID(String)
@@ -34,6 +37,7 @@ public enum WikiStoreError: Error, CustomStringConvertible {
         case .sourceNotFound(let id): return "Source not found: \(id.rawValue)"
         case .sourceVersionNotFound(let id): return "Source version not found: \(id.rawValue)"
         case .sourceMarkdownVersionNotFound(let id): return "Source markdown version not found: \(id.rawValue)"
+        case .noProcessedMarkdown(let id): return "Source has no processed markdown yet: \(id.rawValue) — extract or seed it first"
         case .deletionRestricted(.provenance(let blockers)):
             return "Source deletion restricted by \(blockers.values.count) page version provenance reference(s)"
         case .invalidBookmarkRow(let id, let reason): return "Invalid bookmark row \(id): \(reason)"
@@ -277,7 +281,40 @@ public protocol WikiStore: AnyObject, Sendable {
     ) throws -> WikiPage
     func createPage(title: String, createdBy: String?, provenance: [PageVersionSourceInput]) throws -> WikiPage
     func updatePage(id: PageID, title: String, body: String, lastEditedBy: String?, provenance: [PageVersionSourceInput]) throws
+    /// Compatibility forwarder: deletes one page through the protected
+    /// contract with the `.preserve` link policy (ghost links stay, matching
+    /// bookmarks are always removed). Equivalent to
+    /// `deleteResources(ResourceDeletionRequest(target: .page(id), linkPolicy: .preserve))`.
     func deletePage(id: PageID) throws
+
+    // MARK: - Protected deletion (issue #219 hardening)
+    //
+    // The single deletion seam for supported writers (app model, `wikictl`).
+    // Impact discovery, provenance validation, optional link rewrites, bookmark
+    // cleanup, and target deletion all happen in ONE write transaction, and the
+    // post-commit event batch is emitted only after that transaction commits.
+    // The legacy single-target methods below forward through the `.preserve`
+    // request so no supported caller can bypass mandatory bookmark cleanup.
+
+    /// Compute what references the given targets — linking pages, matching
+    /// bookmarks, provenance blockers, and the incoming-link edge count — as
+    /// one deterministic snapshot. Throwing (never an empty result on failure):
+    /// a failed read surfaces as an error so callers cannot mistake it for
+    /// "nothing references these targets". Read-only; emits nothing.
+    func deletionImpact(for targets: Set<ResourceDeletionTarget>) throws -> DeletionImpact
+
+    /// Delete the request's targets under its link policy in ONE transaction:
+    /// rechecked impact → provenance validation (any blocker throws the typed
+    /// restriction before the first mutation) → optional `.unlink` rewrites →
+    /// mandatory bookmark-leaf removal (with sibling renumbering) → target-row
+    /// deletion with dependent graph cleanup. Any failure rolls back the whole
+    /// operation and emits nothing; a commit emits `.page .updated` per
+    /// rewritten page, `.bookmark .deleted` per removed bookmark, and one
+    /// `.deleted` event per target row that actually existed. Missing targets
+    /// are idempotent no-ops (stale matching bookmarks are still removed, but
+    /// no target-deleted event is emitted for a row that wasn't there).
+    @discardableResult
+    func deleteResources(_ request: ResourceDeletionRequest) throws -> ResourceDeletionResult
 
     /// Resolve a page *title* to its id, or nil if no page has that title.
     /// On duplicate titles, the lowest ULID (oldest page) wins. Used by
@@ -392,7 +429,11 @@ public protocol WikiStore: AnyObject, Sendable {
     /// resolves the active version for the source that owns it.
     func sourceVersion(id: SourceVersionID) throws -> SourceVersion?
 
-    /// Remove a source by id.
+    /// Compatibility forwarder: deletes one source through the protected
+    /// contract with the `.preserve` link policy (citations stay as ghost
+    /// links, matching bookmarks are always removed). Provenance blockers
+    /// still throw the typed deletion restriction before any write. Equivalent
+    /// to `deleteResources(ResourceDeletionRequest(target: .source(id), linkPolicy: .preserve))`.
     func deleteSource(id: SourceID) throws
 
     /// The page versions whose provenance cites `sourceID`, making the source
@@ -459,6 +500,37 @@ public protocol WikiStore: AnyObject, Sendable {
         detectionHints: ContentTypeDetectionHints,
         provenance: SourceProvenance?
     ) throws -> SourceVersion
+
+    /// Attach acquired bytes to an existing (byteless) source — the
+    /// attachment drain's one store write for any acquisition package. Creates
+    /// the content version (blob, hash, declared MIME, ext derived from the
+    /// MIME), refreshes the denormalized mirror (byte size, ext, MIME), and
+    /// populates the retained external-provenance columns plus the display
+    /// name in ONE transaction. Re-syncing identical bytes updates the
+    /// provenance columns but never creates a duplicate version (hash-diff,
+    /// the normal versioning path). `displayName` replaces the display name
+    /// only when non-nil.
+    @discardableResult
+    func attachAcquiredBytes(
+        sourceID: SourceID,
+        bytes: Data,
+        mimeType: String,
+        externalItemKey: String?,
+        externalItemTitle: String?,
+        displayName: String?
+    ) throws -> SourceVersion
+
+    /// Populate the retained external-provenance columns (and optionally the
+    /// display name) for a source whose product arrived as a Markdown
+    /// version instead of a blob. Each non-nil argument replaces; nil keeps
+    /// the stored value. The columns themselves keep their historical names
+    /// (compat contract); only the operation seam is acquisition-neutral.
+    func setAcquisitionProvenance(
+        sourceID: SourceID,
+        externalItemKey: String?,
+        externalItemTitle: String?,
+        displayName: String?
+    ) throws
 
     /// The latest (HEAD) version of the processed markdown for a source, or nil
     /// when no version exists yet (not yet seeded/extracted).
@@ -539,6 +611,19 @@ public protocol WikiStore: AnyObject, Sendable {
                                  origin: SourceMarkdownOrigin, note: String?,
                                  technique: String?) throws -> SourceMarkdownVersion
 
+    /// Append a `.user` processed-markdown version with compare-and-swap on
+    /// the active head: the write commits ONLY when the chain's current head
+    /// still equals `expectedHead`; otherwise it throws
+    /// `SourceMarkdownConflictError` before any row, ref, FTS, event, or
+    /// embedding change. This is the CAS-protected write seam for user/agent
+    /// processed-source rewrites (CLI `source edit-markdown`); the trusted
+    /// extraction/transcript writers keep using `appendProcessedMarkdown` /
+    /// `appendDerivedMarkdown`.
+    @discardableResult
+    func appendUserProcessedMarkdown(
+        sourceID: SourceID, content: String, expectedHead: SourceMarkdownVersionID
+    ) throws -> SourceMarkdownVersion
+
     /// Append typed, non-user derived markdown and make it the active source
     /// markdown head. This is the canonical persistence seam for extraction and
     /// transcript writers.
@@ -550,12 +635,15 @@ public protocol WikiStore: AnyObject, Sendable {
     ) throws -> SourceMarkdownVersion
 
     /// Append one package-backed result with exact immutable package identity.
-    /// This compatibility overload keeps package metadata in the tagged plan.
+    /// The origin is derived: `.extraction` for document packages, `.transcript`
+    /// for package transcripts (which REQUIRE `sourceVersionID` — the source's
+    /// immutable initial version).
     @discardableResult
     func appendInstalledPackageMarkdown(
         sourceID: SourceID, content: String,
         package: ExtractionInstalledPackageProducer,
-        toolVersion: String?, sourceVersionID: SourceVersionID?, note: String?
+        origin: SourceMarkdownOrigin, toolVersion: String?,
+        sourceVersionID: SourceVersionID?, note: String?
     ) throws -> SourceMarkdownVersion
 
     /// Revert to an older version by appending a NEW version whose content
@@ -599,6 +687,21 @@ public protocol WikiStore: AnyObject, Sendable {
     func pageVersionSources(versionID: PageVersionID) throws -> [PageVersionSource]
     func pageHeadSources(pageID: PageID) throws -> [PageVersionSource]
     func sourceReferencingPageVersions(sourceID: SourceID) throws -> [PageVersionID]
+
+    /// The distinct pages whose recorded page-version provenance cites any of
+    /// `sourceIDs` — the inverse of `sourceReferencingPageVersions(sourceID:)`
+    /// and the evidence seam for the queue Overview's "Outputs" section
+    /// (pages appear only because a citation edge says so). Bounded by
+    /// `limit` (a non-positive limit returns `[]`); when at least `limit`
+    /// pages match, the result is truncated at exactly `limit` rows —
+    /// callers must treat a full-page result as a floor (e.g. "200+"),
+    /// never a verified total. Ordered by title (case-insensitive) then
+    /// page id, with `nil`-title rows placed last, so the result is
+    /// deterministic for a given store state. Titles resolve from the live
+    /// `pages` row and are `nil` when the page row has vanished — callers
+    /// degrade honestly. Read-only: routes through `dbWriter.read` (usable
+    /// from read-only store handles) and emits no `ResourceChangeEvent`.
+    func pagesCitingSources(sourceIDs: [SourceID], limit: Int) throws -> [CitedPage]
 
     /// Typed read projections over existing source-markdown activity data.
     func extractionProvenance(markdownVersionID: SourceMarkdownVersionID) throws -> ExtractionProvenance?
@@ -922,14 +1025,40 @@ public protocol WikiStore: AnyObject, Sendable {
     /// chat has `id`.
     func renameChat(id: ChatID, to title: String) throws
 
+    /// Set a chat's title ONLY when its current title is empty, in one
+    /// conditional `UPDATE` (`WHERE id = ? AND title = ''`). The first send
+    /// titles an untouched empty chat through this without racing a concurrent
+    /// manual rename into a stale overwrite. Bumps `updated_at` and refreshes
+    /// the `chat_search` sidecar when the title is written.
+    ///
+    /// Returns `true` when the title was written (exactly one `.chat .updated`
+    /// event is emitted) and `false` when the chat exists with a nonempty
+    /// title (no event). Throws `.chatNotFound` when no chat has `id`.
+    @discardableResult
+    func setChatTitleIfEmpty(chatID: ChatID, title: String) throws -> Bool
+
+    /// Replace a chat's title ONLY when it still equals `expectedTitle`, in
+    /// one conditional `UPDATE` (`WHERE id = ? AND title = ?`). The
+    /// provisional→final upgrade: the first send writes a provisional title,
+    /// and the summarizer's generated title replaces exactly that text — a
+    /// manual rename (any other current title) makes the update match no row
+    /// and the rename wins. Bumps `updated_at` and refreshes the
+    /// `chat_search` sidecar when the title is written.
+    ///
+    /// Returns `true` when the title was written (exactly one `.chat .updated`
+    /// event is emitted) and `false` when the current title differs (no
+    /// event). Throws `.chatNotFound` when no chat has `id`.
+    @discardableResult
+    func setChatTitleIf(
+        chatID: ChatID, expectedTitle: String, title: String
+    ) throws -> Bool
+
     /// Delete a chat. `ON DELETE CASCADE` removes its messages. No error if
     /// `id` doesn't exist.
     func deleteChat(id: ChatID) throws
 
     /// Write the one-line summary of the model's first response (issue #411),
     /// bumping `updated_at`. Throws `.notFound` if no chat has `id`.
-    func updateChatSummary(chatID: ChatID, summary: String) throws
-
     /// Write or clear the ACP session ID for resume (#830). Pass `nil` to
     /// clear (terminal teardown / permanent resume failure). Bumps
     /// `updated_at`.
@@ -952,13 +1081,15 @@ public protocol WikiStore: AnyObject, Sendable {
     /// One chat summary by id. Throws `.notFound` if no chat has `id`.
     func getChat(id: ChatID) throws -> ChatSummary
 
-    /// Write the cached one-line summary for a single assistant message
-    /// (chat-summary plan §3.5). The chat row is the change-emission resource
-    /// (there is no `.message` resource kind); emits `.chat .updated` with the
-    /// chat's id. Idempotent at the SQL level; the caller short-circuits on a
-    /// non-nil cached summary to enforce compute-once (AC.6).
+    /// Write the cached one-line summary for a single transcript item
+    /// (chat-summary plan §3.5; v54, issue #1266 — the summary lives on the
+    /// durable `chat_transcript_items` row, keyed by cursor). The chat row is
+    /// the change-emission resource (there is no `.message` resource kind);
+    /// emits `.chat .updated` with the chat's id. Idempotent at the SQL level;
+    /// the caller short-circuits on a non-nil cached summary to enforce
+    /// compute-once (AC.6).
     func updateMessageSummary(
-        chatID: ChatID, messageID: PageID, summary: String, kind: ChatMessageSummaryKind
+        chatID: ChatID, cursor: ChatTranscriptCursor, summary: String, kind: ChatMessageSummaryKind
     ) throws
 
     /// Upsert a streaming assistant row under a stable draft handle (#826).

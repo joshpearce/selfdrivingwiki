@@ -52,14 +52,30 @@ public protocol AgentBackend: Sendable {
     /// cancellation path (cancelling the `for await` consumer) also bridges
     /// here via the stream's `onTermination`.
     func cancel(_ session: SessionHandle) async
+
+    /// Process-level shutdown for owners that CACHE a backend across
+    /// operations (issue #1276): terminate the underlying subprocess without
+    /// needing a session handle. Idempotent, and safe on a backend that never
+    /// started. Backend owners MUST call this when retiring a cached backend —
+    /// dropping the last reference does NOT terminate any process, and
+    /// `cancel(_:)` is session-scoped. `AgentProviderRuntime` calls it during
+    /// summarizer snapshot release, AFTER active summary/title leases drain
+    /// and BEFORE the backend's scratch directory is removed.
+    ///
+    /// A protocol REQUIREMENT (not an extension default) on purpose: a new
+    /// conformer that forgets the real termination path fails to compile
+    /// instead of silently leaking a child process.
+    func shutdown() async
 }
 
 /// Abstract per-mode/per-op configuration; each backend interprets it.
 ///
 /// The launcher resolves app-level concerns (scratch dir, bundled `wikictl`
 /// path, log layout) and passes them in here; `ACPBackend` reads `model`/
-/// `providerHints` for routing and `cli` for the env vars it needs to spawn
-/// (`WIKI_DB`/`WIKICTL`/`PATH`) — see `CLIProfile`.
+/// `providerHints` for routing and `cli`/`runContext` for the spawn
+/// environment (`WIKI_DB`/`WIKICTL`/`PATH` are CONVENIENCES exported from
+/// `runContext` — adapters may drop them; correctness flows from the absolute
+/// paths injected into the operation prompt — see `CLIProfile`).
 /// The execution access the application authorizes for an ACP session.
 ///
 /// This is distinct from `PermissionPolicy`: it controls an agent's own
@@ -93,6 +109,40 @@ public struct BackendProfile: Sendable {
     /// files for post-hoc debugging — the verbose companion to the lightweight
     /// `run.jsonl`. nil = debug logging disabled.
     public var debugLogURL: URL?
+    /// The resolved seatbelt confinement for this run (issue #1251). When
+    /// non-nil, `ACPBackend.startProcess` wraps the agent spawn with
+    /// `sandbox-exec` (writes fenced to the allowed subtree set; the resolved
+    /// `pdf2md` script exec/read-denied) and FAILS CLOSED when
+    /// `/usr/bin/sandbox-exec` is unusable.
+    ///
+    /// Every production constructor that can start an LLM child process MUST
+    /// state its decision with an explicit non-nil `sandbox:` — a read-only
+    /// `LLMSandboxScratch.sandbox` for extraction, summarization, and
+    /// provider-model probes (issue #1276), or the launcher-resolved write
+    /// invocation for Ingest/Edit/chat. Explicit `sandbox: nil` is reserved
+    /// for profiles that never spawn a production LLM process (fake backends,
+    /// low-level tests); `LLMSpawnSandboxExhaustivenessTests` audits the
+    /// source and fails when a production constructor omits or nils it.
+    public var sandbox: SandboxProfile.SandboxInvocation?
+    /// The typed per-run capability context (`AgentRunContext`): canonical
+    /// scratch, scratch-local temp roots, typed wiki id, trusted absolute
+    /// `wikictl` path, and the effective PATH. The launcher sets it on every
+    /// operation profile; `ACPBackend` exports its protected environment keys
+    /// (over provider hints) and points the session cwd at the canonical
+    /// scratch. nil only on legacy/internal profiles that never spawn an
+    /// operation agent (e.g. the message summarizer, extraction clients).
+    public var runContext: AgentRunContext?
+    /// The snapshot-owned package-runner execution-staging directory
+    /// (issue #1279) — TRUSTED launch data, deliberately NOT a `providerHints`
+    /// entry, so untrusted provider configuration can never select or replace
+    /// it. Present ONLY on strict summarizer profiles whose configured command
+    /// is JS-adapter-shaped: for an EFFECTIVE `bun x` launch the plan exports
+    /// this directory as the child's `TMPDIR` (bun stages + execs adapters
+    /// under its temp root; the strict scratch stays W^X). A canonicalization
+    /// that declines leaves the lease unused — the plan keeps the scratch
+    /// temp — and snapshot teardown removes it. nil everywhere else
+    /// (extraction, probes, chat: `<scratch>/.tmp` behavior unchanged).
+    public var packageRunnerTempURL: URL?
 
     public init(
         model: String? = nil,
@@ -101,7 +151,10 @@ public struct BackendProfile: Sendable {
         isReadOnly: Bool = false,
         executionAccess: AgentExecutionAccess = .standard,
         cli: CLIProfile? = nil,
-        debugLogURL: URL? = nil
+        debugLogURL: URL? = nil,
+        sandbox: SandboxProfile.SandboxInvocation? = nil,
+        runContext: AgentRunContext? = nil,
+        packageRunnerTempURL: URL? = nil
     ) {
         self.model = model
         self.providerHints = providerHints
@@ -110,6 +163,9 @@ public struct BackendProfile: Sendable {
         self.executionAccess = executionAccess
         self.cli = cli
         self.debugLogURL = debugLogURL
+        self.sandbox = sandbox
+        self.runContext = runContext
+        self.packageRunnerTempURL = packageRunnerTempURL
     }
 }
 

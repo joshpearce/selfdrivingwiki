@@ -1,3 +1,5 @@
+// pattern: Imperative Shell
+
 import AppKit
 import SwiftUI
 import WikiFSCore
@@ -9,84 +11,136 @@ import WikiFSCore
 /// This is the WKWebView (AppKit) counterpart to the retired
 /// `WikiLinkContextMenu` (which returned Textual `LinkMenuItem`s). It is
 /// Textual-free and runs on the main actor (AppKit's context-menu path). The
-/// menu items' closures capture `store` / `fileProvider`; because both are
+/// menu items' closures capture ``WikiLinkMenuCapabilities`` — opaque closures
+/// the HOST binds to its store and facade (``WikiLinkMenuCapabilities/full``
+/// is the only place menu construction meets `WikiStoreModel`) — so both the
+/// reader and the chat transcript build menus from one seam. Because both are
 /// `@MainActor`-isolated and the actions fire on the main thread, no isolation
 /// boundary is crossed.
 @MainActor
 enum WikiLinkMenuNSItems {
 
+    /// Resolve a canonical wiki URL to its typed navigation target. Mirrors the
+    /// click router's id-first discipline (`selectPage(byID:)` & friends): the
+    /// `?id=<ULID>` query wins when it names a loaded row — rename-stable, so
+    /// a menu action keeps working after a rename leaves the link's display
+    /// alias stale (issue #1315). Only when the URL carries no id (a legacy
+    /// `?title=`-only link) or names a row that no longer loads does the
+    /// title/display-name lookup decide — the pre-#1315 behavior.
+    ///
+    /// Used by the reader's context menu AND the chat transcript's
+    /// `.openWikiLinkInBackground` consumers, so both surfaces resolve the same
+    /// link the same way.
+    static func selection(for url: URL, store: WikiStoreModel) -> WikiSelection? {
+        let target = WikiLinkMarkdown.target(from: url) ?? ""
+        switch WikiLinkMarkdown.resolvedKind(from: url) {
+        case .page:
+            if let id = WikiLinkMarkdown.id(from: url),
+               store.summaries.contains(where: { $0.id == id }) {
+                return .page(id)
+            }
+            return store.pageID(forTitle: target).map(WikiSelection.page)
+        case .source:
+            if let id = WikiLinkMarkdown.sourceID(from: url),
+               store.sources.contains(where: { $0.id == id }) {
+                return .source(id)
+            }
+            return store.sourceID(forDisplayName: target).map(WikiSelection.source)
+        case .chat:
+            let chatID = WikiLinkMarkdown.id(from: url).map { ChatID(rawValue: $0.rawValue) }
+            if let chatID, store.chats.contains(where: { $0.id == chatID }) {
+                return .chat(chatID)
+            }
+            return store.chatID(forTitle: target).map(WikiSelection.chat)
+        case nil:
+            return nil
+        }
+    }
+
     static func items(
         for url: URL,
         actions: [WikiLinkAction]? = nil,
-        store: WikiStoreModel,
-        fileProvider: FileProviderFacade?,
-        addURL: (@MainActor @Sendable (String) -> Void)? = nil,
-        addBookmark: (@MainActor @Sendable (BookmarkTargetPickerContext) -> Void)? = nil
+        capabilities: WikiLinkMenuCapabilities,
+        anchorView: NSView? = nil,
+        anchorRect: NSRect = .zero
     ) -> [NSMenuItem] {
         var items: [NSMenuItem] = []
+        var shareIndex: Int? = nil
         for action in actions ?? WikiLinkMenuBuilder.actions(for: url) {
             switch action {
             case .addAsSource:
                 // Opens the "Add from URL" sheet pre-filled with the URL, the same
-                // path the toolbar button takes. Omitted when no handler is wired
-                // (e.g. SwiftUI previews), mirroring how `.copyFilePath` omits
-                // itself without a File Provider spike.
-                guard let addURL else { continue }
+                // path the toolbar button takes. Omitted when the host cannot
+                // present the sheet.
+                guard let addURL = capabilities.addURL else { continue }
                 items.append(.wikiItem("Add as Source") { addURL(url.absoluteString) })
             case .addBookmark:
                 // Resolved internal wiki link — file the target page/source into a
-                // bookmark folder. The target already exists, so we resolve its id
-                // (same lookup as `.openInBackgroundTab`) and hand a
-                // `BookmarkTargetPickerContext` to the handler, which presents the
-                // folder picker. Omitted when no handler is wired or the link no
+                // bookmark folder. The target must resolve here (same lookup as
+                // `.openInBackgroundTab`) so the picker receives a typed target.
+                // Omitted when the host cannot present the picker or the link no
                 // longer resolves (e.g. the page was just deleted). Issue #188.
-                guard let addBookmark else { continue }
-                let kind = WikiLinkMarkdown.resolvedKind(from: url)
-                let target = WikiLinkMarkdown.target(from: url) ?? ""
-                let ctx: BookmarkTargetPickerContext?
-                switch kind {
-                case .page:
-                    guard let id = store.pageID(forTitle: target) else { continue }
-                    ctx = BookmarkTargetPickerContext(targets: .pages([id]))
-                case .source:
-                    guard let id = store.sourceID(forDisplayName: target) else { continue }
-                    ctx = BookmarkTargetPickerContext(targets: .sources([id]))
-                case .chat:
-                    guard let id = store.chatID(forTitle: target) else { continue }
-                    ctx = BookmarkTargetPickerContext(targets: .chats([id]))
-                case nil:
-                    continue
+                guard let addBookmark = capabilities.addBookmark else { continue }
+                let ctx: BookmarkTargetPickerContext
+                switch capabilities.selection?(url) {
+                case .page(let id): ctx = BookmarkTargetPickerContext(targets: .pages([id]))
+                case .source(let id): ctx = BookmarkTargetPickerContext(targets: .sources([id]))
+                case .chat(let id): ctx = BookmarkTargetPickerContext(targets: .chats([id]))
+                default: continue
                 }
-                guard let ctx else { continue }
                 items.append(.wikiItem("Add Bookmark…") { addBookmark(ctx) })
             case .suggest:
+                guard let similarPages = capabilities.similarPages,
+                      let navigateToPage = capabilities.navigateToPage else { continue }
                 items.append(
                     similarPagesItem(
                         title: "Suggest…",
                         query: WikiLinkMarkdown.target(from: url) ?? "",
-                        store: store))
+                        search: similarPages,
+                        navigate: navigateToPage))
             case .findSimilar:
+                guard let similarPages = capabilities.similarPages,
+                      let navigateToPage = capabilities.navigateToPage else { continue }
                 items.append(
                     similarPagesItem(
                         title: "Find Similar…",
                         query: WikiLinkMarkdown.target(from: url) ?? "",
-                        store: store))
+                        search: similarPages,
+                        navigate: navigateToPage))
             case .openInBackgroundTab:
-                let kind = WikiLinkMarkdown.resolvedKind(from: url)
-                let target = WikiLinkMarkdown.target(from: url) ?? ""
+                // Presence needs the link to resolve NOW (a dead link omits
+                // the item); the action RE-RESOLVES at click time, so a
+                // target deleted between right-click and click no-ops instead
+                // of opening a dead tab.
+                guard let openInBackground = capabilities.openInBackground,
+                      capabilities.selection?(url) != nil else { continue }
                 items.append(.wikiItem("Open in Background") {
-                    switch kind {
-                    case .page:
-                        if let id = store.pageID(forTitle: target) { store.openTabInBackground(.page(id)) }
-                    case .source:
-                        if let id = store.sourceID(forDisplayName: target) { store.openTabInBackground(.source(id)) }
-                    case .chat:
-                        if let id = store.chatID(forTitle: target) { store.openTabInBackground(.chat(id)) }
-                    case nil: break
-                    }
+                    guard let selection = capabilities.selection?(url) else { return }
+                    openInBackground(selection)
                 })
+            case .share:
+                // Share heads the bottom group. Presence needs the host's
+                // presenter AND anchor facts; the File Provider resolution
+                // itself happens at CLICK time inside the presenter — never
+                // here, so an unclicked Share… does no work (the #925 rule,
+                // one branch over). Chat targets resolve to nothing and the
+                // click is a deliberate no-op (reader parity).
+                guard let sharePresent = capabilities.sharePresent,
+                      let anchorView else { continue }
+                shareIndex = items.count
+                let shareItem = NSMenuItem.wikiItem("Share…") {
+                    sharePresent(url, anchorView, anchorRect)
+                }
+                shareItem.image = NSImage(systemSymbolName: "square.and.arrow.up",
+                                          accessibilityDescription: "Share")
+                items.append(shareItem)
             }
-            }
+        }
+        // Keep the reader's visual grouping: Share… leads the bottom group,
+        // separated from the actions under it.
+        if let shareIndex, shareIndex + 1 < items.count {
+            items.insert(NSMenuItem.separator(), at: shareIndex + 1)
+        }
         return items
     }
 
@@ -99,30 +153,14 @@ enum WikiLinkMenuNSItems {
     /// surfaces Tantivy-BM25-fused results — gaining the indexer's `fuzzyFields`
     /// edit-distance-1 matches (already configured at
     /// `TantivyIndexer.swift:108-111`) for free, and surviving #634's FTS5 drop
-    /// without regression.
+    /// without regression. The production `search`/`navigate` closures arrive
+    /// through ``WikiLinkMenuCapabilities`` (`.full` binds them to the host's
+    /// store).
     ///
     /// #925: that search is now `async`, so this returns immediately with a
     /// disabled "Searching…" row and a ``SimilarPagesMenuLoader`` delegate that
     /// fills the submenu in when the user actually opens it. Nothing runs at
     /// right-click time; nothing blocks the main actor.
-    private static func similarPagesItem(
-        title: String, query: String, store: WikiStoreModel
-    ) -> NSMenuItem {
-        similarPagesItem(
-            title: title,
-            query: query,
-            search: { query, limit in await store.searchSimilarResolvingTantivy(query: query, limit: limit) },
-            navigate: { page in
-                // Prefer the rename-stable id path (#922 strong types); fall back
-                // to the title lookup when the summary list hasn't reloaded since
-                // the search, which is the only case `selectPage(byID:)` rejects.
-                if !store.selectPage(byID: page.id) { store.selectPage(byTitle: page.title) }
-            })
-    }
-
-    /// Seam-injected form of ``similarPagesItem(title:query:store:)`` — the
-    /// production overload wires `store`; tests pass a controlled `search` to
-    /// drive the lazy submenu deterministically.
     static func similarPagesItem(
         title: String,
         query: String,

@@ -77,11 +77,50 @@ public extension ExtractorRouteID {
         kind: .docx,
         mimeTypeString: "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
+    /// The RSS podcast transcript route. The synthetic `audio/podcast`
+    /// source MIME is the route dimension for byteless `.podcast` sources;
+    /// the input itself is the source URL (protocol revision 3).
+    static let canonicalPodcastTranscript = ExtractorRouteID.validatedCanonical(
+        kind: .podcastTranscript,
+        mimeTypeString: "audio/podcast")
+
+    /// The Apple Podcasts transcript route. The synthetic `audio/apple-podcast`
+    /// source MIME is the route dimension for byteless `.applePodcast`
+    /// sources; the input itself is the episode page URL (protocol
+    /// revision 3). Kept separate from the RSS route so each source class
+    /// resolves its own package selection.
+    static let canonicalApplePodcastTranscript = ExtractorRouteID.validatedCanonical(
+        kind: .applePodcastTranscript,
+        mimeTypeString: "audio/apple-podcast")
+
+    /// The YouTube transcript route. The synthetic `video/youtube` source
+    /// MIME is the route dimension for byteless `.youtube` sources; the
+    /// input itself is the video URL (protocol revision 3). Kept separate
+    /// from the podcast routes so each source class resolves its own
+    /// package selection.
+    static let canonicalYouTubeTranscript = ExtractorRouteID.validatedCanonical(
+        kind: .youtubeTranscript,
+        mimeTypeString: "video/youtube")
+
+    /// The Zotero attachment route. The synthetic `application/zotero`
+    /// source MIME is the route dimension for byteless `.zotero` sources;
+    /// the input itself is the attachment file URL (protocol revision 3+
+    /// transport; the package speaks revision 4 results).
+    static let canonicalZotero = ExtractorRouteID.validatedCanonical(
+        kind: .zotero,
+        mimeTypeString: "application/zotero")
+
     /// True for the routes host execution supports today. Future package
     /// registrations may declare other MIME types; displaying and resolving them
     /// is the route table's job, while execution adapters for new kinds remain
     /// separate work.
-    var isCanonical: Bool { self == .canonicalPDF || self == .canonicalHTML || self == .canonicalDOCX }
+    var isCanonical: Bool {
+        self == .canonicalPDF || self == .canonicalHTML || self == .canonicalDOCX
+            || self == .canonicalPodcastTranscript
+            || self == .canonicalApplePodcastTranscript
+            || self == .canonicalYouTubeTranscript
+            || self == .canonicalZotero
+    }
 
     private static func validatedCanonical(kind: ExtractorKind, mimeTypeString: String) -> ExtractorRouteID {
         guard let route = ExtractorRouteID(normalizing: kind, mimeTypeString: mimeTypeString) else {

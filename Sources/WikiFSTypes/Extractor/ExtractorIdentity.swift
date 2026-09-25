@@ -253,8 +253,21 @@ public struct ExtractorProtocolRevision: RawRepresentable, Codable, Hashable, Se
     /// requests keep their exact old shape and can neither declare nor
     /// receive credentials.
     public static let v2 = Self(validatedRawValue: 2)
+    /// Revision 3 adds the `remote-url` operation input transport: the request
+    /// carries one normalized HTTP or HTTPS source URL instead of staged input
+    /// bytes. Revisions 1 and 2 keep their exact old wire shape; a v1/v2
+    /// request can neither declare nor receive a remote URL.
+    public static let v3 = Self(validatedRawValue: 3)
+    /// Revision 4 adds two optional result-frame fields: `resultMIMEType`
+    /// (the output file carries source bytes with that MIME instead of the
+    /// Markdown product) and `articleMetadata.identifier` (an external
+    /// identity for provenance, e.g. a Zotero parent item key). Requests keep
+    /// their exact revision-3 wire shape; a revision-4 request is byte-for-byte
+    /// a revision-3 request. Older hosts fail closed: their strict result
+    /// decoders reject frames carrying the new fields.
+    public static let v4 = Self(validatedRawValue: 4)
     public init?(rawValue: Int) {
-        guard rawValue == 1 || rawValue == 2 else { return nil }
+        guard rawValue == 1 || rawValue == 2 || rawValue == 3 || rawValue == 4 else { return nil }
         self.rawValue = rawValue
     }
     private init(validatedRawValue: Int) { self.rawValue = validatedRawValue }
@@ -274,11 +287,23 @@ public struct ExtractorManifestRevision: RawRepresentable, Codable, Hashable, Se
     /// declarations (issue #1159). Revision 1 validation, canonical JSON,
     /// and package digests are preserved byte-for-byte.
     public static let v2 = Self(validatedRawValue: 2)
+    /// Revision 3 adds the registration-scoped `sync` declaration
+    /// (package-declared acquisition syncability): a registration may
+    /// declare its config sidecar, URL template, and fields so a generic
+    /// host engine can sync it with no package-specific host code.
+    /// Revisions 1 and 2 validation, canonical JSON, and package digests
+    /// are preserved byte-for-byte.
+    public static let v3 = Self(validatedRawValue: 3)
     public init?(rawValue: Int) {
-        guard rawValue == 1 || rawValue == 2 else { return nil }
+        guard rawValue == 1 || rawValue == 2 || rawValue == 3 else { return nil }
         self.rawValue = rawValue
     }
     private init(validatedRawValue: Int) { self.rawValue = validatedRawValue }
+    /// The highest manifest revision THIS build understands. The catalog
+    /// reader uses it to skip — not fail on — records persisted by a newer
+    /// host, so a mixed-version machine degrades to "record invisible"
+    /// instead of an unreadable catalog.
+    public static var maximumKnownRawValue: Int { v3.rawValue }
     public init(from decoder: any Decoder) throws {
         let rawValue = try Int(from: decoder)
         guard let value = Self(rawValue: rawValue) else { throw ExtractorValidationError.invalidRevision(rawValue) }
@@ -299,6 +324,16 @@ enum ExtractorIdentifierRules {
         guard let first = value.first, first.isASCII, first.isLetter, first.isLowercase,
               value.count <= 64, value.last != "-" else { return false }
         return value.allSatisfy { $0.isASCII && ($0.isLowercase || $0.isNumber || $0 == "-") }
+    }
+
+    /// Sync config field names: camelCase sidecar keys (`libraryID`,
+    /// `attachments`). 1–64 ASCII alphanumerics starting with a letter —
+    /// braces are excluded so a field name can never hide inside a URL
+    /// template's placeholder syntax.
+    static func isSyncFieldName(_ value: String) -> Bool {
+        guard let first = value.first, first.isASCII, first.isLetter,
+              value.count <= ExtractorHostLimits.maximumSyncFieldNameByteCount else { return false }
+        return value.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) }
     }
 
     static func strictUInt(_ value: Substring) -> UInt? {

@@ -14,6 +14,8 @@ struct ExtractorKindNeutralityContractTests {
         "Sources/WikiFSEngine",
         "Sources/WikiFS",
         "Sources/wikid",
+        "Sources/WikiCtlCore",
+        "Sources/wikictl",
     ]
 
     private static let requiredTenetMarkers = [
@@ -126,6 +128,179 @@ struct ExtractorKindNeutralityContractTests {
             #expect(
                 contents.contains(marker),
                 "\(path) lost the extractor-kind-neutrality tenet marker")
+        }
+    }
+
+    /// The podcast transcript registration is DATA, not host policy: no
+    /// source branch may compare against `.podcastTranscript` for selection,
+    /// and the reviewed package ID literal may appear only where reviewed
+    /// identities are declared — never in a selection or execution branch.
+    /// Registration-driven route data (default-routes.json) and the typed
+    /// prepare seam stay allowed, mirroring the `.docx` rules above.
+    @Test func podcastRegistrationIsDataDriven() throws {
+        let root = try Self.locateRepositoryRoot()
+        let files = try Self.sourceFiles(under: root)
+        #expect(files.isEmpty == false, "no host sources found to scan")
+
+        // No kind comparison for the podcast kind.
+        let comparison = try NSRegularExpression(
+            pattern: #"([=!]=)\s*\.podcastTranscript\b"#)
+        // No package-ID policy literal outside the reviewed-identity table.
+        let packageIDLiteral = try NSRegularExpression(
+            pattern: #"org\.selfdrivingwiki\.podcast-transcript"#)
+        let allowedPackageIDFiles: Set<String> = ["ReviewedExtractorPackages.swift"]
+
+        for file in files {
+            var contents = try String(contentsOf: file, encoding: .utf8)
+            // Identifiers only: strip comments first so prose cannot trip
+            // the scan (mirrors forbidsKindNamedPolicySeams).
+            contents = contents.replacingOccurrences(
+                of: #"//.*"#,
+                with: "",
+                options: .regularExpression)
+            let range = NSRange(contents.startIndex..., in: contents)
+
+            let kindMatches = comparison.matches(in: contents, range: range)
+            #expect(
+                kindMatches.isEmpty,
+                "\(file.lastPathComponent) compares against the .podcastTranscript extractor kind; policy must come from registration data")
+
+            let idMatches = packageIDLiteral.matches(in: contents, range: range)
+            if allowedPackageIDFiles.contains(file.lastPathComponent) == false {
+                #expect(
+                    idMatches.isEmpty,
+                    "\(file.lastPathComponent) hard-codes the reviewed podcast package ID; eligibility must come from registration data")
+            }
+        }
+    }
+
+    /// The Apple Podcasts registration is DATA, not host policy: no source
+    /// branch may compare against `.applePodcastTranscript` for selection,
+    /// and the reviewed Apple package ID literal may appear only where
+    /// reviewed identities are declared. The exact-revision support grant
+    /// (ReviewedApplePodcastSupport) compares complete REVISION identities,
+    /// which is the reviewed-only admission seam this packaging introduces —
+    /// never a kind, MIME, or capability branch.
+    @Test func applePodcastRegistrationIsDataDriven() throws {
+        let root = try Self.locateRepositoryRoot()
+        let files = try Self.sourceFiles(under: root)
+        #expect(files.isEmpty == false, "no host sources found to scan")
+
+        // No kind comparison for the Apple kind.
+        let comparison = try NSRegularExpression(
+            pattern: #"([=!]=)\s*\.applePodcastTranscript\b"#)
+        // No package-ID policy literal outside the reviewed-identity table.
+        let packageIDLiteral = try NSRegularExpression(
+            pattern: #"org\.selfdrivingwiki\.apple-podcast-transcript"#)
+        let allowedPackageIDFiles: Set<String> = ["ReviewedExtractorPackages.swift"]
+
+        for file in files {
+            var contents = try String(contentsOf: file, encoding: .utf8)
+            contents = contents.replacingOccurrences(
+                of: #"//.*"#,
+                with: "",
+                options: .regularExpression)
+            let range = NSRange(contents.startIndex..., in: contents)
+
+            let kindMatches = comparison.matches(in: contents, range: range)
+            #expect(
+                kindMatches.isEmpty,
+                "\(file.lastPathComponent) compares against the .applePodcastTranscript extractor kind; policy must come from registration data")
+
+            let idMatches = packageIDLiteral.matches(in: contents, range: range)
+            if allowedPackageIDFiles.contains(file.lastPathComponent) == false {
+                #expect(
+                    idMatches.isEmpty,
+                    "\(file.lastPathComponent) hard-codes the reviewed Apple package ID; eligibility must come from registration data")
+            }
+        }
+    }
+
+    /// The YouTube registration is DATA, not host policy: no source branch
+    /// may compare against `.youtubeTranscript` for selection, and the
+    /// reviewed YouTube package ID literal may appear only where reviewed
+    /// identities are declared. The typed prepare seam and exhaustive
+    /// adapter dispatch stay allowed, mirroring the podcast rules above.
+    @Test func youtubeRegistrationIsDataDriven() throws {
+        let root = try Self.locateRepositoryRoot()
+        let files = try Self.sourceFiles(under: root)
+        #expect(files.isEmpty == false, "no host sources found to scan")
+
+        // No kind comparison for the YouTube kind.
+        let comparison = try NSRegularExpression(
+            pattern: #"([=!]=)\s*\.youtubeTranscript\b"#)
+        // No package-ID policy literal outside the reviewed-identity table.
+        let packageIDLiteral = try NSRegularExpression(
+            pattern: #"org\.selfdrivingwiki\.youtube-transcript"#)
+        let allowedPackageIDFiles: Set<String> = ["ReviewedExtractorPackages.swift"]
+
+        for file in files {
+            var contents = try String(contentsOf: file, encoding: .utf8)
+            contents = contents.replacingOccurrences(
+                of: #"//.*"#,
+                with: "",
+                options: .regularExpression)
+            let range = NSRange(contents.startIndex..., in: contents)
+
+            let kindMatches = comparison.matches(in: contents, range: range)
+            #expect(
+                kindMatches.isEmpty,
+                "\(file.lastPathComponent) compares against the .youtubeTranscript extractor kind; policy must come from registration data")
+
+            let idMatches = packageIDLiteral.matches(in: contents, range: range)
+            if allowedPackageIDFiles.contains(file.lastPathComponent) == false {
+                #expect(
+                    idMatches.isEmpty,
+                    "\(file.lastPathComponent) hard-codes the reviewed YouTube package ID; eligibility must come from registration data")
+            }
+        }
+    }
+
+    /// The Zotero registration is DATA, not host policy — the contract the
+    /// package-declared acquisition sync leans on. No source branch may
+    /// compare against `.zotero` for selection, and the reviewed package ID
+    /// literal may appear only where reviewed identities are declared. The
+    /// sync path (discovery, engine, sidecar) contains neither: syncability
+    /// comes from the registration's `sync` declaration, and the
+    /// `Sources/WikiCtlCore` + `Sources/wikictl` roots are scanned so the
+    /// discovery path and its dispatch file are covered. The typed prepare
+    /// seam, the synthetic `application/zotero` MIME mapping, and the
+    /// origin-provider display row stay allowed — operation shapes and
+    /// kind-to-value tables, not policy.
+    @Test func zoteroRegistrationIsDataDriven() throws {
+        let root = try Self.locateRepositoryRoot()
+        let files = try Self.sourceFiles(under: root)
+        #expect(files.isEmpty == false, "no host sources found to scan")
+
+        // No kind comparison for the zotero kind.
+        let comparison = try NSRegularExpression(
+            pattern: #"([=!]=)\s*\.zotero\b"#)
+        // No package-ID policy literal outside the reviewed-identity table.
+        let packageIDLiteral = try NSRegularExpression(
+            pattern: #"org\.selfdrivingwiki\.zotero"#)
+        let allowedPackageIDFiles: Set<String> = ["ReviewedExtractorPackages.swift"]
+
+        for file in files {
+            var contents = try String(contentsOf: file, encoding: .utf8)
+            // Identifiers only: strip comments first so prose cannot trip
+            // the scan (mirrors the other per-kind scans).
+            contents = contents.replacingOccurrences(
+                of: #"//.*"#,
+                with: "",
+                options: .regularExpression)
+            let range = NSRange(contents.startIndex..., in: contents)
+
+            let kindMatches = comparison.matches(in: contents, range: range)
+            #expect(
+                kindMatches.isEmpty,
+                "\(file.lastPathComponent) compares against the .zotero extractor kind; policy must come from registration data")
+
+            let idMatches = packageIDLiteral.matches(in: contents, range: range)
+            if allowedPackageIDFiles.contains(file.lastPathComponent) == false {
+                #expect(
+                    idMatches.isEmpty,
+                    "\(file.lastPathComponent) hard-codes the reviewed Zotero package ID; eligibility must come from registration data")
+            }
         }
     }
 }

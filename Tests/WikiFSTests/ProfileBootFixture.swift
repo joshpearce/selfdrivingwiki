@@ -94,14 +94,6 @@ enum ProfileBootFixture {
                 await recorder.record()
             }
         } : nil
-        let zoteroClientProviderFactory: ProcessPluginCatalogFactories.ZoteroClientProviderFactory? = includeAppServices ? { @Sendable in
-            ProcessRuntimeLease(service: ZoteroClientProvider(
-                readConfiguration: { ZoteroConfig() },
-                readCredential: { nil },
-                makeFetcher: { URLSessionZoteroFetcher() })) {
-                    await recorder.record()
-                }
-        } : nil
         return try ProcessPluginCatalog.build(factories: ProcessPluginCatalogFactories(
             compositionInputs: fixtureProcessInputs(
                 queueAssembly: queueFactory,
@@ -110,8 +102,7 @@ enum ProfileBootFixture {
             makeEmbeddings: {
                 ProcessRuntimeLease(service: .unavailable(identifier: "unavailable-fixture"), dispose: {})
             },
-            makeURLFetchProvider: urlFetchProviderFactory,
-            makeZoteroClientProvider: zoteroClientProviderFactory))
+            makeURLFetchProvider: urlFetchProviderFactory))
     }
 
     static func processEntries(includeAppServices: Bool) throws -> [Entry] {
@@ -306,14 +297,28 @@ private struct ProfileQueueExtractionProvider: QueueExtractionProvider {
         backendOverride: ExtractionBackend?
     ) async throws -> ExtractionResolution? { nil }
 
-    func persistExtraction(
+    func persistBytesExtraction(
         wikiID: WikiID,
         sourceID: SourceID,
-        markdown: String,
-        backend: ExtractionBackend,
-        modelVersion: String?,
-        technique: String?
-    ) async throws {}
+        resolution: BytesExtractionResolution,
+        markdown: String
+    ) async throws -> QueueExtractionOutputReference? { nil }
+
+    func persistTranscriptExtraction(
+        wikiID: WikiID,
+        sourceID: SourceID,
+        resolution: TranscriptExtractionResolution,
+        outcome: TranscriptFetchOutcome
+    ) async throws -> QueueExtractionOutputReference? { nil }
+
+    func persistAttachmentExtraction(
+        wikiID: WikiID,
+        sourceID: SourceID,
+        resolution: AttachmentExtractionResolution,
+        outcome: AttachmentFetchOutcome
+    ) async throws -> QueueExtractionOutputReference? { nil }
+
+    func enqueueFollowOnExtraction(wikiID: WikiID, sourceID: SourceID) async throws {}
 }
 
 private func fixtureTransportServices() -> DaemonTransportServices {

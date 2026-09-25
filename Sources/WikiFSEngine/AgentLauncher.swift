@@ -4,6 +4,8 @@ import Observation
 import WikiFSCore
 import ACPModel
 
+// pattern: Imperative Shell
+
 /// Runs the three ACP agent operations — Ingest / Query / Lint — against the
 /// currently-selected wiki, streaming a live activity feed back into the app
 /// (`plans/llm-wiki.md` Phase C). Generalizes the v0 agent launcher: instead of a
@@ -304,6 +306,40 @@ public final class AgentLauncher {
     /// closure delegating to `PdfExtractionService.resolveScript()` at wiring
     /// time; tests/the daemon default to nil (no deny rule emitted).
     @ObservationIgnored public var pdf2mdScriptPathResolver: () -> String? = { nil }
+
+    /// The user-environment `PATH` for run contexts, resolved through the
+    /// account's configured login shell (shell-NEUTRAL — `$SHELL`/passwd
+    /// record, never a hard-coded zsh). Falls back to the inherited process
+    /// PATH when the login-shell hop fails. Injectable so tests pin the value
+    /// without spawning a shell.
+    @ObservationIgnored var resolveUserEnvironmentPath: () async -> String = {
+        await UserEnvironmentPath.userPATH()
+            ?? ProcessInfo.processInfo.environment["PATH"]
+            ?? "/usr/bin:/bin"
+    }
+
+    /// Build the run context for one spawn: resolves the user environment
+    /// PATH once, and creates the scratch temp roots (`<scratch>/.tmp` and
+    /// `<scratch>/.tmp/zsh`) BEFORE any sandbox applies — the relocated
+    /// `TMPDIR` must exist at first use, and nothing here generates or trusts
+    /// an executable in agent-writable scratch.
+    private func makeRunContext(
+        scratch: URL,
+        wikiID: WikiID,
+        wikictlDirectory: String,
+        operation: WikiOperation? = nil
+    ) async -> AgentRunContext {
+        let userPath = await resolveUserEnvironmentPath()
+        let context = AgentRunContext(
+            scratchDirectory: scratch,
+            wikiID: wikiID,
+            wikictlDirectory: wikictlDirectory,
+            userPATH: userPath,
+            stateFilePath: operation?.stateFilePath,
+            stagedSourcePaths: operation?.stagedSourcePaths ?? [])
+        context.createTempDirectories()
+        return context
+    }
 
     /// Returns the chat's most-recent run's debug-folder URL by resolving from
     /// disk: `<Caches>/Self Driving Wiki-agent/<chatULID>/runs/<latest>/debug/`.
@@ -1270,28 +1306,6 @@ public final class AgentLauncher {
         return (preparation, prepared, chain)
     }
 
-    /// Applies launcher-owned operation details to a service-owned, secrets-bearing
-    /// prepared profile. The service supplies all provider identity, command,
-    /// credential, model, and policy data; this layer may only add local paths and
-    /// non-secret provenance/workspace environment hints.
-    private func profile(
-        from prepared: AgentProviderPreparedBackend,
-        scratch: URL,
-        executionAccess: AgentExecutionAccess,
-        cli: CLIProfile,
-        adding hints: [String: String] = [:]
-    ) -> BackendProfile {
-        var providerHints = prepared.profile.providerHints
-        for (key, value) in hints { providerHints[key] = value }
-        return BackendProfile(
-            providerHints: providerHints,
-            scratchDirectory: scratch,
-            isReadOnly: false,
-            executionAccess: executionAccess,
-            cli: cli,
-            debugLogURL: debugFolderURL)
-    }
-
     /// Wait for the shared generation gate on the given lane, returning `true`
     /// iff this caller acquired it (and `holdsGenerationSlot` is now `true`).
     /// Returns `false` if the wait was cancelled before the slot was handed over
@@ -1532,7 +1546,7 @@ public final class AgentLauncher {
             resolvedPath = nil
         } else {
             let loginShellPath = await PathPreflight.loginShellPATH()
-            guard let spawn = resolveACPProviderSpawn(provider, searchPath: loginShellPath) else {
+            guard let spawn = await resolveACPProviderSpawn(provider, searchPath: loginShellPath) else {
                 isRunning = false
                 releaseGenerationSlot()
                 return
@@ -1571,6 +1585,24 @@ public final class AgentLauncher {
             return
         }
 
+        // Resolve the seatbelt confinement BEFORE the resume attempt: the
+        // resume path may itself spawn a fresh process, and the one-shot spawn
+        // below reuses the same invocation (issue #1251).
+        let pdf2mdScriptPath = resolvePdf2mdScriptPath()
+        let sandbox = resolveSandboxInvocation(
+            wikiID: wikiID, scratch: scratch, dir: dir, pdf2mdScriptPath: pdf2mdScriptPath)
+
+        // Typed per-run capability context (created BEFORE any spawn, sandbox
+        // or not): resolves the user-environment PATH once and creates the
+        // scratch temp roots (`<scratch>/.tmp`, `<scratch>/.tmp/zsh`) the
+        // relocated TMPDIR/TMPPREFIX point at. Provider environment merging and
+        // the protected run keys happen in `ACPBackend.startProcess`.
+        let runContext = await makeRunContext(
+            scratch: scratch,
+            wikiID: wikiID,
+            wikictlDirectory: wikictlDirectory,
+            operation: operation)
+
         // #813 Phase 3: Attempt to resume from a previous ACP session if available
         var resumedSession: SessionHandle? = nil
         if let queueStore = queueStore,
@@ -1595,7 +1627,9 @@ public final class AgentLauncher {
                         onStdoutChunk: { _ in },
                         onStderrChunk: { _ in }
                     ),
-                        debugLogURL: nil
+                        debugLogURL: nil,
+                        sandbox: sandbox,
+                        runContext: runContext
                     )) {
                         resumedSession = handle
                         DebugLog.agent("run: successfully resumed ACP session \(sessionId)")
@@ -1607,11 +1641,6 @@ public final class AgentLauncher {
                 }
             }
         }
-
-        let pdf2mdScriptPath = resolvePdf2mdScriptPath()
-        let sandbox = resolveSandboxInvocation(
-            wikiID: wikiID, scratch: scratch, dir: dir, pdf2mdScriptPath: pdf2mdScriptPath)
-        if sandbox != nil { createSandboxTmpDir(in: scratch) }
 
         // RESERVE per-run metadata. isRunning is already `true` (set above).
         // Note: runStartedAt is set inside setGenerating(true) below.
@@ -1667,7 +1696,9 @@ public final class AgentLauncher {
                 wikiRoot: wikiRoot,
                 wikiID: wikiID,
                 systemPrompt: systemPrompt,
-                wikictlDirectory: wikictlDirectory
+                wikictlDirectory: wikictlDirectory,
+                sandbox: sandbox,
+                runContext: runContext
             )
             return
         }
@@ -1706,7 +1737,9 @@ public final class AgentLauncher {
             isReadOnly: false,
             executionAccess: executionAccess,
             cli: cli,
-            debugLogURL: debugFolderURL)
+            debugLogURL: debugFolderURL,
+            sandbox: sandbox,
+            runContext: runContext)
 
         do {
             let resolvedPathDescription = resolvedPath ?? "provider runtime"
@@ -1772,6 +1805,11 @@ public final class AgentLauncher {
             // an instruction to do everything directly.
             var promptText = operation.prompt(wikiRoot: wikiRoot)
             promptText += "\n\nIMPORTANT: Do NOT dispatch sub-agents, background tasks, or async agents. Do NOT use sleep or ScheduleWakeup. Read all sources, process them, and write all wiki pages directly in THIS session — everything must complete before you stop."
+            // The run-capability block: absolute scratch/temp/state/staged-source
+            // paths + the trusted absolute `wikictl --wiki <id>` invocation. The
+            // agent's correctness must not depend on nested-tool cwd or preserved
+            // env (`plans/sandbox-agent.md`).
+            promptText += "\n\n" + runContext.promptContextSection()
             let stream = try await self.sendAgentTurn(
                 prompt: promptText, backend: self.backend, session: session)
             for await event in stream {
@@ -1862,7 +1900,9 @@ public final class AgentLauncher {
         wikiRoot: String,
         wikiID: WikiID,
         systemPrompt: String,
-        wikictlDirectory: String
+        wikictlDirectory: String,
+        sandbox: SandboxProfile.SandboxInvocation?,
+        runContext: AgentRunContext
     ) async {
         // Safety net: if any code path exits without calling finish() (e.g. an
         // unexpected throw from a future adding await between phases), ensure the
@@ -1972,7 +2012,7 @@ public final class AgentLauncher {
             plannerModel = config.modelId(forStage: ACPIngestStage.planner.rawValue)
             executorModel = config.modelId(forStage: ACPIngestStage.executor.rawValue)
             finalizerModel = config.modelId(forStage: ACPIngestStage.finalizer.rawValue)
-            guard let spawn = resolveACPProviderSpawn(provider, searchPath: loginShellPath) else {
+            guard let spawn = await resolveACPProviderSpawn(provider, searchPath: loginShellPath) else {
                 DebugLog.agent("runACPIngest: ACP exe missing for provider=\(provider.id) — aborting")
                 preflightError = "The agent executable for ‘\(provider.label)’ was not found on your PATH."
                 finish(status: -1)
@@ -2073,6 +2113,7 @@ public final class AgentLauncher {
                             stagedSourcePaths: stagedSourcePaths,
                             sourceIDs: sourceIDs,
                             retryAdvisory: self.retryCeilingKillContext?.retryAdvisory)
+                            + "\n\n" + runContext.promptContextSection()
             },
             scratch: scratch,
             ingestRequest: request,
@@ -2080,7 +2121,9 @@ public final class AgentLauncher {
             operation: operation,
             wikiRoot: wikiRoot,
             wikiID: wikiID,
-            phaseName: "planner"
+            phaseName: "planner",
+            sandbox: sandbox,
+            runContext: runContext
         ) else {
             // Planner failed — fall back to single-session ACP ingest on the
             // same resolution (the #604 collapsed default provider).
@@ -2093,7 +2136,9 @@ public final class AgentLauncher {
                 makeCLIProfile: makeCLIProfile,
                 backend: backend,
                 provider: provider,
-                providerHints: plannerHints)
+                providerHints: plannerHints,
+                sandbox: sandbox,
+                runContext: runContext)
             return
         }
 
@@ -2126,7 +2171,9 @@ public final class AgentLauncher {
                 makeCLIProfile: makeCLIProfile,
                 backend: backend,
                 provider: provider,
-                providerHints: plannerHints)
+                providerHints: plannerHints,
+                sandbox: sandbox,
+                runContext: runContext)
             return
         }
         DebugLog.agent("runACPIngest: plan loaded — \(plan.pages.count) pages across \(plan.distinctSourceFiles.count) source file(s)")
@@ -2143,7 +2190,9 @@ public final class AgentLauncher {
             scratchDirectory: scratch,
             isReadOnly: false,
             executionAccess: .fullAccess,
-            cli: makeCLIProfile(operation), debugLogURL: debugFolderURL)
+            cli: makeCLIProfile(operation), debugLogURL: debugFolderURL,
+            sandbox: sandbox,
+            runContext: runContext)
         let maxConcurrent = await (backend as? ACPBackend)?.maxConcurrentExecutorCount() ?? 1
 
         if maxConcurrent > 1 && plan.distinctSourceFiles.count > 1 {
@@ -2220,6 +2269,7 @@ public final class AgentLauncher {
                             allPageTitles: plan.allPageTitles,
                             sourceIDs: sourceIDs,
                             retryAdvisory: self.retryCeilingKillContext?.retryAdvisory)
+                            + "\n\n" + runContext.promptContextSection()
                     },
                     scratch: scratch,
                     ingestRequest: request,
@@ -2227,7 +2277,9 @@ public final class AgentLauncher {
                     operation: operation,
                     wikiRoot: wikiRoot,
                     wikiID: wikiID,
-                    phaseName: "executor[\(sourceFile)]"
+                    phaseName: "executor[\(sourceFile)]",
+                    sandbox: sandbox,
+                    runContext: runContext
                 ) {
                     let executorProviderLabel = quotaFallback.plannerProviderId == executorProvider.id
                         ? executorProvider.label
@@ -2309,6 +2361,7 @@ public final class AgentLauncher {
                     stateFilePath: stateFilePath,
                     sourceFileNames: finalizerSourceFileNames,
                     sourceIDs: sourceIDs)
+                    + "\n\n" + runContext.promptContextSection()
             },
             scratch: scratch,
             ingestRequest: request,
@@ -2316,7 +2369,9 @@ public final class AgentLauncher {
             operation: operation,
             wikiRoot: wikiRoot,
             wikiID: wikiID,
-            phaseName: "finalizer"
+            phaseName: "finalizer",
+            sandbox: sandbox,
+            runContext: runContext
         ) {
             await capturePhaseUsage(backend: backend, session: session, providerLabel: provider.label)
             if let acp = backend as? ACPBackend {
@@ -2423,12 +2478,15 @@ public final class AgentLauncher {
                 }
 
                 let assignments = plan.assignments(forSource: sourceFile)
+                let runContextSection = profile.runContext
+                    .map { "\n\n" + $0.promptContextSection() } ?? ""
                 let executorPrompt = ACPIngestPrompts.executorPrompt(
                     stateFilePath: stateFilePath,
                     assignments: assignments,
                     allPageTitles: allPageTitles,
                     sourceIDs: sourceIDs,
                     retryAdvisory: self.retryCeilingKillContext?.retryAdvisory)
+                    + runContextSection
                 let phaseName = "executor[\(sourceFile)]"
                 let workDir = profile.scratchDirectory?.path
                 let parentHandle = forkFrom
@@ -2622,7 +2680,9 @@ public final class AgentLauncher {
         operation: WikiOperation,
         wikiRoot: String,
         wikiID: WikiID,
-        phaseName: String
+        phaseName: String,
+        sandbox: SandboxProfile.SandboxInvocation?,
+        runContext: AgentRunContext
     ) async -> SessionHandle? {
         var attemptChain = chain
         while let descriptor = quotaFallback.firstLiveDescriptor(in: attemptChain) {
@@ -2647,7 +2707,7 @@ public final class AgentLauncher {
             } else {
                 let config = providersConfig()
                 guard let legacyProvider = config.provider(id: descriptor.id),
-                      let spawn = resolveACPProviderSpawn(legacyProvider, searchPath: searchPath) else {
+                      let spawn = await resolveACPProviderSpawn(legacyProvider, searchPath: searchPath) else {
                     DebugLog.agent("runPhaseWithFallback[\(phaseName)]: no spawn for \(descriptor.id) — skipping")
                     attemptChain.removeAll { $0.id == descriptor.id }
                     continue
@@ -2691,12 +2751,19 @@ public final class AgentLauncher {
             }
 
             // Isolated scratch dir for fallback providers (avoid contention).
+            // A fallback scratch gets its OWN derived run context (independent
+            // temp roots under the fallback scratch) so a fallback run never
+            // shares temp state with the primary run.
             let phaseScratch: URL
+            let phaseRunContext: AgentRunContext
             if isPlannerBackend || provider.id == quotaFallback.plannerProviderId {
                 phaseScratch = scratch
+                phaseRunContext = runContext
             } else {
                 phaseScratch = scratch.appending(path: "fallback-\(provider.id.rawValue)")
                 DebugLog.trying("create phaseScratch directory", operation: { try FileManager.default.createDirectory(at: phaseScratch, withIntermediateDirectories: true) })
+                phaseRunContext = runContext.withScratch(phaseScratch)
+                phaseRunContext.createTempDirectories()
             }
 
             let profile = BackendProfile(
@@ -2704,7 +2771,9 @@ public final class AgentLauncher {
                 scratchDirectory: phaseScratch,
                 isReadOnly: false,
                 executionAccess: .fullAccess,
-                cli: makeCLIProfile(operation), debugLogURL: debugFolderURL)
+                cli: makeCLIProfile(operation), debugLogURL: debugFolderURL,
+                sandbox: sandbox,
+                runContext: phaseRunContext)
 
             let prompt = buildPrompt(provider)
 
@@ -2932,7 +3001,9 @@ public final class AgentLauncher {
         makeCLIProfile: (WikiOperation) -> CLIProfile,
         backend: AgentBackend,
         provider: AgentProvider,
-        providerHints: [String: String]
+        providerHints: [String: String],
+        sandbox: SandboxProfile.SandboxInvocation?,
+        runContext: AgentRunContext
     ) async {
         currentIngestPhase = "fallback-single"
         let profile = BackendProfile(
@@ -2940,9 +3011,12 @@ public final class AgentLauncher {
             scratchDirectory: scratch,
             isReadOnly: false,
             executionAccess: .fullAccess,
-            cli: makeCLIProfile(operation), debugLogURL: debugFolderURL)
+            cli: makeCLIProfile(operation), debugLogURL: debugFolderURL,
+            sandbox: sandbox,
+            runContext: runContext)
         var promptText = operation.prompt(wikiRoot: wikiRoot)
         promptText += "\n\nIMPORTANT: Do NOT dispatch sub-agents, background tasks, or async agents. Do NOT use sleep or ScheduleWakeup. Read all sources, process them, and write all wiki pages directly in THIS session — everything must complete before you stop."
+        promptText += "\n\n" + runContext.promptContextSection()
 
         if let session = await runPhaseOutcome(
             backend: backend,
@@ -3170,20 +3244,27 @@ public final class AgentLauncher {
 
     /// Resolve a `.acp` provider's spawn command (PATH-resolved, since the
     /// swift-acp SDK's `launch()` does no PATH lookup itself) + its
-    /// Keychain-backed API key. `bun` is resolved from the login-shell PATH,
-    /// where mise activates the repository-pinned version. Sets `preflightError`
-    /// and returns `nil` on
+    /// Keychain-backed API key. Resolution goes through the shared
+    /// `ProviderCommandResolver` (issue #1279 AC.9): login-shell PATH first,
+    /// the validated `RuntimeCommandLocator` Bun lookup as the only bare-`bun`
+    /// fallback — so the shipped `bun x …` command resolves from the GUI
+    /// daemon without an absolute-path workaround, and this path cannot drift
+    /// from the catalog compositions. `bun` is resolved from the login-shell
+    /// PATH, where mise activates the repository-pinned version. Sets
+    /// `preflightError` and returns `nil` on
     /// failure — callers must bail out (`isRunning = false` +
     /// `releaseGenerationSlot()`) when this returns `nil`.
     func resolveACPProviderSpawn(
         _ provider: AgentProvider,
         searchPath: String?
-    ) -> (command: [String], apiKey: String?)? {
+    ) async -> (command: [String], apiKey: String?)? {
         guard let command = provider.command, let exe = command.first else {
             preflightError = "Provider ‘\(provider.label)’ has no command configured."
             return nil
         }
-        guard let resolvedCommand = Self.resolveCommand(for: provider, searchPath: searchPath) else {
+        guard let resolvedCommand = await ProviderCommandResolver.resolveCommand(
+            for: provider,
+            searchPath: searchPath) else {
             let resolution = PathPreflight.resolve(
                 executable: ShellArgv.expandTilde(exe),
                 usingSearchPath: searchPath ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
@@ -3501,7 +3582,7 @@ public final class AgentLauncher {
             resolvedPath = "provider runtime"
         } else {
             let loginShellPath = await PathPreflight.loginShellPATH()
-            guard let spawn = resolveACPProviderSpawn(provider, searchPath: loginShellPath) else {
+            guard let spawn = await resolveACPProviderSpawn(provider, searchPath: loginShellPath) else {
                 DebugLog.agent("startInteractiveQuery: ACP exe missing — \(preflightError ?? "?")")
                 return
             }
@@ -3538,7 +3619,16 @@ public final class AgentLauncher {
         let pdf2mdScriptPath = resolvePdf2mdScriptPath()
         let sandbox = resolveSandboxInvocation(
             wikiID: wikiID, scratch: scratch, dir: dir, pdf2mdScriptPath: pdf2mdScriptPath)
-        if sandbox != nil { createSandboxTmpDir(in: scratch) }
+
+        // Typed per-run capability context (created BEFORE any spawn, sandbox
+        // or not): user-environment PATH + scratch temp roots. The chat prompt
+        // injects the absolute scratch/state paths + trusted `wikictl --wiki`
+        // invocation so nested-tool cwd and env sanitization cannot break it.
+        let runContext = await makeRunContext(
+            scratch: scratch,
+            wikiID: wikiID,
+            wikictlDirectory: wikictlDirectory,
+            operation: operation)
 
         // RESERVE per-run metadata. isRunning will be set at spawn commit below
         // (after backend.start succeeds). runStartedAt is set inside
@@ -3621,7 +3711,9 @@ public final class AgentLauncher {
             scratchDirectory: scratch,
             isReadOnly: false,
             cli: cli,
-            debugLogURL: debugFolderURL)
+            debugLogURL: debugFolderURL,
+            sandbox: sandbox,
+            runContext: runContext)
         DebugLog.agent("startInteractiveQuery: profile built providerHints keys=\(profile.providerHints.keys.sorted()) scratch=\(scratch.lastPathComponent)")
 
         // #830: Attempt to resume a prior ACP session for this chat. Mirrors
@@ -3725,9 +3817,22 @@ public final class AgentLauncher {
             // the full task context — send only the user's raw message.
             let composedFirstMessage: String
             if resumedSession != nil {
-                composedFirstMessage = firstMessageDisplay ?? firstMessage
+                // The resumed conversation still references the PREVIOUS run's
+                // authoritative paths. Prepend a RUN ENVIRONMENT refresh so the
+                // model's scratch/state/tool paths match THIS run's context and
+                // sandbox; the displayed text stays the raw user message.
+                composedFirstMessage = """
+                \(runContext.promptContextSection())
+
+                (This RUN ENVIRONMENT block is CURRENT and supersedes any paths \
+                from earlier sessions in this conversation.)
+
+                # USER MESSAGE
+                \(firstMessageDisplay ?? firstMessage)
+                """
             } else {
                 let taskPrompt = operation.prompt(wikiRoot: wikiRoot)
+                    + "\n\n" + runContext.promptContextSection()
                 composedFirstMessage = "\(taskPrompt)\n\n# USER MESSAGE\n\(firstMessage)"
             }
             sendInteractiveMessage(composedFirstMessage, displayText: firstMessageDisplay ?? firstMessage)
@@ -4598,9 +4703,9 @@ public final class AgentLauncher {
     ///   bundled to run; generic `uv`/`python3` is still reachable — issue #116 item 2).
     ///
     /// This function ONLY resolves the invocation; it does NOT create any directories.
-    /// Each spawn site that receives a non-nil result MUST call `createSandboxTmpDir(in:)`
-    /// before launching the child so that `TMPDIR` (set by `OperationCommand.applySandbox`)
-    /// points at a directory that actually exists.
+    /// Spawn sites create the scratch temp roots via `AgentRunContext.createTempDirectories()`
+    /// BEFORE launching, so the relocated `TMPDIR` points at a directory that
+    /// actually exists.
     ///
     /// (The chat path uses this write invocation directly — chats are always
     /// write-capable. The former read-only Ask sandbox is retained in-tree but
@@ -4621,6 +4726,7 @@ public final class AgentLauncher {
         // Symlink resolution is performed inside `SandboxProfile.invocation` (the
         // tested core layer) so the canonical path reaches the seatbelt profile.
         let dbPath = dir.appendingPathComponent("\(wikiID.rawValue).sqlite", isDirectory: false).path
+        let queueDBPath = dir.appendingPathComponent("queue.sqlite", isDirectory: false).path
 
         // Fail-open if any required path is empty/relative (misconfiguration).
         guard !scratch.path.isEmpty, scratch.path.hasPrefix("/"),
@@ -4633,10 +4739,12 @@ public final class AgentLauncher {
             homePath: homePath,
             scratchDir: scratch.path,
             wikiDBPath: dbPath,
+            queueDBPath: queueDBPath,
             pdf2mdScriptPath: pdf2mdScriptPath
         )
         let pdf2mdNote = pdf2mdScriptPath.map { " + denying pdf2md @ \($0)" } ?? ""
-        DebugLog.agent("sandbox: confining Ingest/Edit agent writes to scratch + \(dbPath)\(pdf2mdNote)")
+        DebugLog.agent(
+            "sandbox: confining Ingest/Edit agent writes to scratch + \(dbPath) + \(queueDBPath)\(pdf2mdNote)")
         return invocation
     }
 
@@ -4655,10 +4763,12 @@ public final class AgentLauncher {
     }
 
     /// Create the `scratch/.tmp` directory a sandboxed spawn would point
-    /// `TMPDIR` at. Must be called at each spawn site whenever a non-nil
-    /// sandbox is resolved so the directory exists before the child process
-    /// tries to write into it. Best-effort: failure (e.g. scratch unwritable)
-    /// is surfaced later by the child's own write errors.
+    /// `TMPDIR` at. Retained for legacy call surfaces — the live launch paths
+    /// now create their temp roots via `AgentRunContext.createTempDirectories()`
+    /// (which also creates the zsh-compatible prefix under `.tmp`). Kept so
+    /// tests that exercise the old seam directly still compile. Best-effort:
+    /// failure (e.g. scratch unwritable) is surfaced later by the child's own
+    /// write errors.
     private static let tmpRelocationLeaf = ".tmp"
     private func createSandboxTmpDir(in scratch: URL) {
         let tmp = scratch.appendingPathComponent(Self.tmpRelocationLeaf, isDirectory: true)

@@ -158,7 +158,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     /// databases produced by that store carry `PRAGMA user_version` up to 37, and
     /// this store must recognize them as already-current so the ladder is a no-op
     /// on re-open (the proven `if version < N`)
-    private static let currentSchemaVersion = 52
+    private static let currentSchemaVersion = 54
     /// The current schema version (mirrors the former
     /// `SQLiteWikiStore.currentSchemaVersion`). Public so tests can assert the
     /// migration ladder landed at the expected `user_version`.
@@ -1550,6 +1550,45 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             version = 52
         }
 
+        // v52→v53: remove the chat-level `summary`/`summary_at` columns. The
+        // mirrored one-line answer summary (issue #411) is no longer read
+        // anywhere — the sidebar row shows the stored title and the creation
+        // date — and the per-message summaries in `chat_messages` (which feed
+        // the outline) are unaffected. Guarded like every other step so
+        // already-converged databases pass through.
+        if version < 53 {
+            try db.inTransaction(.immediate) {
+                try Self.dropChatSummaryColumnsV53(in: db)
+                try db.execute(sql: "PRAGMA user_version = 53;")
+                return .commit
+            }
+            version = 53
+        }
+
+        // v53→v54: the per-message summary moves onto `chat_transcript_items`
+        // (issue #1266). The summary is consumed by transcript reads (the chat
+        // outline), so it belongs on the durable transcript row, keyed by the
+        // durable cursor — not on the compatibility `chat_messages`
+        // projection, keyed by an unrelated `PageID`. The step:
+        //   1. adds `summary`/`summary_kind`/`summary_at` to
+        //      `chat_transcript_items`,
+        //   2. backfills them from `chat_messages` through the documented
+        //      seq↔cursor mapping (`cursor = seq + 1`),
+        //   3. rewrites skills-budget-warning rows (titles + summaries)
+        //      written before the derivation/summarizer seams stripped the
+        //      warning themselves (7937b383 / bb3e7884), so the display-time
+        //      compensations and their tests delete cleanly,
+        //   4. drops the summary columns from `chat_messages`, leaving it a
+        //      pure export/index projection with no app-owned state.
+        if version < 54 {
+            try db.inTransaction(.immediate) {
+                try Self.moveMessageSummaryToTranscriptItemsV54(in: db)
+                try db.execute(sql: "PRAGMA user_version = 54;")
+                return .commit
+            }
+            version = 54
+        }
+
         // Catch-all fallback: any DB older than `currentSchemaVersion` whose
         // per-step work has not been added above (the steady-state guard for a
         // genuine currentSchemaVersion bump). Drops FTS5 + stamps
@@ -2066,8 +2105,6 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             title              TEXT NOT NULL,
             created_at         REAL NOT NULL,
             updated_at         REAL NOT NULL,
-            summary            TEXT,
-            summary_at         REAL,
             acp_session_id     TEXT,
             model_provider_id  TEXT,
             model_id           TEXT,
@@ -2232,7 +2269,13 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         try db.execute(sql: "CREATE UNIQUE INDEX IF NOT EXISTS chat_turns_claim_id ON chat_turns(claim_id) WHERE claim_id IS NOT NULL;")
     }
 
-    private static func createChatTranscriptItemsV46(in db: Database) throws {
+    /// The CURRENT transcript-items shape (fresh schema path). Fresh databases
+    /// stamp `user_version = currentSchemaVersion` directly without running
+    /// the ladder, so this creator must always carry the latest columns — the
+    /// v54 `summary` trio (#1266). The ladder's v46 rebuild uses the
+    /// historical `createChatPhase2TablesV46` shape and gains the columns
+    /// through the v54 migration step instead.
+    private static func createChatTranscriptItemsV54(in db: Database) throws {
         try db.execute(sql: """
         CREATE TABLE IF NOT EXISTS chat_transcript_items (
             chat_id               TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
@@ -2242,6 +2285,9 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             projected_event_json  TEXT,
             projected_text        TEXT NOT NULL DEFAULT '',
             created_at            REAL NOT NULL,
+            summary               TEXT,
+            summary_kind          TEXT,
+            summary_at            REAL,
             PRIMARY KEY (chat_id, cursor)
         ) WITHOUT ROWID;
         """)
@@ -2910,6 +2956,169 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         }
     }
 
+    /// The v52→53 migration step: drop the chat-level one-line answer
+    /// summary columns (issue #411 successor). The mirrored `chats.summary`
+    /// is no longer read anywhere; per-message summaries in `chat_messages`
+    /// (which feed the outline) are unaffected.
+    private static func dropChatSummaryColumnsV53(in db: Database) throws {
+        let columns = try tableColumnInfo("chats", in: db)
+        guard columns.contains("summary") || columns.contains("summary_at") else { return }
+
+        if columns.contains("summary") {
+            try db.execute(sql: "ALTER TABLE chats DROP COLUMN summary;")
+        }
+        if columns.contains("summary_at") {
+            try db.execute(sql: "ALTER TABLE chats DROP COLUMN summary_at;")
+        }
+    }
+
+    /// The v53→54 migration step (issue #1266 — summary onto transcript
+    /// items + bounded legacy preamble compensations). Idempotent: every
+    /// schema change is guarded, and the backfills converge.
+    private static func moveMessageSummaryToTranscriptItemsV54(in db: Database) throws {
+        // 0. The v46 rebuild guarantees this table exists on every real
+        //    ladder path; create it for partial synthetic schemas so the
+        //    step stays total (at the historical v46 shape — the ALTERs
+        //    below then converge it).
+        try db.execute(sql: """
+        CREATE TABLE IF NOT EXISTS chat_transcript_items (
+            chat_id               TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+            cursor                INTEGER NOT NULL,
+            item_kind             TEXT NOT NULL,
+            item_json             TEXT NOT NULL,
+            projected_event_json  TEXT,
+            projected_text        TEXT NOT NULL DEFAULT '',
+            created_at            REAL NOT NULL,
+            PRIMARY KEY (chat_id, cursor)
+        ) WITHOUT ROWID;
+        """)
+
+        // 1. Add the summary columns. Guarded so fresh-schema databases
+        //    (`createChatTranscriptItemsV54` already carries the trio) and
+        //    re-runs pass through.
+        if !(try hasColumn("summary", on: "chat_transcript_items", in: db)) {
+            try db.execute(sql: "ALTER TABLE chat_transcript_items ADD COLUMN summary TEXT;")
+        }
+        if !(try hasColumn("summary_kind", on: "chat_transcript_items", in: db)) {
+            try db.execute(sql: "ALTER TABLE chat_transcript_items ADD COLUMN summary_kind TEXT;")
+        }
+        if !(try hasColumn("summary_at", on: "chat_transcript_items", in: db)) {
+            try db.execute(sql: "ALTER TABLE chat_transcript_items ADD COLUMN summary_at REAL;")
+        }
+
+        // 2. Backfill through the documented seq↔cursor mapping: the dense
+        //    zero-based `chat_messages.seq` is the one-based durable
+        //    transcript cursor minus one. Legacy-only chats (no transcript
+        //    items) simply have nothing to backfill into. Guarded on the
+        //    source trio existing: `chat_messages` carried it from v40
+        //    through v53, but a schema created fresh at ≥54 never had it
+        //    (and a v52-era DB reaching this step through the ladder cannot
+        //    backfill what was already dropped).
+        if try hasColumn("summary", on: "chat_messages", in: db),
+           try hasColumn("summary_kind", on: "chat_messages", in: db),
+           try hasColumn("summary_at", on: "chat_messages", in: db) {
+            try db.execute(sql: """
+            UPDATE chat_transcript_items
+            SET summary = (
+                    SELECT m.summary FROM chat_messages AS m
+                    WHERE m.chat_id = chat_transcript_items.chat_id
+                      AND m.seq = chat_transcript_items.cursor - 1),
+                summary_kind = (
+                    SELECT m.summary_kind FROM chat_messages AS m
+                    WHERE m.chat_id = chat_transcript_items.chat_id
+                      AND m.seq = chat_transcript_items.cursor - 1),
+                summary_at = (
+                    SELECT m.summary_at FROM chat_messages AS m
+                    WHERE m.chat_id = chat_transcript_items.chat_id
+                      AND m.seq = chat_transcript_items.cursor - 1)
+            WHERE summary IS NULL;
+            """)
+        }
+
+        // 3a. Sanitize the moved summaries. Rows written before bb3e7884 can
+        //    carry the skills-budget warning the summarizer now strips at
+        //    derivation time. Warning-only summaries NULL back to
+        //    unsummarized so the summarizer recomputes them clean.
+        let movedSummaries = try Row.fetchAll(db, sql: """
+        SELECT chat_id, cursor, summary FROM chat_transcript_items
+        WHERE summary IS NOT NULL;
+        """)
+        for row in movedSummaries {
+            let chatID: String = row["chat_id"]
+            let cursor: Int64 = row["cursor"]
+            let raw: String = row["summary"]
+            let cleaned = AgentPresentationPreamble.visibleText(raw, policy: .completeOnly)
+            if let cleaned, !cleaned.isEmpty {
+                guard cleaned != raw else { continue }
+                try db.execute(sql: """
+                UPDATE chat_transcript_items SET summary = ?
+                WHERE chat_id = ? AND cursor = ?;
+                """, arguments: [cleaned, chatID, cursor])
+            } else {
+                // Warning-only (visibleText yields nil when nothing
+                // substantive remains) or empty: unsummarize the row.
+                try db.execute(sql: """
+                UPDATE chat_transcript_items
+                SET summary = NULL, summary_kind = NULL, summary_at = NULL
+                WHERE chat_id = ? AND cursor = ?;
+                """, arguments: [chatID, cursor])
+            }
+        }
+
+        // 3b. Sanitize stored titles. Rows written before 7937b383 store the
+        //    warning as (part of) the title. Warning-only titles rewrite to
+        //    the provisional question title (exactly what first-send titling
+        //    would have written); when no question is recoverable the row
+        //    rewrites to genuinely untitled (issue #1265) — displayed as
+        //    "New Chat" by the fallback, but retriable by later automatic
+        //    title writes. The `chat_search` sidecar carries a title copy,
+        //    so it is rewritten in the same pass.
+        let chatTitles = try Row.fetchAll(db, sql: "SELECT id, title FROM chats;")
+        for row in chatTitles {
+            let chatID: String = row["id"]
+            let raw: String = row["title"]
+            guard !raw.isEmpty else { continue }
+            let cleaned = AgentPresentationPreamble.visibleText(raw, policy: .completeOnly)
+            let replacement: String?
+            switch cleaned {
+            case .some(let visible) where !visible.isEmpty && visible != raw:
+                // Content-bearing tainted title: keep the cleaned remainder.
+                replacement = visible
+            case .some(let visible) where !visible.isEmpty:
+                // Clean title, already correct.
+                replacement = nil
+            case .some, .none:
+                // Warning-only title (visibleText yields nil when nothing
+                // substantive remains): recover the provisional question
+                // title — exactly what first-send titling would have
+                // written; when no question is recoverable, rewrite to
+                // genuinely untitled (issue #1265): the display fallback
+                // renders "New Chat", and later automatic title writes can
+                // still name the row.
+                let firstUserText = try String.fetchOne(db, sql: """
+                SELECT text FROM chat_messages
+                WHERE chat_id = ? AND role = 'user'
+                ORDER BY seq ASC LIMIT 1;
+                """, arguments: [chatID])
+                replacement = firstUserText
+                    .flatMap { ChatSummary.title(fromFirstMessage: $0) } ?? ""
+            }
+            guard let replacement else { continue }
+            try db.execute(sql: "UPDATE chats SET title = ? WHERE id = ?;",
+                           arguments: [replacement, chatID])
+            try db.execute(sql: "UPDATE chat_search SET title = ? WHERE chat_id = ?;",
+                           arguments: [replacement, chatID])
+        }
+
+        // 4. Drop the summary columns from `chat_messages`. After this the
+        //    compatibility projection carries no app-owned state.
+        let messageColumns = try tableColumnInfo("chat_messages", in: db)
+        for column in ["summary", "summary_kind", "summary_at"]
+        where messageColumns.contains(column) {
+            try db.execute(sql: "ALTER TABLE chat_messages DROP COLUMN \(column);")
+        }
+    }
+
     /// The v35→36 migration step (issue #411 — chat summary).
     private static func migrateV35ToV36(in db: Database) throws {
         let columns = try tableColumnInfo("chats", in: db)
@@ -3373,8 +3582,6 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             title              TEXT NOT NULL,
             created_at         REAL NOT NULL,
             updated_at         REAL NOT NULL,
-            summary            TEXT,
-            summary_at         REAL,
             acp_session_id     TEXT,
             model_provider_id  TEXT,
             model_id           TEXT,
@@ -3392,9 +3599,6 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             event_json  TEXT NOT NULL,
             text        TEXT NOT NULL DEFAULT '',
             created_at  REAL NOT NULL,
-            summary     TEXT,
-            summary_kind TEXT,
-            summary_at  REAL,
             is_draft    INTEGER NOT NULL DEFAULT 0,
             draft_handle TEXT
         );
@@ -3424,7 +3628,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         );
         """)
         try createChatTurnsV48(in: db)
-        try createChatTranscriptItemsV46(in: db)
+        try createChatTranscriptItemsV54(in: db)
 
         // v30: page versions (W0).
         try db.execute(sql: """
@@ -4241,25 +4445,10 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         }
     }
 
+    /// Compatibility forwarder — the protected contract under `.preserve`.
+    /// See `deleteResources(_:)` for the atomicity + event guarantees.
     public func deletePage(id: PageID) throws {
-        try mutate(event: { _ in
-            self.localEvent(.page, id: id.rawValue, change: .deleted)
-        }) { db in
-            // FK safety: page_links, attachments, source_links all have FKs
-            // onto pages(id) WITHOUT ON DELETE CASCADE (unlike page_chunks).
-            // Clear every dependent row first, then delete the page — all in
-            // ONE transaction (dbWriter.write provides this).
-            try db.execute(sql: "DELETE FROM page_links WHERE from_page_id = ? OR to_page_id = ?;",
-                           arguments: [id.rawValue, id.rawValue])
-            try db.execute(sql: "DELETE FROM source_links WHERE from_page_id = ?;",
-                           arguments: [id.rawValue])
-            try db.execute(sql: "DELETE FROM attachments WHERE page_id = ?;",
-                           arguments: [id.rawValue])
-            try db.execute(sql: "DELETE FROM refs WHERE owner_id = ? AND kind = 'page-content';",
-                           arguments: [id.rawValue])
-            try db.execute(sql: "DELETE FROM pages WHERE id = ?;",
-                           arguments: [id.rawValue])
-        }
+        try deleteResources(ResourceDeletionRequest(target: .page(id), linkPolicy: .preserve))
     }
 
     public func resolveTitleToID(_ title: String) throws -> PageID? {
@@ -4287,63 +4476,73 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         try mutate(event: { _ in
             self.localEvent(.page, id: pageID.rawValue, change: .updated)
         }) { db in
-            // Delete all existing outgoing page + source links, then insert the
-            // resolved subset. Faithful port of `SQLiteWikiStore.replaceLinks`:
-            // canonical-ULID targets validate by id (direct row fetch); legacy
-            // and forward links resolve by name via `resolveLinkTarget`. All
-            // resolvers used here are the `*Locked` variants that take the
-            // in-transaction `db` — the public `resolveTitleToID` /
-            // `resolveSourceByName` open their own `dbWriter.read`, which would
-            // re-enter the DatabasePool's serial queue and hit GRDB's fatal
-            // "Database methods are not reentrant".
-            try db.execute(sql: "DELETE FROM page_links WHERE from_page_id = ?;",
-                           arguments: [pageID.rawValue])
-            try db.execute(sql: "DELETE FROM source_links WHERE from_page_id = ?;",
-                           arguments: [pageID.rawValue])
-            for link in parsedLinks {
-                switch link.linkType {
-                case .page:
-                    let resolved: PageID?
-                    if let id = try self.canonicalLinkID(link, in: db) {
-                        resolved = id
-                    } else {
-                        resolved = try self.resolveLinkTarget(
-                            link, using: self.resolveTitleToIDLocked, in: db)
-                    }
-                    guard let resolved else { continue }
-                    try db.execute(sql: """
-                    INSERT OR IGNORE INTO page_links (from_page_id, to_page_id, link_text)
-                    VALUES (?, ?, ?);
-                    """, arguments: [pageID.rawValue, resolved.rawValue, link.linkText])
-                case .source:
-                    let resolved: SourceID?
-                    if let id = try self.canonicalLinkID(link, in: db) {
-                        resolved = SourceID(rawValue: id.rawValue)
-                    } else {
-                        resolved = try self.resolveLinkTarget(
-                            link, using: self.resolveSourceByNameLocked, in: db)
-                    }
-                    guard let resolved else { continue }
-                    // Resolve the `@vN` ordinal (1-based) to a concrete smv id;
-                    // NULL when unpinned or out-of-range (follows the active ref).
-                    let pinID = try link.versionPin.flatMap {
-                        try self.resolveVersionPin($0, sourceID: resolved, in: db)
-                    }
-                    // Embed source links (`![[source:…]]`) write a DISTINCT edge
-                    // with role='embed' — the `source_links_edge` unique index
-                    // treats (from, to, role, pin) as distinct, so a cite + embed
-                    // to the same source coexist as separate rows (Phase 4a, AC.3).
-                    let role = link.isEmbed ? "embed" : "cite"
-                    try db.execute(sql: """
-                    INSERT OR IGNORE INTO source_links
-                        (from_page_id, to_source_id, link_text, role, pinned_version_id)
-                    VALUES (?, ?, ?, ?, ?);
-                    """, arguments: [pageID.rawValue, resolved.rawValue, link.linkText,
-                                     role, pinID?.rawValue])
-                case .chat:
-                    // Chat links resolve at render time (no persisted graph edge).
-                    continue
+            try self.replaceLinksLocked(from: pageID, parsedLinks: parsedLinks, on: db)
+        }
+    }
+
+    /// The db-handle core of `replaceLinks` — same resolution rules, no
+    /// transaction, no event. Callers already inside a write transaction (the
+    /// protected deletion's unlink rewrites) route through this instead of the
+    /// public mutator, which would re-enter the writer queue and deadlock.
+    private func replaceLinksLocked(
+        from pageID: PageID, parsedLinks: [ParsedLink], on db: Database
+    ) throws {
+        // Delete all existing outgoing page + source links, then insert the
+        // resolved subset. Faithful port of `SQLiteWikiStore.replaceLinks`:
+        // canonical-ULID targets validate by id (direct row fetch); legacy
+        // and forward links resolve by name via `resolveLinkTarget`. All
+        // resolvers used here are the `*Locked` variants that take the
+        // in-transaction `db` — the public `resolveTitleToID` /
+        // `resolveSourceByName` open their own `dbWriter.read`, which would
+        // re-enter the DatabasePool's serial queue and hit GRDB's fatal
+        // "Database methods are not reentrant".
+        try db.execute(sql: "DELETE FROM page_links WHERE from_page_id = ?;",
+                       arguments: [pageID.rawValue])
+        try db.execute(sql: "DELETE FROM source_links WHERE from_page_id = ?;",
+                       arguments: [pageID.rawValue])
+        for link in parsedLinks {
+            switch link.linkType {
+            case .page:
+                let resolved: PageID?
+                if let id = try self.canonicalLinkID(link, in: db) {
+                    resolved = id
+                } else {
+                    resolved = try self.resolveLinkTarget(
+                        link, using: self.resolveTitleToIDLocked, in: db)
                 }
+                guard let resolved else { continue }
+                try db.execute(sql: """
+                INSERT OR IGNORE INTO page_links (from_page_id, to_page_id, link_text)
+                VALUES (?, ?, ?);
+                """, arguments: [pageID.rawValue, resolved.rawValue, link.linkText])
+            case .source:
+                let resolved: SourceID?
+                if let id = try self.canonicalLinkID(link, in: db) {
+                    resolved = SourceID(rawValue: id.rawValue)
+                } else {
+                    resolved = try self.resolveLinkTarget(
+                        link, using: self.resolveSourceByNameLocked, in: db)
+                }
+                guard let resolved else { continue }
+                // Resolve the `@vN` ordinal (1-based) to a concrete smv id;
+                // NULL when unpinned or out-of-range (follows the active ref).
+                let pinID = try link.versionPin.flatMap {
+                    try self.resolveVersionPin($0, sourceID: resolved, in: db)
+                }
+                // Embed source links (`![[source:…]]`) write a DISTINCT edge
+                // with role='embed' — the `source_links_edge` unique index
+                // treats (from, to, role, pin) as distinct, so a cite + embed
+                // to the same source coexist as separate rows (Phase 4a, AC.3).
+                let role = link.isEmbed ? "embed" : "cite"
+                try db.execute(sql: """
+                INSERT OR IGNORE INTO source_links
+                    (from_page_id, to_source_id, link_text, role, pinned_version_id)
+                VALUES (?, ?, ?, ?, ?);
+                """, arguments: [pageID.rawValue, resolved.rawValue, link.linkText,
+                                 role, pinID?.rawValue])
+            case .chat:
+                // Chat links resolve at render time (no persisted graph edge).
+                continue
             }
         }
     }
@@ -4854,18 +5053,479 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         }
     }
 
+    /// Compatibility forwarder — the protected contract under `.preserve`.
+    /// Provenance blockers throw the typed restriction before any write.
+    /// See `deleteResources(_:)` for the atomicity + event guarantees.
     public func deleteSource(id: SourceID) throws {
-        try mutate(event: { _ in
-            self.localEvent(.source, id: id.rawValue, change: .deleted)
-        }) { db in
-            if let blockers = try self.provenanceDeletionBlockers(sourceID: id, on: db) {
-                throw WikiStoreError.deletionRestricted(.provenance(blockers))
-            }
-            // source_versions cascade on DELETE, but blobs and activities do
-            // not — they're left for lazy GC (vacuumBlobs/vacuumActivities).
-            try db.execute(sql: "DELETE FROM sources WHERE id = ?;",
-                           arguments: [id.rawValue])
+        try deleteResources(ResourceDeletionRequest(target: .source(id), linkPolicy: .preserve))
+    }
+
+    // MARK: - Protected deletion (issue #219 hardening)
+    //
+    // One write transaction owns impact discovery, provenance validation,
+    // optional link rewrites, mandatory bookmark cleanup, and target deletion.
+    // Events are buffered by `mutateBatch` and emitted strictly after commit —
+    // a rollback emits nothing, and a missing target emits no false
+    // target-deleted event.
+
+    /// TEST SEAM — never passed by production code. `deleteResources` offers
+    /// an internal overload taking a `ProtectedDeletionFailurePoint` so tests
+    /// can throw at a deterministic stage (default `.none`, the only value
+    /// production uses). A parameter, not stored state: nothing to reset, no
+    /// unsynchronized access.
+    public func deletionImpact(for targets: Set<ResourceDeletionTarget>) throws -> DeletionImpact {
+        try dbWriter.read { db in
+            try self.deletionImpact(for: targets, on: db)
         }
+    }
+
+    @discardableResult
+    public func deleteResources(_ request: ResourceDeletionRequest) throws -> ResourceDeletionResult {
+        try deleteResources(request, failurePoint: .none)
+    }
+
+    /// Internal overload backing the test seam. Internal to the module; app
+    /// and CLI code only ever see the public single-argument form.
+    func deleteResources(
+        _ request: ResourceDeletionRequest,
+        failurePoint: ProtectedDeletionFailurePoint
+    ) throws -> ResourceDeletionResult {
+        try mutateBatch(events: { result in
+            var events: [ResourceChangeEvent] = []
+            // Rewritten linking pages first …
+            for pageID in result.rewrittenPageIDs {
+                events.append(self.localEvent(.page, id: pageID.rawValue, change: .updated))
+            }
+            // … then every removed bookmark leaf (one tree invalidation per
+            // leaf — subscribers reload the complete tree, which also picks
+            // up renumbered siblings, so no per-sibling position events) …
+            for bookmarkID in result.removedBookmarkIDs {
+                events.append(self.localEvent(.bookmark, id: bookmarkID.rawValue, change: .deleted))
+            }
+            // … and finally one deleted event per target row that actually
+            // existed (never a false event for a missing id).
+            for target in ResourceDeletionTarget.sorted(Set(result.deletedTargets)) {
+                switch target {
+                case .page(let id):
+                    events.append(self.localEvent(.page, id: id.rawValue, change: .deleted))
+                case .source(let id):
+                    events.append(self.localEvent(.source, id: id.rawValue, change: .deleted))
+                }
+            }
+            return events
+        }) { db in
+            try self.deleteResourcesLocked(request, failurePoint: failurePoint, on: db)
+        }
+    }
+
+    /// The db-handle core of the protected deletion. Runs entirely inside the
+    /// caller's `mutateBatch` savepoint; never opens a transaction or emits an
+    /// event.
+    private func deleteResourcesLocked(
+        _ request: ResourceDeletionRequest,
+        failurePoint: ProtectedDeletionFailurePoint,
+        on db: Database
+    ) throws -> ResourceDeletionResult {
+        let pageIDs = request.pageIDs
+        let sourceIDs = request.sourceIDs
+
+        // 1. Recheck the impact INSIDE the write transaction. The pre-delete
+        //    snapshot the UI showed is advisory — this re-read is authoritative.
+        let impact = try deletionImpact(for: request.targets, on: db)
+
+        // 2. Provenance validation BEFORE the first mutation (AC.6): any
+        //    blocker — even one whose citing page is itself selected for
+        //    deletion — stops the complete batch with zero writes.
+        if let blockers = NonEmptyProvenanceDeletionBlockers(impact.provenanceBlockers) {
+            throw WikiStoreError.deletionRestricted(.provenance(blockers))
+        }
+
+        // 3. Optional link rewrites (AC.4, AC.5): each distinct linking page
+        //    is rewritten at most once, and pages in the deletion set are
+        //    excluded (their bodies vanish with them).
+        var rewrittenPageIDs: [PageID] = []
+        if request.linkPolicy == .unlink {
+            for linkingPage in impact.linkingPages {
+                if try rewritePageUnlinkingTargets(
+                    pageID: linkingPage.pageID,
+                    deletedPageIDs: pageIDs,
+                    deletedSourceIDs: sourceIDs,
+                    on: db)
+                {
+                    rewrittenPageIDs.append(linkingPage.pageID)
+                }
+            }
+        }
+        try throwIfFailureInjected(failurePoint, at: .afterRewrite)
+
+        // 4. Mandatory bookmark cleanup (AC.1, AC.2, AC.14): every leaf
+        //    pointing at a deleted target goes, with sibling renumbering —
+        //    even when the target row itself is already gone (stale rows).
+        let removedBookmarkIDs = try deleteBookmarksMatching(
+            pageIDs: pageIDs, sourceIDs: sourceIDs, on: db)
+        try throwIfFailureInjected(failurePoint, at: .afterBookmarkCleanup)
+
+        // 5. Target rows + dependent graph rows (AC.14: a missing target is an
+        //    idempotent no-op and produces no result entry).
+        try throwIfFailureInjected(failurePoint, at: .beforeTargetDeletion)
+        var deletedTargets: [ResourceDeletionTarget] = []
+        for id in pageIDs {
+            if try deletePageTargetRow(id, on: db) { deletedTargets.append(.page(id)) }
+        }
+        for id in sourceIDs {
+            if try deleteSourceTargetRow(id, on: db) { deletedTargets.append(.source(id)) }
+        }
+
+        return ResourceDeletionResult(
+            deletedTargets: deletedTargets,
+            rewrittenPageIDs: rewrittenPageIDs,
+            removedBookmarkIDs: removedBookmarkIDs,
+            incomingLinkCount: impact.incomingLinkCount)
+    }
+
+    /// Throws when the test seam names exactly `expected`. Production runs
+    /// with `.none`, which matches nothing.
+    private func throwIfFailureInjected(
+        _ failurePoint: ProtectedDeletionFailurePoint,
+        at expected: ProtectedDeletionFailurePoint
+    ) throws {
+        guard failurePoint == expected else { return }
+        throw WikiStoreError.unexpected(
+            "protected deletion failure injected at \(expected) (test seam)")
+    }
+
+    /// Computes the deletion impact on an open database handle — shared by the
+    /// read-side `deletionImpact(for:)` and the in-transaction recheck inside
+    /// `deleteResourcesLocked`, so the preflight snapshot and the write-time
+    /// truth can never drift in shape.
+    private func deletionImpact(
+        for targets: Set<ResourceDeletionTarget>, on db: Database
+    ) throws -> DeletionImpact {
+        let pageIDs = ResourceDeletionTarget.sorted(targets).compactMap(\.pageID)
+        let sourceIDs = ResourceDeletionTarget.sorted(targets).compactMap(\.sourceID)
+        let pageStrings = pageIDs.map(\.rawValue)
+        let sourceStrings = sourceIDs.map(\.rawValue)
+
+        // Incoming linking pages (both link kinds), excluding pages that are
+        // themselves in the deletion set.
+        var linkingIDStrings: Set<String> = []
+        if !pageStrings.isEmpty {
+            let rows = try String.fetchAll(db, sql: """
+            SELECT DISTINCT from_page_id FROM page_links
+            WHERE to_page_id IN (\(Self.placeholders(pageStrings.count)));
+            """, arguments: StatementArguments(pageStrings))
+            linkingIDStrings.formUnion(rows)
+        }
+        if !sourceStrings.isEmpty {
+            let rows = try String.fetchAll(db, sql: """
+            SELECT DISTINCT from_page_id FROM source_links
+            WHERE to_source_id IN (\(Self.placeholders(sourceStrings.count)));
+            """, arguments: StatementArguments(sourceStrings))
+            linkingIDStrings.formUnion(rows)
+        }
+        linkingIDStrings.subtract(pageStrings)
+        let linkingIDs = linkingIDStrings.sorted().map(PageID.init(rawValue:))
+
+        // Presentation titles for the linking pages (nil when the row vanished).
+        var titles: [String: String] = [:]
+        if !linkingIDs.isEmpty {
+            let linkingStrings = linkingIDs.map(\.rawValue)
+            let rows = try Row.fetchAll(db, sql: """
+            SELECT id, title FROM pages WHERE id IN (\(Self.placeholders(linkingStrings.count)));
+            """, arguments: StatementArguments(linkingStrings))
+            for row in rows {
+                let rowID: String = row["id"]
+                let title: String? = row["title"]
+                if let title { titles[rowID] = title }
+            }
+        }
+        let linkingPages = linkingIDs.map { id in
+            DeletionLinkingPage(pageID: id, title: titles[id.rawValue])
+        }
+
+        // Incoming link EDGE count, excluding edges that start on a page in
+        // the deletion set (those spans vanish with their page — they neither
+        // survive as ghost links nor get unlinked).
+        var incomingLinkCount = 0
+        if !pageStrings.isEmpty {
+            incomingLinkCount += try Int.fetchOne(db, sql: """
+            SELECT COUNT(*) FROM page_links
+            WHERE to_page_id IN (\(Self.placeholders(pageStrings.count)))
+              AND from_page_id NOT IN (\(Self.placeholders(pageStrings.count)));
+            """, arguments: StatementArguments(pageStrings + pageStrings)) ?? 0
+        }
+        if !sourceStrings.isEmpty {
+            incomingLinkCount += try Int.fetchOne(db, sql: """
+            SELECT COUNT(*) FROM source_links
+            WHERE to_source_id IN (\(Self.placeholders(sourceStrings.count)))
+              AND from_page_id NOT IN (\(Self.placeholders(pageStrings.count)));
+            """, arguments: StatementArguments(sourceStrings + pageStrings)) ?? 0
+        }
+
+        // Matching bookmark leaves. Only page/source REF kinds match — folders
+        // and chat refs are untouched by construction.
+        var matchedNodes: [(id: String, parentID: String?)] = []
+        if !pageStrings.isEmpty || !sourceStrings.isEmpty {
+            var conditions: [String] = []
+            var values: [String] = []
+            if !pageStrings.isEmpty {
+                conditions.append("(kind = ? AND target_id IN (\(Self.placeholders(pageStrings.count))))")
+                values.append(BookmarkNodeKind.pageRef.rawValue)
+                values.append(contentsOf: pageStrings)
+            }
+            if !sourceStrings.isEmpty {
+                conditions.append("(kind = ? AND target_id IN (\(Self.placeholders(sourceStrings.count))))")
+                values.append(BookmarkNodeKind.sourceRef.rawValue)
+                values.append(contentsOf: sourceStrings)
+            }
+            let rows = try Row.fetchAll(db, sql: """
+            SELECT id, parent_id FROM bookmark_nodes
+            WHERE \(conditions.joined(separator: " OR "))
+            ORDER BY id ASC;
+            """, arguments: StatementArguments(values))
+            for row in rows {
+                let parentID: String? = row["parent_id"]
+                matchedNodes.append((row["id"], parentID))
+            }
+        }
+
+        // Folder display paths (presentation): walk each matched node's parent
+        // chain through the folder-label map. Same spelling as the model's
+        // `bookmarkDisplayPath` — `"Bookmarks"` for root-level nodes.
+        let folderMap = try Self.folderLabels(on: db)
+        let matchedBookmarks: [DeletionBookmarkImpact] = matchedNodes.map { node in
+            let path = Self.bookmarkFolderPath(
+                parentID: node.parentID, folderLabels: folderMap) ?? "Bookmarks"
+            return DeletionBookmarkImpact(
+                nodeID: BookmarkID(rawValue: node.id),
+                folderPath: path)
+        }
+
+        // Provenance blockers for the selected sources, in the raw
+        // (page, version, source) SQL order, deduplicated across sources.
+        var blockers: [ProvenanceDeletionBlocker] = []
+        var seenBlockers = Set<ProvenanceDeletionBlocker>()
+        for sourceID in sourceIDs {
+            for blocker in try provenanceDeletionBlockers(sourceID: sourceID, on: db)?.values ?? [] {
+                if seenBlockers.insert(blocker).inserted {
+                    blockers.append(blocker)
+                }
+            }
+        }
+
+        return DeletionImpact(
+            linkingPages: linkingPages,
+            bookmarks: matchedBookmarks,
+            provenanceBlockers: blockers,
+            incomingLinkCount: incomingLinkCount)
+    }
+
+    /// `(?, ?, …)` with `count` placeholders — the expanded IN-clause form.
+    /// The store binds IN lists by explicit placeholders (GRDB expands each
+    /// bound value), which keeps every argument a plain `String` at the type
+    /// level instead of a nested array.
+    private static func placeholders(_ count: Int) -> String {
+        Array(repeating: "?", count: count).joined(separator: ", ")
+    }
+
+    /// All folder nodes as `(id → (parent, label))`, for display-path walks.
+    private static func folderLabels(on db: Database) throws -> [String: (parent: String?, label: String)] {
+        let rows = try Row.fetchAll(db, sql: """
+        SELECT id, parent_id, label FROM bookmark_nodes WHERE kind = ?;
+        """, arguments: [BookmarkNodeKind.folder.rawValue])
+        var map: [String: (parent: String?, label: String)] = [:]
+        for row in rows {
+            let parentID: String? = row["parent_id"]
+            let label: String? = row["label"]
+            map[row["id"]] = (parentID, label ?? "")
+        }
+        return map
+    }
+
+    /// The slash-delimited folder path above `parentID` (`"Bookmarks"` when
+    /// the node sits at the root or the chain can't be resolved). Mirrors
+    /// `BookmarkNode.displayPath` + the model's `bookmarkDisplayPath`.
+    private static func bookmarkFolderPath(
+        parentID: String?, folderLabels: [String: (parent: String?, label: String)]
+    ) -> String? {
+        guard let parentID else { return nil } // root-level → caller says "Bookmarks"
+        var segments: [String] = []
+        var current: String? = parentID
+        var depth = 0
+        let maxDepth = 64
+        while let id = current, depth < maxDepth {
+            depth += 1
+            guard let folder = folderLabels[id] else { break }
+            if !folder.label.isEmpty { segments.insert(folder.label, at: 0) }
+            current = folder.parent
+        }
+        let path = segments.joined(separator: " / ")
+        return path.isEmpty ? nil : path
+    }
+
+    /// Rewrites one linking page's body so every span pointing at a deleted
+    /// target becomes plain text, then persists the rewrite (new immutable
+    /// version + rebuilt link rows) inside the caller's transaction. Returns
+    /// `false` when the page was skipped (in the deletion set, missing, or
+    /// nothing matched). Only the MATCHING spans change — unrelated links and
+    /// protected code ranges stay byte-identical (AC.4) — and the page's
+    /// `page_links` / `source_links` rows are rebuilt from the final body in
+    /// the same transaction.
+    private func rewritePageUnlinkingTargets(
+        pageID: PageID,
+        deletedPageIDs: [PageID],
+        deletedSourceIDs: [SourceID],
+        on db: Database
+    ) throws -> Bool {
+        // Never rewrite a page that is itself being deleted (AC.5).
+        guard !deletedPageIDs.contains(pageID) else { return false }
+        guard let row = try Row.fetchOne(db, sql: """
+        SELECT title, body_markdown FROM pages WHERE id = ?;
+        """, arguments: [pageID.rawValue]) else { return false }
+        let title: String = row["title"]
+        let body: String = row["body_markdown"]
+
+        // Name-based links still resolve here because the target rows are
+        // deleted LATER in this same transaction.
+        guard let rewritten = try LinkUnlinker.unlink(
+            in: body,
+            unlinkPageIDs: Set(deletedPageIDs),
+            unlinkSourceIDs: Set(deletedSourceIDs),
+            resolvePageName: { try self.resolveTitleToIDLocked($0, in: db) },
+            resolveSourceName: { try self.resolveSourceByNameLocked($0, in: db) }
+        ) else { return false }
+
+        try persistPageRewrite(pageID: pageID, title: title, body: rewritten, on: db)
+        return true
+    }
+
+    /// Persists one rewritten page through the internal version-write helper —
+    /// the same page-version + provenance + mirror + ref rules as `updatePage`
+    /// (minus amend coalescing, so a batch rewrite is always a deterministic
+    /// new version) — and rebuilds the page's link rows from the final body,
+    /// all on the caller's database handle. Emits nothing; the outer
+    /// `mutateBatch` owns the event batch.
+    private func persistPageRewrite(
+        pageID: PageID, title: String, body: String, on db: Database
+    ) throws {
+        let bodyData = Data(body.utf8)
+        let hash = portableSHA256(bodyData)
+            .map { String(format: "%02x", $0) }.joined()
+        let now = Date()
+        let slug = try uniqueSlug(from: title, id: pageID, on: db)
+        let head = try Self.pageHeadVersionIDLocked(pageID: pageID, on: db)
+        _ = try createPageVersionWithProvenance(on: db, request: .init(
+            pageID: pageID, head: head, mergeParentID: nil, title: title, body: body,
+            bodyData: bodyData, hash: hash,
+            activityAgent: .pageAuthor(PageAuthor.agent("unlink").rawValue),
+            activityKind: "edit", now: now, nowTS: now.timeIntervalSince1970,
+            provenance: [],
+            publication: .main(slug: slug, mirrorMutation: .append)))
+        try replaceLinksLocked(
+            from: pageID, parsedLinks: WikiLinkParser.parse(body), on: db)
+    }
+
+    /// Deletes every bookmark leaf whose (kind, target_id) matches the given
+    /// page/source ids, renumbers each affected sibling group, and returns the
+    /// removed node ids in deterministic (raw ULID) order.
+    private func deleteBookmarksMatching(
+        pageIDs: [PageID], sourceIDs: [SourceID], on db: Database
+    ) throws -> [BookmarkID] {
+        let pageStrings = pageIDs.map(\.rawValue)
+        let sourceStrings = sourceIDs.map(\.rawValue)
+        guard !pageStrings.isEmpty || !sourceStrings.isEmpty else { return [] }
+
+        var conditions: [String] = []
+        var values: [String] = []
+        if !pageStrings.isEmpty {
+            conditions.append("(kind = ? AND target_id IN (\(Self.placeholders(pageStrings.count))))")
+            values.append(BookmarkNodeKind.pageRef.rawValue)
+            values.append(contentsOf: pageStrings)
+        }
+        if !sourceStrings.isEmpty {
+            conditions.append("(kind = ? AND target_id IN (\(Self.placeholders(sourceStrings.count))))")
+            values.append(BookmarkNodeKind.sourceRef.rawValue)
+            values.append(contentsOf: sourceStrings)
+        }
+        let rows = try Row.fetchAll(db, sql: """
+        SELECT id, parent_id FROM bookmark_nodes
+        WHERE \(conditions.joined(separator: " OR "))
+        ORDER BY id ASC;
+        """, arguments: StatementArguments(values))
+        guard !rows.isEmpty else { return [] }
+
+        var removedIDs: [String] = []
+        var affectedParents: Set<String?> = []
+        for row in rows {
+            let id: String = row["id"]
+            let parentID: String? = row["parent_id"]
+            removedIDs.append(id)
+            affectedParents.insert(parentID)
+        }
+        try db.execute(
+            sql: "DELETE FROM bookmark_nodes WHERE id IN (\(Self.placeholders(removedIDs.count)));",
+            arguments: StatementArguments(removedIDs))
+        for parent in affectedParents {
+            try Self.renumberBookmarkSiblings(parentID: parent, on: db)
+        }
+        return removedIDs.map(BookmarkID.init(rawValue:))
+    }
+
+    /// Makes one sibling group's positions contiguous (0, 1, 2, …), oldest
+    /// first. Shared by `deleteBookmarkNode` and the protected deletion's
+    /// batch cleanup.
+    private static func renumberBookmarkSiblings(parentID: String?, on db: Database) throws {
+        let parentColumn = parentID != nil ? "parent_id = ?" : "parent_id IS NULL"
+        let sibRows = try Row.fetchAll(
+            db,
+            sql: "SELECT id FROM bookmark_nodes WHERE \(parentColumn) ORDER BY position ASC;",
+            arguments: parentID.map { [$0] } ?? []
+        )
+        for (i, row) in sibRows.enumerated() {
+            let childID: String = row["id"]
+            try db.execute(
+                sql: "UPDATE bookmark_nodes SET position = ? WHERE id = ?;",
+                arguments: [i, childID]
+            )
+        }
+    }
+
+    /// Deletes one page row and its dependent graph rows (the FK sweep the
+    /// legacy `deletePage` owned). Returns `false` when the page row is
+    /// already gone (idempotent no-op).
+    private func deletePageTargetRow(_ id: PageID, on db: Database) throws -> Bool {
+        let exists = try Int.fetchOne(
+            db, sql: "SELECT 1 FROM pages WHERE id = ?;",
+            arguments: [id.rawValue]) ?? 0
+        guard exists == 1 else { return false }
+        // FK safety: page_links, attachments, source_links all have FKs
+        // onto pages(id) WITHOUT ON DELETE CASCADE (unlike page_chunks).
+        // Clear every dependent row first, then delete the page.
+        try db.execute(sql: "DELETE FROM page_links WHERE from_page_id = ? OR to_page_id = ?;",
+                       arguments: [id.rawValue, id.rawValue])
+        try db.execute(sql: "DELETE FROM source_links WHERE from_page_id = ?;",
+                       arguments: [id.rawValue])
+        try db.execute(sql: "DELETE FROM attachments WHERE page_id = ?;",
+                       arguments: [id.rawValue])
+        try db.execute(sql: "DELETE FROM refs WHERE owner_id = ? AND kind = 'page-content';",
+                       arguments: [id.rawValue])
+        try db.execute(sql: "DELETE FROM pages WHERE id = ?;",
+                       arguments: [id.rawValue])
+        return true
+    }
+
+    /// Deletes one source row (its versions cascade; blobs and activities fall
+    /// to lazy GC). Returns `false` when the source row is already gone
+    /// (idempotent no-op). Provenance validation already ran for the whole
+    /// batch before the first mutation.
+    private func deleteSourceTargetRow(_ id: SourceID, on db: Database) throws -> Bool {
+        let exists = try Int.fetchOne(
+            db, sql: "SELECT 1 FROM sources WHERE id = ?;",
+            arguments: [id.rawValue]) ?? 0
+        guard exists == 1 else { return false }
+        try db.execute(sql: "DELETE FROM sources WHERE id = ?;",
+                       arguments: [id.rawValue])
+        return true
     }
 
     /// The page-version provenance edges that prevent `sourceID` from being
@@ -5210,6 +5870,141 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 activityID: activityID,
                 externalIdentity: provenance?.externalIdentity, fetchedAt: now
             )
+        }
+    }
+
+    /// The `attachAcquiredBytes` implementation: same single-`mutate()`
+    /// transaction as before the acquisition-neutral rename — blob, hash-diff
+    /// version, mirror refresh, retained external-provenance columns.
+    public func attachAcquiredBytes(
+        sourceID: SourceID,
+        bytes: Data,
+        mimeType: String,
+        externalItemKey: String?,
+        externalItemTitle: String?,
+        displayName: String?
+    ) throws -> SourceVersion {
+        // The declared MIME is authoritative data from the result frame; the
+        // file extension derives from it. Detection stays out of this path:
+        // the reviewed package reported the true content type.
+        let ext = {
+            #if canImport(UniformTypeIdentifiers)
+            return UTType(mimeType: mimeType)?.preferredFilenameExtension?.lowercased()
+            #else
+            return nil
+            #endif
+        }() ?? ""
+        let sanitizedDisplayName = displayName.map { WikiNameRules.sanitized($0) }
+        return try mutate(event: { _ in
+            self.localEvent(.source, id: sourceID.rawValue, change: .updated)
+        }) { db in
+            guard bytes.count <= Self.ingestByteCap else {
+                throw WikiStoreError.unexpected(
+                    "source \(bytes.count) bytes exceeds cap \(Self.ingestByteCap)")
+            }
+            let contentHash = portableSHA256( bytes)
+                .map { String(format: "%02x", $0) }.joined()
+            let now = Date()
+            let nowTS = now.timeIntervalSince1970
+
+            guard let existing = try Row.fetchOne(
+                db,
+                sql: "SELECT content_hash FROM sources WHERE id = ?;",
+                arguments: [sourceID.rawValue]
+            ) else {
+                throw WikiStoreError.sourceNotFound(sourceID)
+            }
+            let previousHash: String? = existing["content_hash"]
+            let bytesChanged = previousHash != contentHash
+
+            // 1. Blob (identical bytes = one row, ever).
+            try db.execute(sql: """
+            INSERT OR IGNORE INTO blobs (hash, byte_size, content) VALUES (?, ?, ?);
+            """, arguments: [contentHash, Int64(bytes.count), bytes])
+
+            let parent = try self.activeContentVersion(sourceID: sourceID, on: db)
+            let prevGeneration = try self.refGeneration(sourceID: sourceID, on: db)
+
+            var versionID = parent?.id
+            // 2. A new version row only when the bytes actually changed
+            //    (hash-diff — the same gate addSource's dedup applies to a
+            //    whole-source import). Provenance-only re-syncs reuse the
+            //    current version.
+            if bytesChanged {
+                // Reuse the current version's activity: the download belongs
+                // to the same fetch lineage the sync command recorded.
+                let activityID: String? = parent?.activityID
+                let newVersionID = SourceVersionID(rawValue: ULID.generate())
+                try db.execute(sql: """
+                INSERT INTO source_versions (id, source_id, parent_id, blob_hash,
+                                             mime_type, activity_id, external_identity, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """, arguments: [newVersionID.rawValue, sourceID.rawValue, parent?.id.rawValue,
+                                contentHash, mimeType, activityID,
+                                externalItemKey, nowTS])
+                // 3. UPSERT the active ref (generation + 1).
+                let nextGeneration = (prevGeneration ?? 0) + 1
+                try db.execute(sql: """
+                INSERT INTO refs (kind, owner_id, version_id, generation, updated_at)
+                VALUES ('source-content', ?, ?, ?, ?)
+                ON CONFLICT(kind, owner_id) DO UPDATE SET
+                    version_id = excluded.version_id,
+                    generation = excluded.generation,
+                    updated_at = excluded.updated_at;
+                """, arguments: [sourceID.rawValue, newVersionID.rawValue,
+                                Int64(nextGeneration), nowTS])
+                versionID = newVersionID
+            }
+
+            // 4. Refresh the denormalized mirror: real MIME, ext from MIME,
+            //    byte size, hash, and the retained external-provenance
+            //    columns. The display name is replaced only when provided.
+            try db.execute(sql: """
+            UPDATE sources SET
+                mime_type = ?,
+                ext = ?,
+                byte_size = ?,
+                content_hash = ?,
+                zotero_item_key = COALESCE(?, zotero_item_key),
+                zotero_item_title = COALESCE(?, zotero_item_title),
+                display_name = COALESCE(?, display_name),
+                updated_at = ?,
+                version = version + 1
+            WHERE id = ?;
+            """, arguments: [mimeType, ext, Int64(bytes.count), contentHash,
+                            externalItemKey, externalItemTitle, sanitizedDisplayName,
+                            nowTS, sourceID.rawValue])
+
+            return SourceVersion(
+                id: versionID ?? SourceVersionID(rawValue: ULID.generate()),
+                sourceID: sourceID, parentID: parent?.id,
+                blobHash: contentHash,
+                mimeType: mimeType,
+                activityID: parent?.activityID,
+                externalIdentity: externalItemKey, fetchedAt: now
+            )
+        }
+    }
+
+    public func setAcquisitionProvenance(
+        sourceID: SourceID,
+        externalItemKey: String?,
+        externalItemTitle: String?,
+        displayName: String?
+    ) throws {
+        let sanitizedDisplayName = displayName.map { WikiNameRules.sanitized($0) }
+        try mutate(event: { _ in
+            self.localEvent(.source, id: sourceID.rawValue, change: .updated)
+        }) { db in
+            try db.execute(sql: """
+            UPDATE sources SET
+                zotero_item_key = COALESCE(?, zotero_item_key),
+                zotero_item_title = COALESCE(?, zotero_item_title),
+                display_name = COALESCE(?, display_name),
+                updated_at = ?
+            WHERE id = ?;
+            """, arguments: [externalItemKey, externalItemTitle, sanitizedDisplayName,
+                            Date().timeIntervalSince1970, sourceID.rawValue])
         }
     }
 
@@ -5686,6 +6481,60 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         return version
     }
 
+    /// The CAS-protected `.user` rewrite seam (CLI `source edit-markdown`).
+    /// Inside ONE `mutate` transaction: read the active head with the
+    /// db-taking helper, compare it with `expectedHead`, and only on a match
+    /// store the blob, insert one `.user` version whose parent is that head,
+    /// update the active `source-derived` ref, and refresh inline FTS. On
+    /// mismatch the throw happens BEFORE any write — no version, no ref, no
+    /// FTS row, no event, no embedding work, no head diagnostic. Post-commit
+    /// behavior mirrors `appendProcessedMarkdown`: exactly one source-update
+    /// event (via `mutate`'s event seam) and one embedding schedule.
+    public func appendUserProcessedMarkdown(
+        sourceID: SourceID, content: String, expectedHead: SourceMarkdownVersionID
+    ) throws -> SourceMarkdownVersion {
+        let version: SourceMarkdownVersion = try mutate(event: { _ in
+            self.localEvent(.source, id: sourceID.rawValue, change: .updated)
+        }) { db in
+            // CAS read with the db-taking helper (the public
+            // `processedMarkdownHead` re-enters `dbWriter.read` — deadlock).
+            guard let currentHead = try self.processedMarkdownHead(sourceID: sourceID, on: db) else {
+                throw WikiStoreError.noProcessedMarkdown(sourceID)
+            }
+            guard currentHead.id == expectedHead else {
+                throw SourceMarkdownConflictError(
+                    sourceID: sourceID, expectedHead: expectedHead,
+                    currentHead: currentHead.id)
+            }
+            let id = SourceMarkdownVersionID(rawValue: ULID.generate())
+            let now = Date()
+            // CAS the body: hash → INSERT OR IGNORE blob.
+            let blobHash = try self.storeMarkdownBlob(content, on: db)
+
+            try db.execute(sql: """
+            INSERT INTO source_markdown_versions
+              (id, file_id, parent_id, origin, note, created_at,
+               blob_hash, mime_type, technique)
+            VALUES (?, ?, ?, 'user', NULL, ?, ?, 'text/markdown', NULL);
+            """, arguments: [id.rawValue, sourceID.rawValue, currentHead.id.rawValue,
+                             now.timeIntervalSince1970, blobHash])
+            try self.upsertMarkdownDerivedRef(
+                sourceID: sourceID, versionID: id, now: now.timeIntervalSince1970, on: db)
+
+            // FTS refresh inline (pure SQL) so keyword search finds the new content.
+            self.upsertSourceSearch(sourceID: sourceID, body: content, on: db)
+
+            return SourceMarkdownVersion(
+                id: id, sourceID: sourceID, parentID: currentHead.id,
+                content: content, origin: .user, note: nil, createdAt: now,
+                blobHash: blobHash, mimeType: MimeType.markdown, technique: nil
+            )
+        }
+        // Post-commit: re-embed from the just-written content + name.
+        reembedSource(sourceID: sourceID, body: content)
+        return version
+    }
+
     /// Canonical append-only persistence for extraction and transcript output.
     /// All rows that describe one derived artifact commit together, followed by
     /// one source update event outside the transaction.
@@ -5773,14 +6622,24 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     /// Append one package-backed result with its exact revision and registration.
     /// The tagged activity plan is authoritative. Legacy normalized columns keep
     /// the package name and digest without presenting them as a model.
+    ///
+    /// The origin is derived by the caller's typed result mode: `.extraction`
+    /// for PDF/HTML/DOCX package results, `.transcript` for package
+    /// transcripts. A package transcript REQUIRES `sourceVersionID` — the
+    /// source's immutable initial version — and the write fails before any
+    /// row is written when it is missing (issue #251 lineage).
     public func appendInstalledPackageMarkdown(
         sourceID: SourceID, content: String,
         package: ExtractionInstalledPackageProducer,
+        origin: SourceMarkdownOrigin = .extraction,
         toolVersion: String? = nil, sourceVersionID: SourceVersionID? = nil,
         note: String? = nil
     ) throws -> SourceMarkdownVersion {
-        try appendDerivedMarkdown(
-            sourceID: sourceID, content: content, origin: .extraction,
+        if origin == .transcript, sourceVersionID == nil {
+            throw AppendDerivedMarkdownError.missingInitialSourceVersion(sourceID)
+        }
+        return try appendDerivedMarkdown(
+            sourceID: sourceID, content: content, origin: origin,
             producer: .installedPackage(package), providerID: nil, modelID: nil,
             toolVersion: toolVersion, sourceVersionID: sourceVersionID, note: note)
     }
@@ -6401,6 +7260,48 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 """,
                 arguments: [sourceID.rawValue]
             ).map(PageVersionID.init(rawValue:))
+        }
+    }
+
+    /// The distinct pages whose recorded page-version provenance cites any of
+    /// `sourceIDs` (protocol docs above). The inverse walk of the same edges
+    /// `provenanceDeletionBlockers` uses, projected onto pages: distinct
+    /// `page_id`s joined to their live `pages` title (LEFT JOIN — a citation
+    /// edge that outlived its page row degrades to `title: nil` instead of
+    /// dropping the evidence). Ordering per protocol: live pages first
+    /// (case-insensitive title, then page id), `nil`-title rows last — the
+    /// honest degradation never outranks real pages. `tableExists` guard
+    /// keeps pre-v48 stores (and in-memory fixtures created before the
+    /// provenance tables) returning `[]` rather than throwing. Read-only →
+    /// emits no `ResourceChangeEvent`.
+    public func pagesCitingSources(sourceIDs: [SourceID], limit: Int) throws -> [CitedPage] {
+        guard limit > 0 else { return [] }
+        // Dedupe: payload inventories can carry duplicate IDs; the citation
+        // edges are a set, and a duplicated argument must not distort LIMIT.
+        let ids = Set(sourceIDs.map(\.rawValue)).sorted()
+        guard !ids.isEmpty else { return [] }
+        return try dbWriter.read { db in
+            guard try Self.tableExists("page_version_sources", in: db) else { return [] }
+            let placeholders = ids.map { _ in "?" }.joined(separator: ", ")
+            var arguments = StatementArguments(ids)
+            arguments += [limit]
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT DISTINCT pv.page_id AS page_id, p.title AS title
+                FROM page_version_sources pvs
+                JOIN page_versions pv ON pv.id = pvs.page_version_id
+                LEFT JOIN pages p ON p.id = pv.page_id
+                WHERE pvs.source_id IN (\(placeholders))
+                ORDER BY (p.title IS NULL), p.title COLLATE NOCASE, pv.page_id ASC
+                LIMIT ?;
+                """,
+                arguments: arguments)
+            return rows.map { row in
+                CitedPage(
+                    pageID: PageID(rawValue: row["page_id"]),
+                    title: row["title"] as String?)
+            }
         }
     }
 
@@ -8304,28 +9205,9 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 sql: "DELETE FROM bookmark_nodes WHERE id = ?;",
                 arguments: [id.rawValue]
             )
-            // Renumber old siblings to be contiguous.
-            let parentColumn: String
-            let parentArg: String?
-            if let oldParent {
-                parentColumn = "parent_id = ?"
-                parentArg = oldParent
-            } else {
-                parentColumn = "parent_id IS NULL"
-                parentArg = nil
-            }
-            let sibRows = try Row.fetchAll(
-                db,
-                sql: "SELECT id FROM bookmark_nodes WHERE \(parentColumn) ORDER BY position ASC;",
-                arguments: parentArg.map { [$0] } ?? []
-            )
-            for (i, row) in sibRows.enumerated() {
-                let childID: String = row["id"]
-                try db.execute(
-                    sql: "UPDATE bookmark_nodes SET position = ? WHERE id = ?;",
-                    arguments: [i, childID]
-                )
-            }
+            // Renumber old siblings to be contiguous (shared with the
+            // protected deletion's batch cleanup).
+            try Self.renumberBookmarkSiblings(parentID: oldParent, on: db)
         }
     }
 
@@ -9325,18 +10207,16 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             ) ?? 0
             let checkpoint = ChatTranscriptCursor(rawValue: checkpointRaw)
             let lowerBound = cursor?.rawValue ?? 0
-            // `chat_messages` is the compatibility projection: its dense
-            // zero-based seq is the one-based durable transcript cursor minus one.
+            // v54 (#1266): the summary lives on the durable transcript row
+            // itself; no compatibility join is needed.
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                SELECT ti.chat_id, ti.cursor, ti.item_json, ti.projected_event_json,
-                       ti.projected_text, ti.created_at, m.summary AS cached_response_summary
-                FROM chat_transcript_items AS ti
-                LEFT JOIN chat_messages AS m
-                    ON m.chat_id = ti.chat_id AND m.seq = ti.cursor - 1
-                WHERE ti.chat_id = ? AND ti.cursor > ?
-                ORDER BY ti.cursor ASC
+                SELECT chat_id, cursor, item_json, projected_event_json,
+                       projected_text, created_at, summary
+                FROM chat_transcript_items
+                WHERE chat_id = ? AND cursor > ?
+                ORDER BY cursor ASC
                 LIMIT ?;
                 """,
                 arguments: [chatID.rawValue, lowerBound, max(0, limit)]
@@ -9390,20 +10270,14 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             let rows = try Row.fetchAll(db, sql: """
             SELECT c.id, c.kind, c.title, c.created_at, c.updated_at,
                    (SELECT COUNT(*) FROM chat_messages m WHERE m.chat_id = c.id) AS msg_count,
-                   c.summary, c.summary_at, c.acp_session_id,
+                   c.acp_session_id,
                    c.model_provider_id, c.model_id,
                    c.configured_thinking_option_id, c.effective_thinking_option_id
             FROM chats c
             ORDER BY c.updated_at DESC, c.rowid DESC;
             """)
             return rows.map { row in
-                let summary: String? = row["summary"]
-                let summaryAt: Double? = row["summary_at"]
-                return Self.readChatSummary(
-                    from: row,
-                    summary: summary,
-                    summaryAt: summaryAt.map { Date(timeIntervalSince1970: $0) }
-                )
+                Self.readChatSummary(from: row)
             }
         }
     }
@@ -9412,7 +10286,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     public func chatMessages(chatID: ChatID) throws -> [ChatMessage] {
         try dbWriter.read { db in
             let rows = try Row.fetchAll(db, sql: """
-            SELECT id, seq, event_json, created_at, summary, summary_kind, summary_at, is_draft
+            SELECT id, seq, event_json, created_at, is_draft
             FROM chat_messages
             WHERE chat_id = ? ORDER BY seq ASC;
             """, arguments: [chatID.rawValue])
@@ -9424,21 +10298,12 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                     let data = json.data(using: .utf8),
                     let event = DebugLog.trying("listChatMessages", operation: { try decoder.decode(AgentEvent.self, from: data) })
                 else { continue }
-                // Decode-if-present for the nullable summary columns
-                // (chat-summary plan §3.4). Pre-v40 rows and unsummarized
-                // messages surface as nil.
-                let summary: String? = row["summary"]
-                let summaryKindRaw: String? = row["summary_kind"]
-                let summaryAtDouble: Double? = row["summary_at"]
                 out.append(ChatMessage(
                     id: PageID(rawValue: row["id"]),
                     chatID: chatID,
                     seq: row["seq"],
                     event: event,
                     createdAt: Date(timeIntervalSince1970: row["created_at"]),
-                    summary: summary,
-                    summaryKind: summaryKindRaw.flatMap(ChatMessageSummaryKind.init(rawValue:)),
-                    summaryAt: summaryAtDouble.map { Date(timeIntervalSince1970: $0) },
                     isDraft: (row["is_draft"] as Int?) == 1
                 ))
             }
@@ -9462,20 +10327,80 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
 
             // Refresh the FTS sidecar title so keyword search reflects the new
             // name (the body is unchanged). A no-op if no chat_search row exists
-            // yet (a chat with no messages has nothing to index). Mirrors
-            // `SQLiteWikiStore.renameChat`'s `upsertChatSearch(chatID:)`.
-            do {
-                let body: String = (try String.fetchOne(
-                    db,
-                    sql: "SELECT COALESCE(GROUP_CONCAT(text, '\n'), '') FROM chat_messages WHERE chat_id = ?;",
-                    arguments: [id.rawValue]
-                )) ?? ""
-                try db.execute(sql: """
-                INSERT OR REPLACE INTO chat_search (chat_id, title, body) VALUES (?, ?, ?);
-                """, arguments: [id.rawValue, title, body])
-            } catch {
-                DebugLog.store("GRDBWikiStore.renameChat: upsertChatSearch[\(id.rawValue)] failed — \(error)")
+            // yet (a chat with no messages has nothing to index).
+            Self.refreshChatSearch(db: db, chatID: id, title: title)
+        }
+    }
+
+    /// Refresh the FTS sidecar (title + concatenated message body) for a chat,
+    /// on the caller's open `Database` — one transaction with the mutation that
+    /// changed the title. A no-op when the chat has no messages (nothing to
+    /// index). Failures are logged, never thrown: search is a sidecar, and a
+    /// failed refresh must not roll back the title write. Mirrors
+    /// `SQLiteWikiStore.renameChat`'s `upsertChatSearch(chatID:)`.
+    private static func refreshChatSearch(db: Database, chatID: ChatID, title: String) {
+        do {
+            let body: String = (try String.fetchOne(
+                db,
+                sql: "SELECT COALESCE(GROUP_CONCAT(text, '\n'), '') FROM chat_messages WHERE chat_id = ?;",
+                arguments: [chatID.rawValue]
+            )) ?? ""
+            try db.execute(sql: """
+            INSERT OR REPLACE INTO chat_search (chat_id, title, body) VALUES (?, ?, ?);
+            """, arguments: [chatID.rawValue, title, body])
+        } catch {
+            DebugLog.store("GRDBWikiStore.refreshChatSearch[\(chatID.rawValue)] failed — \(error)")
+        }
+    }
+
+    /// Set a chat's title only when it is still empty (first send on an
+    /// app-created empty chat). ONE conditional `UPDATE` — `id` AND `title = ''`
+    /// predicates — so a concurrent manual rename can never be overwritten by a
+    /// stale read-then-write: the row simply doesn't match anymore.
+    ///
+    /// Emission is driven by the result: `true` (row titled) emits exactly one
+    /// `.chat .updated`; `false` (chat exists, already titled) emits nothing;
+    /// a missing chat throws `.chatNotFound` inside the savepoint so it rolls
+    /// back and emits nothing.
+    @discardableResult
+    public func setChatTitleIfEmpty(chatID: ChatID, title: String) throws -> Bool {
+        try setChatTitleIf(chatID: chatID, expectedTitle: "", title: title)
+    }
+
+    /// The shared conditional-title write: ONE `UPDATE` matching both the chat
+    /// id and the expected current title (empty string = the untitled case).
+    /// Emission is driven by the result: `true` (row written) emits exactly
+    /// one `.chat .updated`; `false` (current title differs — e.g. a manual
+    /// rename) emits nothing; a missing chat throws `.chatNotFound` inside the
+    /// savepoint so it rolls back and emits nothing.
+    @discardableResult
+    public func setChatTitleIf(
+        chatID: ChatID, expectedTitle: String, title: String
+    ) throws -> Bool {
+        try mutate(event: { titled in
+            titled ? self.localEvent(.chat, id: chatID.rawValue, change: .updated) : nil
+        }) { db in
+            try db.execute(sql: """
+            UPDATE chats SET title = ?, updated_at = ?
+            WHERE id = ? AND title = ?;
+            """, arguments: [title, Date().timeIntervalSince1970,
+                             chatID.rawValue, expectedTitle])
+            if db.changesCount > 0 {
+                // The chat just became searchable under its new title — refresh
+                // the sidecar in the same transaction.
+                Self.refreshChatSearch(db: db, chatID: chatID, title: title)
+                return true
             }
+            // No row matched: either the chat exists with a different title
+            // (valid no-op — e.g. a manual rename won the race) or it does not
+            // exist (error).
+            let exists = try Int.fetchOne(
+                db,
+                sql: "SELECT 1 FROM chats WHERE id = ?;",
+                arguments: [chatID.rawValue]
+            ) ?? 0
+            guard exists != 0 else { throw WikiStoreError.chatNotFound(chatID) }
+            return false
         }
     }
 
@@ -9486,18 +10411,6 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             // chat_messages cascade on DELETE.
             try db.execute(sql: "DELETE FROM chats WHERE id = ?;",
                            arguments: [id.rawValue])
-        }
-    }
-
-    public func updateChatSummary(chatID: ChatID, summary: String) throws {
-        try mutate(event: { _ in
-            self.localEvent(.chat, id: chatID.rawValue, change: .updated)
-        }) { db in
-            try db.execute(sql: """
-            UPDATE chats SET summary = ?, summary_at = ?, updated_at = ?
-            WHERE id = ?;
-            """, arguments: [summary, Date().timeIntervalSince1970,
-                            Date().timeIntervalSince1970, chatID.rawValue])
         }
     }
 
@@ -9568,8 +10481,11 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         }
     }
 
-    /// Write the cached one-line summary for a single assistant message
-    /// (chat-summary plan §3.5). Routes through `mutate(event:_:)` and emits a
+    /// Write the cached one-line summary for a single transcript item
+    /// (chat-summary plan §3.5; v54, issue #1266 — the summary lives on the
+    /// durable `chat_transcript_items` row, keyed by the durable cursor, and
+    /// a missing cursor row is a silent no-op because the caller's pending
+    /// snapshot was stale). Routes through `mutate(event:_:)` and emits a
     /// `.chat .updated` event on the chat the message belongs to — the
     /// projection + model subscribe to `.chat` changes, and there is no
     /// standalone `.message` resource kind (`chat_messages` cascade-delete with
@@ -9577,17 +10493,17 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     /// row overwrites the cached values), but the caller is expected to
     /// short-circuit when `summary` is non-nil (compute-once, AC.6).
     public func updateMessageSummary(
-        chatID: ChatID, messageID: PageID, summary: String, kind: ChatMessageSummaryKind
+        chatID: ChatID, cursor: ChatTranscriptCursor, summary: String, kind: ChatMessageSummaryKind
     ) throws {
         try mutate(event: { _ in
             self.localEvent(.chat, id: chatID.rawValue, change: .updated)
         }) { db in
             try db.execute(sql: """
-            UPDATE chat_messages
+            UPDATE chat_transcript_items
             SET summary = ?, summary_kind = ?, summary_at = ?
-            WHERE id = ?;
+            WHERE chat_id = ? AND cursor = ?;
             """, arguments: [summary, kind.rawValue,
-                            Date().timeIntervalSince1970, messageID.rawValue])
+                            Date().timeIntervalSince1970, chatID.rawValue, cursor.rawValue])
         }
     }
 
@@ -9597,20 +10513,14 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             let rows = try Row.fetchAll(db, sql: """
             SELECT c.id, c.kind, c.title, c.created_at, c.updated_at,
                    (SELECT COUNT(*) FROM chat_messages m WHERE m.chat_id = c.id) AS msg_count,
-                   c.summary, c.summary_at, c.acp_session_id,
+                   c.acp_session_id,
                    c.model_provider_id, c.model_id,
                    c.configured_thinking_option_id, c.effective_thinking_option_id
             FROM chats c
             ORDER BY c.id ASC;
             """)
             return rows.map { row in
-                let summary: String? = row["summary"]
-                let summaryAt: Double? = row["summary_at"]
-                return Self.readChatSummary(
-                    from: row,
-                    summary: summary,
-                    summaryAt: summaryAt.map { Date(timeIntervalSince1970: $0) }
-                )
+                Self.readChatSummary(from: row)
             }
         }
     }
@@ -9702,7 +10612,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 let rows = try Row.fetchAll(db, sql: """
                     SELECT c.id, c.kind, c.title, c.created_at, c.updated_at,
                            (SELECT COUNT(*) FROM chat_messages m WHERE m.chat_id = c.id) AS msg_count,
-                           c.summary, c.summary_at, cc.embedding, c.acp_session_id,
+                           cc.embedding, c.acp_session_id,
                            c.model_provider_id, c.model_id,
                            c.configured_thinking_option_id, c.effective_thinking_option_id
                     FROM chat_chunks cc
@@ -9724,12 +10634,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                     .sorted { $0.value.sim > $1.value.sim }
                     .prefix(pool)
                     .map { _, entry in
-                        let summary: String? = entry.row["summary"]
-                        let summaryAt: Double? = entry.row["summary_at"]
-                        return Self.readChatSummary(
-                            from: entry.row,
-                            summary: summary,
-                            summaryAt: summaryAt.map { Date(timeIntervalSince1970: $0) })
+                        return Self.readChatSummary(from: entry.row)
                     }
                 return Array(RankFusion.rrf([semRows, ftsRows], id: \.id).prefix(limit))
             }
@@ -10250,14 +11155,14 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         let projectedEventJSON: String? = row["projected_event_json"]
         let projectedText: String = row["projected_text"]
         let createdAt: Double = row["created_at"]
-        let cachedResponseSummary: String? = row["cached_response_summary"]
+        let summary: String? = row["summary"]
         return PersistedChatTranscriptItem(
             cursor: cursor,
             item: item,
             projectedEventJSON: projectedEventJSON,
             projectedPlainText: projectedText,
             createdAt: Date(timeIntervalSince1970: createdAt),
-            cachedResponseSummary: cachedResponseSummary
+            summary: summary
         )
     }
 
@@ -10436,9 +11341,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     /// Read a complete ChatSummary from a GRDB Row. Every caller selects the
     /// provider/model and thinking-selection columns so list, get, search, and
     /// File Provider projections preserve the same durable state.
-    private static func readChatSummary(
-        from row: Row, summary: String?, summaryAt: Date?
-    ) -> ChatSummary {
+    private static func readChatSummary(from row: Row) -> ChatSummary {
         let acpSessionId: String? = row["acp_session_id"]
         let modelProviderId: String? = row["model_provider_id"]
         let modelId: String? = row["model_id"]
@@ -10451,8 +11354,6 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             createdAt: Date(timeIntervalSince1970: row["created_at"]),
             updatedAt: Date(timeIntervalSince1970: row["updated_at"]),
             messageCount: row["msg_count"],
-            summary: summary,
-            summaryAt: summaryAt,
             acpSessionId: acpSessionId.map { AcpSessionID(rawValue: $0) },
             modelProviderId: modelProviderId.map { ProviderID(rawValue: $0) },
             modelId: modelId.map { ModelID(rawValue: $0) },
@@ -10841,6 +11742,12 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     /// probe).
 
 
+    /// Test seam: when non-nil, invoked IN PLACE of the real embedding work
+    /// (name read + chunked embeddings + chunk store). Lets `StoreEmissionTests`
+    /// / `SourceEmbeddingSearchTests` count embedding schedules for the CAS
+    /// write seams without loading an embedder. Not set in production code.
+    var reembedInterceptor: (@Sendable (SourceID, String) -> Void)?
+
     /// Best-effort re-embed of `sourceID` from `body`. Runs POST-commit (never
     /// inside `mutate`): reads the source name on its own, runs MLX chunked
     /// embeddings out-of-transaction, then writes via the existing public
@@ -10848,6 +11755,10 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     /// loaded (the model must be available to embed). Mirrors
     /// `SQLiteWikiStore.reembedSource` minus the lock-holding.
     private func reembedSource(sourceID: SourceID, body: String) {
+        if let reembedInterceptor {
+            reembedInterceptor(sourceID, body)
+            return
+        }
         guard let title = DebugLog.trying("reembedSource", operation: {
             try dbWriter.read { db in
                 try String.fetchOne(
@@ -11526,20 +12437,14 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 sql: """
                 SELECT c.id, c.kind, c.title, c.created_at, c.updated_at,
                        (SELECT COUNT(*) FROM chat_messages m WHERE m.chat_id = c.id) AS msg_count,
-                       c.summary, c.summary_at, c.acp_session_id,
+                       c.acp_session_id,
                        c.model_provider_id, c.model_id,
                        c.configured_thinking_option_id, c.effective_thinking_option_id
                 FROM chats c WHERE c.id = ?;
                 """,
                 arguments: [id.rawValue]
             ) else { throw WikiStoreError.chatNotFound(id) }
-            let summary: String? = row["summary"]
-            let summaryAt: Double? = row["summary_at"]
-            return Self.readChatSummary(
-                from: row,
-                summary: summary,
-                summaryAt: summaryAt.map { Date(timeIntervalSince1970: $0) }
-            )
+            return Self.readChatSummary(from: row)
         }
     }
 

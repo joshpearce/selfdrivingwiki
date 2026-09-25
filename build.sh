@@ -227,6 +227,14 @@ for package_dir in "${EXTRACTOR_PACKAGES_SRC}"/*; do
   cp -R "${package_dir}" "${DAEMON_EXTRACTOR_PACKAGES}/"
   echo "  ✓ bundled extractor package ${package_name}"
 done
+# Stage the reviewed packages beside build/wikictl as well: the CLI's
+# `extractor sync` discovery passes this directory as the reviewed overlay
+# root (ReviewedExtractorPackages.bundledRoot(explicitRoot:)), so a bare
+# `build/wikictl extractor sync <package>` finds declared packages even
+# before the app has published them into the durable machine catalog.
+# Idempotent: remove first so a package deleted from the tree disappears.
+rm -rf "${BUILD_DIR}/ExtractorPackages"
+cp -R "${EXTRACTOR_PACKAGES_SRC}" "${BUILD_DIR}/ExtractorPackages"
 for package_root in \
   "${APP_EXTRACTOR_PACKAGES}/SignedWikiDExtractorFixture" \
   "${DAEMON_EXTRACTOR_PACKAGES}/SignedWikiDExtractorFixture"; do
@@ -334,27 +342,76 @@ fi
 # Contents/Resources/ in .app/.appex) before falling back to Bundle.module
 # (which works in the SwiftPM .build context).
 SPM_RESOURCE_BUNDLE="${BIN_DIR}/WikiFS_WikiFSCore.bundle"
-if [ -d "${SPM_RESOURCE_BUNDLE}/Prompts" ]; then
+# SwiftPM's bundle layout is toolchain-dependent: older toolchains emit
+# resources directly inside the bundle (…/WikiFS_WikiFSCore.bundle/Prompts);
+# Swift 6.4 emits macOS-style bundles (…/Contents/Resources/Prompts). Resolve
+# whichever exists so the staging below works under both.
+SPM_BUNDLE_RESOURCES="${SPM_RESOURCE_BUNDLE}"
+if [ ! -d "${SPM_BUNDLE_RESOURCES}/Prompts" ] && [ -d "${SPM_RESOURCE_BUNDLE}/Contents/Resources" ]; then
+  SPM_BUNDLE_RESOURCES="${SPM_RESOURCE_BUNDLE}/Contents/Resources"
+fi
+if [ -d "${SPM_BUNDLE_RESOURCES}/Prompts" ]; then
   mkdir -p "${APPEX_CONTENTS}/Resources" "${DAEMON_XPC_CONTENTS}/Resources"
-  cp -R "${SPM_RESOURCE_BUNDLE}/Prompts" "${RESOURCES_DIR}/"
-  cp -R "${SPM_RESOURCE_BUNDLE}/Prompts" "${APPEX_CONTENTS}/Resources/"
-  cp -R "${SPM_RESOURCE_BUNDLE}/Prompts" "${DAEMON_XPC_CONTENTS}/Resources/"
+  cp -R "${SPM_BUNDLE_RESOURCES}/Prompts" "${RESOURCES_DIR}/"
+  cp -R "${SPM_BUNDLE_RESOURCES}/Prompts" "${APPEX_CONTENTS}/Resources/"
+  cp -R "${SPM_BUNDLE_RESOURCES}/Prompts" "${DAEMON_XPC_CONTENTS}/Resources/"
   echo "  ✓ bundled prompt resources into app + extension + wikid XPC service"
 else
   echo "  ⚠ SwiftPM resource bundle not found at ${SPM_RESOURCE_BUNDLE}" >&2
   echo "    Run 'make prompts' then rebuild. Prompt loading will crash at runtime." >&2
 fi
 
+# SwiftPM module bundles — every `Bundle.module` consumer in a packaged binary
+# needs its `<Owner>_<Module>.bundle` inside the packaged bundle's Resources
+# (the generated accessor looks in Bundle.main first). CordisLoader's
+# ProductionProfileResolver resolves shipped profile bundles at app/daemon
+# boot, so a missing WikiFS_CordisLoader.bundle trap-crashes the app at
+# launch (EXC_BREAKPOINT in resource_bundle_accessor.swift). Copy every
+# non-test module bundle from the SwiftPM products directory (same
+# flat-vs-Contents/Resources layouts as above) into the app, the File
+# Provider extension, and the wikid XPC service; codesign seals them as
+# nested bundles.
+stage_spm_bundles() {
+  local dest="$1"
+  local staged=0
+  for bundle in "${BIN_DIR}"/*.bundle; do
+    [ -d "${bundle}" ] || continue
+    local name
+    name="$(basename "${bundle}")"
+    case "${name}" in
+      *Tests*|*FuzzHarness*) continue ;;  # test-only targets
+    esac
+    # Idempotent: ${BUILD_DIR} is not wiped between builds (only the .app is),
+    # so replace any previous copy rather than merging into it.
+    rm -rf "${dest:?}/${name}"
+    cp -R "${bundle}" "${dest}/" 2>/dev/null || continue
+    staged=$((staged + 1))
+  done
+  echo "  ✓ staged ${staged} SwiftPM resource bundle(s) into ${dest}"
+}
+mkdir -p "${APPEX_CONTENTS}/Resources" "${DAEMON_XPC_CONTENTS}/Resources"
+stage_spm_bundles "${RESOURCES_DIR}"
+stage_spm_bundles "${APPEX_CONTENTS}/Resources"
+stage_spm_bundles "${DAEMON_XPC_CONTENTS}/Resources"
+# ...and beside build/wikictl. That copy is a bare executable with no Info.plist
+# and no enclosing bundle, so `Bundle.module` resolves only against the
+# executable's own directory — without the bundles here, the first dispatched
+# command that builds the Cordis composition dies with
+# "unable to find bundle named WikiFS_CordisLoader" (exit 133). Same source as
+# the app/appex/daemon staging above, so the copies cannot diverge; build/ is
+# not code-signed, so a plain cp -R is enough.
+stage_spm_bundles "${BUILD_DIR}"
+
 # RendererPackageGuide is a bounded WIKI_STATE.md reference, not a prompt.
 # Copy it beside the prompts so app, extension, and wikid XPC Bundle.main
 # lookups work after the built app is moved away from the originating .build
 # directory. RendererPackageGuide retains Bundle.module as the SwiftPM/test
 # fallback.
-if [ -f "${SPM_RESOURCE_BUNDLE}/wiki-state-chat-reference.md" ]; then
+if [ -f "${SPM_BUNDLE_RESOURCES}/wiki-state-chat-reference.md" ]; then
   mkdir -p "${APPEX_CONTENTS}/Resources" "${DAEMON_XPC_CONTENTS}/Resources"
-  cp "${SPM_RESOURCE_BUNDLE}/wiki-state-chat-reference.md" "${RESOURCES_DIR}/"
-  cp "${SPM_RESOURCE_BUNDLE}/wiki-state-chat-reference.md" "${APPEX_CONTENTS}/Resources/"
-  cp "${SPM_RESOURCE_BUNDLE}/wiki-state-chat-reference.md" "${DAEMON_XPC_CONTENTS}/Resources/"
+  cp "${SPM_BUNDLE_RESOURCES}/wiki-state-chat-reference.md" "${RESOURCES_DIR}/"
+  cp "${SPM_BUNDLE_RESOURCES}/wiki-state-chat-reference.md" "${APPEX_CONTENTS}/Resources/"
+  cp "${SPM_BUNDLE_RESOURCES}/wiki-state-chat-reference.md" "${DAEMON_XPC_CONTENTS}/Resources/"
   echo "  ✓ bundled renderer package guide into app + extension + wikid XPC service"
 else
   echo "  ⚠ WIKI_STATE renderer reference not found at ${SPM_RESOURCE_BUNDLE}" >&2
@@ -383,6 +440,13 @@ cat > "${CONTENTS}/Info.plist" <<PLIST
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
 	<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+	<!-- Add from URL defaults scheme-less input to HTTPS, but honors an explicit
+	     HTTP URL selected by the user. Because those hosts are not known at build
+	     time, a fixed NSExceptionDomains allowlist cannot support this workflow. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key><true/>
+	</dict>
 	<!-- Per-developer ids read at runtime by WikiIdentifiers (Bundle.main path).
 	     WIKIDaemonServiceID is the name the app passes to
 	     NSXPCConnection(serviceName:) — it MUST match wikid.xpc's
@@ -675,6 +739,13 @@ PLIST
   # Inside-out: sign nested Mach-O (the wikictl helper + the .appex) first, then
   # the outer app. wikictl needs no entitlements — it's an un-sandboxed helper
   # writing user-owned App Group files, launched by the un-sandboxed app.
+  # NOTE: do NOT add keychain-access-groups here to let `wikictl extractor
+  # sync` read the shared keychain directly. Restricted entitlements on a bare
+  # Mach-O require an embedded provisioning profile, and a profile cannot
+  # embed in a bare executable — AMFI SIGKILLs the helper at exec ("No
+  # matching profile found"; verified 2026-09-21). The sync command instead
+  # defers the API-key check to the entitled host that drains the job
+  # (app / wikid.xpc).
   echo "→ codesign wikictl helper (${IDENTITY})"
   codesign --force --timestamp=none --sign "${IDENTITY}" \
     "${HELPERS_DIR}/${CTL_NAME}"

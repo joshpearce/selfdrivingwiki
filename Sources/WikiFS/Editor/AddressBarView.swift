@@ -250,9 +250,10 @@ struct AddressBarView: View {
     private func navigate(to result: OmniboxResult) {
         switch result {
         case .ask(let question):
-            // Open a new chat tab with the question pre-filled (#288).
-            store.pendingChatQuestion = question
-            store.openTab(.newChat)
+            // Open a durable new chat with the question pre-filled (#288).
+            // beginNewChat persists the row first and installs the prefill
+            // only on success, so a failed creation never leaks the question.
+            store.beginNewChat(prefill: question)
         default:
             store.select(result.selection)
         }
@@ -325,6 +326,20 @@ struct AddressBarView: View {
         !addressString.isEmpty
     }
 
+    /// Resolves the address-bar text for an open chat. An empty (or
+    /// whitespace-only) row title is an UNTITLED chat, not "no content" —
+    /// every new chat starts untitled. The canonical "New Chat" fallback
+    /// (same label as `EditorTab`'s tab title and the sidebar cell) keeps
+    /// `hasContentLoaded` true, so opening a chat never flips the omnibox
+    /// into its search-first autofocus state. The previous "" return did
+    /// exactly that on every new chat and stole keyboard focus from the
+    /// chat's composer.
+    nonisolated static func chatAddress(in chats: [ChatSummary], chatID: ChatID) -> String {
+        let title = chats.first { $0.id == chatID }?.title ?? ""
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "[[chat:New Chat]]" : "[[chat:\(trimmed)]]"
+    }
+
     /// Resolves the active selection to its wikilink notation. Non-page
     /// selections (source, chat, …) show a best-effort pseudo-wikilink so the
     /// bar is never blank when something is open.
@@ -344,8 +359,7 @@ struct AddressBarView: View {
         case .bookmark:
             return ""
         case .chat(let id):
-            let title = store.chats.first { $0.id == id }?.title ?? ""
-            return title.isEmpty ? "" : "[[chat:\(title)]]"
+            return Self.chatAddress(in: store.chats, chatID: id)
         }
     }
 }

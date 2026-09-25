@@ -392,19 +392,20 @@ import SQLite3
         #expect(nodes.isEmpty)
     }
 
-    @Test func targetDeletedRefBecomesStale() throws {
+    /// Protected-delete invariant (issue #219 hardening): a supported page
+    /// deletion ALWAYS removes bookmarks targeting it — a bookmark to a
+    /// missing page is invalid, so no stale ref may survive.
+    @Test func protectedDeleteRemovesTargetingRefNotStale() throws {
         let store = try GRDBWikiStore(databaseURL: tempDatabaseURL())
         let page = try store.createPage(title: "Doomed")
-        let ref = try store.createBookmarkNode(
+        _ = try store.createBookmarkNode(
             parentID: nil, position: 0, content: .page(page.id))
 
-        // Delete the page.
+        // Delete the page through the protected contract.
         try store.deletePage(id: page.id)
 
-        // The ref is still there (stale — not auto-deleted).
-        let nodes = try store.listBookmarkNodes()
-        #expect(nodes.count == 1)
-        #expect(nodes.first?.content == ref.content)
+        // The ref is GONE (mandatory bookmark cleanup), not stale.
+        #expect(try store.listBookmarkNodes().isEmpty)
     }
 
     // MARK: - Move/reorder (AC.4)
@@ -665,7 +666,7 @@ private struct FixedRendererEventClock: RendererEventClock {
         #expect(first.scalarText("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='renderer_event_journal';") == "1")
 
         let reopened = try store(url: url)
-        #expect(reopened.pragmaValue("user_version") == "52")
+        #expect(reopened.pragmaValue("user_version") == "\(GRDBWikiStore.schemaVersion)")
         #expect(try reopened.listRendererWikiEnablement().isEmpty)
     }
 
@@ -847,13 +848,13 @@ private struct FixedRendererEventClock: RendererEventClock {
         #expect(try MetadataSQLiteFixtureSupport.scalar("PRAGMA user_version", at: url) == "48")
 
         let upgraded = try store(url: url)
-        #expect(upgraded.pragmaValue("user_version") == "52")
+        #expect(upgraded.pragmaValue("user_version") == "\(GRDBWikiStore.schemaVersion)")
         #expect(upgraded.scalarText("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='renderer_wiki_enablement';") == "1")
         #expect(upgraded.scalarText("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='renderer_event_journal_scope_sequence';") == "1")
         upgraded.close()
 
         let reopened = try store(url: url)
-        #expect(reopened.pragmaValue("user_version") == "52")
+        #expect(reopened.pragmaValue("user_version") == "\(GRDBWikiStore.schemaVersion)")
         #expect(try reopened.listRendererWikiEnablement().isEmpty)
     }
 

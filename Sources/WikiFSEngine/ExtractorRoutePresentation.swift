@@ -63,9 +63,19 @@ public struct ExtractorRouteDescriptor: Hashable, Sendable {
     public let displayName: String
     public let systemImage: String?
 
+    /// A route's display name is load-bearing UI: it is what the Defaults
+    /// table shows and what accessibility speaks. Every producer feeds it
+    /// from validated data (compiled host constants, manifest-validated
+    /// registration names, or the route's MIME), so a blank name is a
+    /// programmer error and crashes loudly at first touch instead of
+    /// rendering an empty row label.
     public init(route: ExtractorRouteID, displayName: String, systemImage: String?) {
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else {
+            preconditionFailure("route descriptor requires a non-blank display name for \(route)")
+        }
         self.route = route
-        self.displayName = displayName
+        self.displayName = trimmed
         self.systemImage = systemImage
     }
 }
@@ -113,7 +123,7 @@ public enum ExtractorRouteSetupReason: Hashable, Sendable {
     case unavailableACPProvider
     case invalidDoclingEndpoint
     case missingDoclingCredential
-    case unauthorizedDoclingCredential
+    case unauthorizedCredential
     case doclingConnectionFailed
 }
 
@@ -245,8 +255,8 @@ public enum ExtractorRouteHostCatalog {
         }
     }
 
-    /// Canonical routes in host display order (PDF first, then HTML, then
-    /// DOCX).
+    /// Canonical routes in host display order (PDF first, then HTML, DOCX,
+    /// and the transcript routes).
     public static let descriptors: [ExtractorRouteDescriptor] = [
         ExtractorRouteDescriptor(
             route: .canonicalPDF,
@@ -260,6 +270,18 @@ public enum ExtractorRouteHostCatalog {
             route: .canonicalDOCX,
             displayName: "Word",
             systemImage: "doc.text"),
+        ExtractorRouteDescriptor(
+            route: .canonicalPodcastTranscript,
+            displayName: "Podcast transcript",
+            systemImage: "mic"),
+        ExtractorRouteDescriptor(
+            route: .canonicalApplePodcastTranscript,
+            displayName: "Apple Podcasts transcript",
+            systemImage: "apple.logo"),
+        ExtractorRouteDescriptor(
+            route: .canonicalYouTubeTranscript,
+            displayName: "YouTube transcript",
+            systemImage: "play.rectangle"),
     ]
 
     /// The host's fixed choices for one route. Only canonical routes have
@@ -298,6 +320,42 @@ public enum ExtractorRouteHostCatalog {
                     route: route,
                     reference: .none,
                     displayName: "No default (use the reviewed package)",
+                    category: .prompt),
+            ]
+        }
+        if route == .canonicalPodcastTranscript {
+            // Package-only, and unlike DOCX the explicit no-default record
+            // DISABLES the route — it does not map back to the reviewed
+            // package. Package choices come from the registration snapshot.
+            return [
+                ExtractorRouteChoice(
+                    route: route,
+                    reference: .none,
+                    displayName: "No default (disable podcast transcripts)",
+                    category: .prompt),
+            ]
+        }
+        if route == .canonicalApplePodcastTranscript {
+            // Package-only like the RSS sibling; an explicit no-default
+            // record disables the Apple route. Package choices come from the
+            // registration snapshot.
+            return [
+                ExtractorRouteChoice(
+                    route: route,
+                    reference: .none,
+                    displayName: "No default (disable Apple Podcasts transcripts)",
+                    category: .prompt),
+            ]
+        }
+        if route == .canonicalYouTubeTranscript {
+            // Package-only like the podcast siblings; an explicit no-default
+            // record disables the YouTube route. Package choices come from
+            // the registration snapshot.
+            return [
+                ExtractorRouteChoice(
+                    route: route,
+                    reference: .none,
+                    displayName: "No default (disable YouTube transcripts)",
                     category: .prompt),
             ]
         }

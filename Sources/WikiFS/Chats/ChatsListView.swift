@@ -186,7 +186,7 @@ final class ChatsListViewController: NSViewController {
 
     private func signature(_ rows: [ChatSummary]) -> String {
         rows.map {
-            "\($0.id.rawValue)|\($0.title)|\($0.updatedAt.timeIntervalSince1970)|\($0.summary ?? "")"
+            "\($0.id.rawValue)|\($0.title)"
         }.joined(separator: "\n")
     }
 
@@ -195,6 +195,10 @@ final class ChatsListViewController: NSViewController {
     /// Reflect the active tab's selection into the table highlight. Called every
     /// `updateNSViewController`. Only acts when the table is in single-selection
     /// state so user multi-selects (Cmd/Shift) aren't clobbered.
+    ///
+    /// Every new chat is persisted before its tab opens, so a `.chat(id)`
+    /// selection always has a real `ChatSummary` row to highlight — there is
+    /// no optimistic draft row anymore (see ``WikiStoreModel/beginNewChat()``).
     func reconcileHighlight(activeSelection: WikiSelection?) {
         guard !isReconcilingHighlight, tableView.selectedRowIndexes.count <= 1 else { return }
         switch activeSelection {
@@ -437,7 +441,10 @@ final class ChatsCellView: NSTableCellView {
     func configure(chat: ChatSummary, isLive: Bool) {
         iconView.image = NSImage(systemSymbolName: ResourceKind.chat.systemImageName,
                                   accessibilityDescription: nil)
-        let title = chat.title.isEmpty ? "New Chat" : chat.title
+        // Title: the summary-model's one-line summary when the summarizer
+        // produced one, otherwise the stored title — the user's question.
+        // Subtitle: the creation date.
+        let title = Self.rowTitle(for: chat)
         titleField.stringValue = title
         toolTip = title
 
@@ -449,12 +456,31 @@ final class ChatsCellView: NSTableCellView {
             liveDot.isHidden = true
             liveLabel.isHidden = true
             subtitleField.isHidden = false
-            if let summary = chat.summary {
-                subtitleField.stringValue = summary
-            } else {
-                subtitleField.stringValue = chat.updatedAt.formatted(.relative(presentation: .named))
-            }
+            subtitleField.stringValue = Self.rowSubtitle(for: chat)
         }
+    }
+
+    /// The row's title line: the chat's stored title — the user's question,
+    /// or the model-generated title when the summarizer stage is configured —
+    /// with an empty title falling back to "New Chat". Since #1265 that
+    /// fallback is the only source of that string: the derivation returns
+    /// `nil` on failure instead of persisting it, so "New Chat" on screen
+    /// always means "no title yet". v54 (#1266): the skills-budget preamble
+    /// strip is gone — the v54 migration rewrote warning-tainted titles in
+    /// place, so stored titles are clean.
+    /// Mirrors the tab title and chat header so every surface names the chat
+    /// identically. The per-message summary deliberately does NOT appear: it
+    /// summarizes the answer, not the chat, and previously shadowed the title
+    /// here. Pure seam so the contract is testable without hosting AppKit
+    /// views.
+    nonisolated static func rowTitle(for chat: ChatSummary) -> String {
+        chat.title.isEmpty ? "New Chat" : chat.title
+    }
+
+    /// The row's subtitle: the chat's creation date, per the row design
+    /// (the title line carries the content; the date anchors it in time).
+    nonisolated static func rowSubtitle(for chat: ChatSummary) -> String {
+        chat.createdAt.formatted(date: .abbreviated, time: .shortened)
     }
 }
 

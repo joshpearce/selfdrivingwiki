@@ -9,11 +9,8 @@ import Foundation
 ///
 /// Provider reconstruction keys off `SourceOrigin.agentName`:
 /// - `"website"` → `WebsiteMaterializer` (refresh appends a content version).
-/// - `"apple-podcast"` → `ApplePodcastMaterializer` (refresh appends a derived
-///   markdown version — byteless sources have no content to refresh).
-/// - `"podcast"` (generic RSS) → `RSSPodcastTranscriptService` (refresh
-///   re-fetches the `<podcast:transcript>` and appends a derived markdown
-///   version — same byteless shape as apple-podcast, but no signing helper).
+/// - `"apple-podcast"` and `"podcast"` → `.transcriptQueueRequired`. Refresh and
+///   Transcribe enqueue the same durable package extraction job.
 /// - Everything else (`local-file`, `zotero`, `markdown-folder`,
 ///   `legacy-import`, `unknown`) → `.notRefreshable` (import-only).
 ///
@@ -33,6 +30,10 @@ public struct SourceRefreshService: Sendable {
         /// and orphan the images (the resolver joins on the active activity).
         /// Snapshot-aware refresh (re-snapshotting images) is a named follow-on.
         case snapshotWithImages
+        /// Transcript sources run through the app's extraction queue (the
+        /// extractor-package routes). A feed source DOES have a URL — the
+        /// direct re-fetch path just no longer exists here.
+        case transcriptQueueRequired
 
         public var errorDescription: String? {
             switch self {
@@ -42,6 +43,8 @@ public struct SourceRefreshService: Sendable {
                 return "This source has no recorded URL to re-fetch."
             case .snapshotWithImages:
                 return "This snapshot source includes images; re-snapshotting on refresh is coming soon."
+            case .transcriptQueueRequired:
+                return "Transcripts run through the app's extraction queue. Use the app's Transcribe or refresh action to enqueue the job."
             }
         }
     }
@@ -65,23 +68,10 @@ public struct SourceRefreshService: Sendable {
     }
 
     public let fetcher: any URLFetchService.URLResourceFetcher
-    #if PODCAST_TRANSCRIPTS
-    public let podcastFetcher: (any PodcastTranscriptFetching)?
-    #endif
 
-    #if PODCAST_TRANSCRIPTS
-    public init(
-        fetcher: any URLFetchService.URLResourceFetcher,
-        podcastFetcher: (any PodcastTranscriptFetching)? = nil
-    ) {
-        self.fetcher = fetcher
-        self.podcastFetcher = podcastFetcher
-    }
-    #else
     public init(fetcher: any URLFetchService.URLResourceFetcher) {
         self.fetcher = fetcher
     }
-    #endif
 
     /// Read the origin → reconstruct the provider → materialize OFF-main.
     /// Returns the material the caller should append. Throws `.notRefreshable`
@@ -96,14 +86,11 @@ public struct SourceRefreshService: Sendable {
         switch origin.provider {
         case .website:
             return try await materializeWebsite(origin: origin)
-        case .applePodcast:
-            return try await materializePodcast(origin: origin)
-        case .podcast:
-            // Generic RSS-feed podcast: re-fetch the transcript via the
-            // `podcast-transcript` script (no FairPlay helper). Mirrors
-            // `.applePodcast`'s refresh → derived-markdown shape. Always
-            // available on every build (the service is always compiled).
-            return try await materializePodcastFeed(origin: origin)
+        case .applePodcast, .podcast:
+            // Both podcast arms run through the app's extraction queue (the
+            // extractor-package routes). The app's Transcribe and refresh
+            // actions enqueue that job instead of calling a materializer.
+            throw RefreshError.transcriptQueueRequired
         case .localFile, .zotero, .markdownFolder, .youtube, .vimeo, .spotify,
              .soundcloud, .remoteMedia, .legacyImport, nil:
             throw RefreshError.notRefreshable(origin.agentName)
@@ -127,53 +114,5 @@ public struct SourceRefreshService: Sendable {
             data: source.data,
             detectionHints: source.detectionHints,
             provenance: prov)
-    }
-
-    // MARK: - Apple Podcast
-
-    #if PODCAST_TRANSCRIPTS
-    private func materializePodcast(origin: SourceOrigin) async throws -> RefreshMaterial {
-        guard let urlString = origin.plan else {
-            throw RefreshError.missingPlan
-        }
-        guard let episode = PodcastEpisodeURL.parse(urlString) else {
-            throw RefreshError.missingPlan
-        }
-        guard let svc = podcastFetcher else {
-            throw PodcastTranscriptError.signatureUnavailable(
-                "Apple Podcasts transcripts need the signing helper, which isn't available in this build.")
-        }
-        guard let pageURL = URL(string: urlString) else {
-            throw RefreshError.missingPlan
-        }
-        // The provider's materialize() runs the transcript fetch off-main
-        // (Task.detached inside). Byteless source → only the derived markdown
-        // (transcript) changes on refresh; the content version never does.
-        let provider = ApplePodcastMaterializer(episode: episode, pageURL: pageURL, fetcher: svc)
-        let transcript = try await provider.materialize()
-        let markdown = String(data: transcript.data, encoding: .utf8) ?? ""
-        return .derivedMarkdown(content: markdown)
-    }
-    #else
-    private func materializePodcast(origin: SourceOrigin) async throws -> RefreshMaterial {
-        throw RefreshError.notRefreshable(origin.agentName)
-    }
-    #endif
-
-    // MARK: - Generic RSS Podcast (always compiled — no FairPlay dependency)
-
-    /// Re-fetch the transcript for a generic `.podcast` (any-RSS-feed) source.
-    /// Spawns the `podcast-transcript` script with the feed URL from
-    /// `origin.plan`. Byteless source → only the derived markdown changes on
-    /// refresh. Always available (the service is always compiled). Issue
-    /// podcast-generalize.
-    private func materializePodcastFeed(origin: SourceOrigin) async throws -> RefreshMaterial {
-        guard let urlString = origin.plan, let url = URL(string: urlString) else {
-            throw RefreshError.missingPlan
-        }
-        let svc = RSSPodcastTranscriptService()
-        let transcript = try await svc.transcript(forFeedURL: url)
-        let markdown = transcript.markdown
-        return .derivedMarkdown(content: markdown)
     }
 }

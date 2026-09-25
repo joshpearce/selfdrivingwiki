@@ -17,7 +17,8 @@ version (extracted from PDFs, fetched from web pages, etc.).
 | **PDF** | Research papers, reports, ebooks | After extraction (yes) |
 | **Web page** | Blog posts, documentation, articles | Yes (fetched and converted) |
 | **Markdown** | Notes, Obsidian exports, LogSeq | Yes (the file itself) |
-| **Podcast** | Apple Podcasts episodes | If a transcript is available |
+| **Podcast (RSS feed)** | Any podcast feed URL | After transcription — through the reviewed podcast-transcript package |
+| **Podcast (Apple)** | Apple Podcasts episodes | After transcription — through the Apple TTML backend |
 | **Image** | PNG, JPEG, screenshots | No (binary embed only) |
 | **Other** | CSVs, JSON, code files | No (agent reads raw bytes) |
 
@@ -49,19 +50,45 @@ the provider and the video/episode id. These sources are first-class (visible,
 searchable, and citable), and you embed them as inline players with
 `![[source:Name]]`. See [Embeds](pages-and-links.md#embedding-a-youtube-video-or-other-web-media).
 
+**Transcripts are on demand.** Apple Podcasts, RSS podcast feeds, and
+YouTube sources show a **Transcribe** action; the extraction queue fetches
+the transcript through a reviewed extractor package and appends it to the
+source with full provenance. YouTube transcription fetches only the captions
+YouTube exposes — videos without captions, with captions disabled, or with
+blocked requests fail with a short cause, and no media is ever downloaded.
+See [Extractor packages](extractor-packages.md).
+
 ### From Zotero
 
-If you use [Zotero](https://www.zotero.org/) for reference management:
+If you use [Zotero](https://www.zotero.org/) for reference management, the
+reviewed `zotero` package downloads the attachments you name. The in-app
+library picker is not built yet; you list attachment keys in a config file.
 
-1. Configure Zotero in **Settings → Zotero** (API key + library ID).
-2. Click **Add from Zotero** in the Sources sidebar.
-3. Search your library by title, author, or year.
-4. Select an item to see its attachments (PDFs, notes).
-5. Toggle which attachments to import.
-6. Click **Add Selected**.
+1. Store your API key: open **Settings → Extraction → Packages** and click
+   **Configure…** on the Zotero Attachment row. Paste the key into the
+   **Zotero API Key** value row. The key lives in your Keychain.
+2. Name what to fetch: edit `zotero-config.json` in the App Group container
+   (the file name comes from the package's sync declaration):
 
-Imported sources carry a **Zotero** origin tag with a clickable "View in Zotero"
-link that opens the item in the Zotero app.
+   ```json
+   {
+     "libraryID": "12345",
+     "attachments": ["ABCD1234", "WXYZ9876"]
+   }
+   ```
+
+   Each entry is one Zotero attachment key (8 characters, uppercase letters
+   and digits).
+3. Run `wikictl extractor sync zotero`. Each configured key becomes one
+   source, and the app (or the wikid daemon) downloads it on its next scan.
+   Add `--force` to re-fetch a key whose file you changed in Zotero.
+   Packages declare their own sync config, so other syncable packages use
+   the same command under their own name.
+
+Imported sources carry a **Zotero** origin tag with a clickable "View in
+Zotero" link that opens the item in the Zotero app. See
+[Extractor packages](extractor-packages.md#zotero-attachments) for the full
+detail, including typed failures.
 
 ### Import a folder
 
@@ -251,11 +278,26 @@ Open from the menu bar or keyboard:
 
 | Window | Shortcut | What it shows |
 |---|---|---|
-| **Agent Queue** | ⌘I | Ingestion and lint jobs. Live agent transcript in the detail pane. |
-| **Extraction Queue** | ⌘E | PDF-to-markdown jobs. Progress text in the detail pane. |
+| **Agent Queue** | ⌘I | Ingestion and lint jobs. |
+| **Extraction Queue** | ⌘E | PDF-to-markdown jobs. |
 
 Both windows show:
-- **Active** section — currently running and queued items (drag to reorder).
-- **Recent** section — last 30 completed/failed/cancelled items.
-- **Per-item controls** — Cancel (running/queued), Retry (failed/cancelled).
-- **Toolbar** — Pause/Resume, Stop All.
+- **Active** section — currently running and queued items (drag to reorder;
+  reordering turns off while filters or search are active).
+- **Recent** section — up to 200 completed/failed/cancelled items.
+- **Per-item controls** — Cancel (running/queued), Retry Job (failed/cancelled).
+- **Sidebar header** — the search field appears above the job list. Separate
+  icon buttons for **Pause Queue** or **Resume Queue**, **Stop All…**, and
+  **Filter** sit beside All Jobs. Point at an icon to see its name.
+- **Toolbar** — the **Run Details** toggle (sidebar.right icon) stays at the
+  right edge.
+
+Pause stops new starts and lets running jobs finish. Resume starts dispatch
+again. Stop All pauses the queue and cancels its running jobs. Queued jobs stay
+queued. The confirmation states this before you confirm.
+
+Select a job to open its workspace. **Overview** shows the job's targets.
+The Run Details toggle opens the optional Run Details inspector. **Activity**
+shows the transcript or progress text. See
+[Organizing and managing](organizing-and-managing.md#the-activity-queue) for
+the full workspace guide.

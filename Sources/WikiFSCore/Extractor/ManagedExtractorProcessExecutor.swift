@@ -50,6 +50,11 @@ public struct ManagedExtractorProcessRequest: Sendable {
     /// for a `runtime` launch: the host launches exactly this executable and
     /// never searches a PATH again.
     public let runtimeResolution: RuntimeCommandResolution?
+    /// The host-owned durable token-cache root for one exact revision. Not
+    /// part of the operation layout (it outlives the operation) and never a
+    /// manifest capability: the executor exposes it to the child only
+    /// through its dedicated environment key.
+    public let durableTokenCacheRoot: URL?
     public let cancellationGracePeriod: Duration
 
     public init(
@@ -58,6 +63,7 @@ public struct ManagedExtractorProcessRequest: Sendable {
         protocolRequest: ExtractorProtocolRequest,
         paths: ManagedExtractorProcessPaths,
         runtimeResolution: RuntimeCommandResolution? = nil,
+        durableTokenCacheRoot: URL? = nil,
         cancellationGracePeriod: Duration = .seconds(1)
     ) {
         self.revision = revision
@@ -65,6 +71,7 @@ public struct ManagedExtractorProcessRequest: Sendable {
         self.protocolRequest = protocolRequest
         self.paths = paths
         self.runtimeResolution = runtimeResolution
+        self.durableTokenCacheRoot = durableTokenCacheRoot?.standardizedFileURL
         self.cancellationGracePeriod = cancellationGracePeriod
     }
 }
@@ -105,10 +112,24 @@ public enum ManagedExtractorProcessError: Error, Equatable, Sendable {
     case launch(RaceFreeProcessGroupError)
     case malformedProtocol
     case protocolSequence(ExtractorProtocolSequenceError)
-    case timeout
+    /// The extractor exceeded its deadline. `detail` carries the elapsed and
+    /// limit durations plus the last progress line and its age, so a user
+    /// can see which phase hung without attaching a debugger.
+    case timeout(detail: String)
     case cancellation
     case outputLimit
-    case processTermination(ProcessTerminationCause)
+    /// The extractor exited nonzero (or was signaled) without a terminal
+    /// frame. `stderrTail` is the bounded single-line tail of the package's
+    /// own stderr — its last words before dying — so a queue failure names
+    /// the package's cause instead of a bare exit code. Same Console
+    /// exposure as the `nonzeroExit` diagnostics event; `timeout(detail:)`
+    /// sets the precedent for bounded detail in messages.
+    case processTermination(ProcessTerminationCause, stderrTail: String)
+    /// macOS seatbelt confinement could not be applied, so nothing was
+    /// spawned. Fail closed: a managed package never runs unsandboxed on
+    /// macOS (Linux diagnostic builds spawn unwrapped and are loudly logged
+    /// instead).
+    case sandboxUnavailable
 }
 
 extension ManagedExtractorProcessError: LocalizedError {
@@ -133,23 +154,47 @@ extension ManagedExtractorProcessError: LocalizedError {
             "The extractor produced malformed protocol output."
         case .protocolSequence:
             "The extractor produced an invalid protocol sequence."
-        case .timeout:
-            "The extractor did not finish in time."
+        case .timeout(let detail):
+            detail
         case .cancellation:
             "The extraction was cancelled."
         case .outputLimit:
             "The extractor exceeded its output limit."
-        case .processTermination(let cause):
+        case .processTermination(let cause, let stderrTail):
             "The extractor process stopped unexpectedly (\(cause))."
+                + (stderrTail.isEmpty ? "" : " Package stderr: \(stderrTail)")
+        case .sandboxUnavailable:
+            "The extractor sandbox could not be set up, so the package did not run."
         }
     }
 }
 
 public struct ManagedExtractorProcessExecutor: ManagedProcessExecuting, Sendable {
     private let diagnostics: any ExtractorDiagnosticsSink
+    /// The seatbelt front-end this executor requires and applies on macOS.
+    /// Injectable so the fail-closed tests can point at a missing,
+    /// non-executable, or non-regular path; production always uses
+    /// `ExtractorSandboxProfile.sandboxExecutablePath`.
+    let sandboxExecutableURL: URL?
 
     public init(diagnostics: (any ExtractorDiagnosticsSink)? = nil) {
         self.diagnostics = diagnostics ?? DebugLogExtractorDiagnosticsSink()
+        #if os(macOS)
+        self.sandboxExecutableURL = URL(fileURLWithPath: ExtractorSandboxProfile.sandboxExecutablePath)
+        #else
+        self.sandboxExecutableURL = nil
+        #endif
+    }
+
+    /// Test seam: an explicit sandbox-executable URL. On macOS a `nil` here
+    /// fails closed (typed `sandboxUnavailable`, nothing spawns); on Linux it
+    /// is ignored because Linux applies no seatbelt.
+    init(
+        diagnostics: (any ExtractorDiagnosticsSink)? = nil,
+        sandboxExecutableURL: URL?
+    ) {
+        self.diagnostics = diagnostics ?? DebugLogExtractorDiagnosticsSink()
+        self.sandboxExecutableURL = sandboxExecutableURL
     }
 
     public func execute(
@@ -162,12 +207,32 @@ public struct ManagedExtractorProcessExecutor: ManagedProcessExecuting, Sendable
         let input = try encodeRequest(operation.protocolRequest)
         let cancellationSlot = ManagedProcessCancellationSlot(
             gracePeriod: operation.cancellationGracePeriod)
+        // Terminal-frame completion latch: `onCompletion`/`onFailure` begin
+        // verified group termination synchronously and unblock
+        // `handle.result`, so a completed protocol exchange concludes the
+        // operation even when the wrapper process outlives it (#1286).
+        let (completionStream, completionContinuation) = AsyncStream<Void>.makeStream(
+            bufferingPolicy: .bufferingNewest(1))
+        // Progress tracking for timeout diagnostics: the last progress line
+        // and when it arrived tell a user which phase hung without a debugger.
+        let progressClock = ContinuousClock()
+        let runStartedAt = progressClock.now
+        let lastProgress = LastProgressBox()
+        let callerOnFrame = onFrame
+        let trackedOnFrame: @Sendable (ExtractorProtocolFrame) -> Void = { frame in
+            if case .progress(let progress) = frame {
+                lastProgress.record(progress.message ?? "", at: progressClock.now, since: runStartedAt)
+            }
+            callerOnFrame(frame)
+        }
         let protocolState = ManagedProtocolState(
             requestID: operation.protocolRequest.requestID,
             outputPath: operation.protocolRequest.outputPath,
             maximumProgressEventCount: operation.manifest.limits.maximumProgressEventCount,
-            onFrame: onFrame,
-            onFailure: { cancellationSlot.requestTermination() })
+            protocolRevision: operation.protocolRequest.protocolRevision,
+            onFrame: trackedOnFrame,
+            onFailure: { cancellationSlot.requestTermination() },
+            onCompletion: { cancellationSlot.requestTermination() })
         let stdoutLimit = managedStandardOutputLimit(operation.manifest.limits)
         let handle: RaceFreeProcessGroupHandle
         do {
@@ -195,16 +260,50 @@ public struct ManagedExtractorProcessExecutor: ManagedProcessExecuting, Sendable
                         for: launch.executableIdentity)).consoleLine)
                 throw error
             }
-            handle = try RaceFreeProcessGroupRunner.launch(.init(
-                executableURL: launch.executableURL,
+            // Seatbelt confinement (macOS): build the per-spawn profile from
+            // the validated operation layout plus manifest capabilities,
+            // require the sandbox front-end (fail closed), and wrap the
+            // spawn argv. Identity pinning above is unchanged — it validated
+            // the real target before this wrap. The result continues to
+            // report the real executable, never sandbox-exec.
+            var spawnExecutableURL = launch.executableURL
+            var spawnArguments = launch.arguments
+            #if os(macOS)
+            let networkDenied = !operation.manifest.capabilities.contains(.network)
+            let sandboxInvocation = ExtractorSandboxProfile.invocation(
+                paths: operation.paths,
+                capabilities: operation.manifest.capabilities,
+                durableTokenCacheRoot: operation.durableTokenCacheRoot)
+            let sandboxURL = try requireSandboxExecutable(
+                sandboxExecutableURL,
+                command: launch.commandDescription)
+            spawnExecutableURL = sandboxURL
+            spawnArguments = ExtractorSandboxProfile.wrappedArguments(
+                executablePath: launch.executableURL.path,
                 arguments: launch.arguments,
+                invocation: sandboxInvocation)
+            #else
+            // Linux diagnostic builds apply no seatbelt; the gap is loud.
+            diagnostics.send(ManagedExtractorDiagnostics.Event.sandboxUnavailablePlatform(
+                command: launch.commandDescription).consoleLine)
+            #endif
+            handle = try RaceFreeProcessGroupRunner.launch(.init(
+                executableURL: spawnExecutableURL,
+                arguments: spawnArguments,
                 environment: environment,
                 currentDirectoryURL: operation.paths.operationRoot,
                 standardInput: input,
                 stdoutLimit: stdoutLimit,
                 stderrLimit: ExtractorHostLimits.maximumStandardErrorByteCount,
                 observeStdout: { protocolState.consume($0) }))
-            cancellationSlot.install(handle)
+            #if os(macOS)
+            // The spawn is live inside the profile. Mirrors `runtimeResolved`
+            // observability: every successful macOS spawn logs whether it
+            // was network-confined (AC.8).
+            diagnostics.send(ManagedExtractorDiagnostics.Event.sandboxApplied(
+                networkDenied: networkDenied).consoleLine)
+            #endif
+            cancellationSlot.install(handle, completion: completionContinuation)
         } catch let error as RaceFreeProcessGroupError {
             diagnostics.send(ManagedExtractorDiagnostics.Event.spawnFailure(
                 command: launch.commandDescription,
@@ -217,11 +316,17 @@ public struct ManagedExtractorProcessExecutor: ManagedProcessExecuting, Sendable
         let timeout = effectiveTimeout(operation)
         let execution: ProcessGroupExecutionResult
         do {
-            execution = try await handle.result(timeout: timeout)
+            execution = try await handle.result(
+                timeout: timeout,
+                completion: completionStream,
+                completionGracePeriod: operation.cancellationGracePeriod)
         } catch is CancellationError {
             throw ManagedExtractorProcessError.cancellation
         } catch RaceFreeProcessGroupError.timedOut {
-            throw ManagedExtractorProcessError.timeout
+            throw ManagedExtractorProcessError.timeout(detail: ManagedExtractorProcessError.timeoutDetail(
+                limit: timeout,
+                elapsed: progressClock.now - runStartedAt,
+                lastProgress: lastProgress.value))
         } catch RaceFreeProcessGroupError.outputLimitExceeded {
             throw ManagedExtractorProcessError.outputLimit
         } catch let error as RaceFreeProcessGroupError {
@@ -237,18 +342,27 @@ public struct ManagedExtractorProcessExecutor: ManagedProcessExecuting, Sendable
             diagnostics.send(protocolFailureLine(launch))
             throw ManagedExtractorProcessError.malformedProtocol
         }
+        // The package contract makes a valid terminal frame the operation's
+        // completion. When the wrapper process outlives the package —
+        // observed with `uv run` lingering after the package exits — the
+        // completion hook kills the group, so a signaled (or nonzero)
+        // termination alongside a terminal frame is success, not a crash.
+        // Without a terminal frame the strict termination rules still hold.
+        let protocolCompleted = protocolState.hasTerminalFrame
         switch execution.terminationCause {
         case .exited(code: 0):
             break
         case .exited, .signaled:
+            guard !protocolCompleted else { break }
+            let stderrTail = ManagedExtractorDiagnostics.singleLineTail(
+                execution.stderr,
+                displayLimit: ManagedExtractorDiagnostics.maximumStderrTailDisplayLength)
             diagnostics.send(ManagedExtractorDiagnostics.Event.nonzeroExit(
                 command: launch.commandDescription,
                 termination: String(describing: execution.terminationCause),
-                stderrTail: ManagedExtractorDiagnostics.singleLineTail(
-                    execution.stderr,
-                    displayLimit: ManagedExtractorDiagnostics
-                        .maximumStderrTailDisplayLength)).consoleLine)
-            throw ManagedExtractorProcessError.processTermination(execution.terminationCause)
+                stderrTail: stderrTail).consoleLine)
+            throw ManagedExtractorProcessError.processTermination(
+                execution.terminationCause, stderrTail: stderrTail)
         }
         do {
             let summary = try protocolState.finish()
@@ -362,10 +476,23 @@ public struct ManagedExtractorProcessExecutor: ManagedProcessExecuting, Sendable
         if operation.manifest.capabilities.contains(.sharedRuntimeCache),
            let shared = operation.paths.sharedRuntimeCacheRoot {
             environment["WIKI_EXTRACTOR_SHARED_RUNTIME_CACHE"] = shared.path
+            // uv-based packages (`uv run --script` runtime launch) keep
+            // their CPython installs and wheel cache warm across
+            // operations. Without these, uv's defaults live under the
+            // operation-private HOME/cache and every run re-downloads a
+            // CPython — exceeding the duration limit on slow links.
+            environment["UV_CACHE_DIR"] = shared.appendingPathComponent("uv-cache").path
+            environment["UV_PYTHON_INSTALL_DIR"] = shared.appendingPathComponent("uv-python").path
         }
         if operation.manifest.capabilities.contains(.modelDownload),
            let shared = operation.paths.sharedModelCacheRoot {
             environment["WIKI_EXTRACTOR_SHARED_MODEL_CACHE"] = shared.path
+        }
+        // Dedicated, revision-gated durable token-cache root. The host
+        // supplies it only for the exact reviewed revision that owns it (see
+        // the engine's token-cache closure); the manifest cannot request it.
+        if let durableTokenCache = operation.durableTokenCacheRoot {
+            environment["WIKI_EXTRACTOR_PACKAGE_TOKEN_CACHE"] = durableTokenCache.path
         }
         return environment
     }
@@ -459,6 +586,36 @@ public struct ManagedExtractorProcessExecutor: ManagedProcessExecuting, Sendable
         let root = root.standardizedFileURL.path
         return candidate == root || candidate.hasPrefix(root + "/")
     }
+
+    /// Fail-closed gate for macOS: the seatbelt front-end must exist as an
+    /// executable regular file (symlinks followed — the target is what gets
+    /// exec'd). A missing path, a non-executable file, or a directory means
+    /// NO spawn at all: a managed package never runs unsandboxed on macOS.
+    /// Sends the `sandboxUnavailable` diagnostic, then throws the typed
+    /// error.
+    #if os(macOS)
+    private func requireSandboxExecutable(
+        _ url: URL?,
+        command: String
+    ) throws -> URL {
+        func unusable(_ detail: String) -> ManagedExtractorProcessError {
+            diagnostics.send(ManagedExtractorDiagnostics.Event.sandboxUnavailable(
+                command: command,
+                detail: detail).consoleLine)
+            return ManagedExtractorProcessError.sandboxUnavailable
+        }
+        guard let url else {
+            throw unusable("no sandbox executable was configured")
+        }
+        var status = stat()
+        guard stat(url.path, &status) == 0,
+              status.st_mode & S_IFMT == S_IFREG,
+              status.st_mode & S_IXUSR != 0 else {
+            throw unusable("\(url.path) is missing or not an executable regular file")
+        }
+        return url
+    }
+    #endif
 }
 
 /// One validated launch: the executable to spawn, its pinned identity, the
@@ -483,23 +640,30 @@ private struct ManagedLaunch: Sendable {
     let launchesHostExecutable: Bool
 }
 
-// NSLock protects all mutable state (`handle`, `terminationRequested`,
-// `terminationTask`); every read and write holds the lock, and the termination
-// task body never re-enters the slot's state.
+// NSLock protects all mutable state (`handle`, `completion`,
+// `terminationRequested`, `terminationStarted`); every read and write holds
+// the lock, and the termination actions run outside it.
 // swiftlint:disable:next unchecked_sendable
 private final class ManagedProcessCancellationSlot: @unchecked Sendable {
     private let lock = NSLock()
     private let gracePeriod: Duration
     private var handle: RaceFreeProcessGroupHandle?
+    private var completion: AsyncStream<Void>.Continuation?
     private var terminationRequested = false
-    private var terminationTask: Task<Void, Never>?
+    private var terminationStarted = false
 
     init(gracePeriod: Duration) {
         self.gracePeriod = gracePeriod
     }
 
-    func install(_ handle: RaceFreeProcessGroupHandle) {
-        lock.withLock { self.handle = handle }
+    func install(
+        _ handle: RaceFreeProcessGroupHandle,
+        completion: AsyncStream<Void>.Continuation
+    ) {
+        lock.withLock {
+            self.handle = handle
+            self.completion = completion
+        }
         startTerminationIfReady()
     }
 
@@ -509,22 +673,25 @@ private final class ManagedProcessCancellationSlot: @unchecked Sendable {
     }
 
     private func startTerminationIfReady() {
-        lock.withLock {
+        let prepared = lock.withLock { () -> (RaceFreeProcessGroupHandle, AsyncStream<Void>.Continuation)? in
             guard terminationRequested,
-                  terminationTask == nil,
-                  let handle else { return }
-            terminationTask = Task {
-                do {
-                    try await handle.terminateVerifiedGroup(gracePeriod: gracePeriod)
-                } catch {
-                    DebugLog.extraction("Managed extractor protocol failure cleanup was refused")
-                }
-            }
+                  !terminationStarted,
+                  let handle,
+                  let completion else { return nil }
+            terminationStarted = true
+            return (handle, completion)
         }
+        guard let prepared else { return }
+        // Synchronous verified SIGTERM plus dispatch-scheduled SIGKILL
+        // escalation, and the completion latch that unblocks
+        // `handle.result`: no cooperative-pool Task stands between a decoded
+        // terminal frame and the operation's conclusion (#1286).
+        prepared.0.beginVerifiedTermination(gracePeriod: gracePeriod)
+        prepared.1.yield(())
     }
 
     deinit {
-        terminationTask?.cancel()
+        completion?.finish()
     }
 }
 
@@ -536,40 +703,62 @@ private final class ManagedProtocolState: @unchecked Sendable {
     private var decoder = ExtractorJSONLinesDecoder()
     private var sequence: ExtractorProtocolSequence
     private var failure: Error?
+    private var completionSignaled = false
     private let onFrame: @Sendable (ExtractorProtocolFrame) -> Void
     private let onFailure: @Sendable () -> Void
+    private let onCompletion: @Sendable () -> Void
 
     init(
         requestID: ExtractorRequestID,
         outputPath: ExtractorRelativePath,
         maximumProgressEventCount: Int,
+        protocolRevision: ExtractorProtocolRevision,
         onFrame: @escaping @Sendable (ExtractorProtocolFrame) -> Void,
-        onFailure: @escaping @Sendable () -> Void
+        onFailure: @escaping @Sendable () -> Void,
+        onCompletion: @escaping @Sendable () -> Void
     ) {
         sequence = ExtractorProtocolSequence(
             requestID: requestID,
             expectedOutputPath: outputPath,
-            maximumProgressEventCount: maximumProgressEventCount)
+            maximumProgressEventCount: maximumProgressEventCount,
+            protocolRevision: protocolRevision)
         self.onFrame = onFrame
         self.onFailure = onFailure
+        self.onCompletion = onCompletion
     }
 
     var hasFailure: Bool { lock.withLock { failure != nil } }
 
+    /// True once the package's terminal frame has been decoded. The package
+    /// contract makes that frame the operation's completion, even if the
+    /// wrapper process that spawned the package never exits.
+    var hasTerminalFrame: Bool { lock.withLock { sequence.terminalFrame != nil } }
+
     func consume(_ data: Data) {
-        let outcome: (frames: [ExtractorProtocolFrame], failed: Bool) = lock.withLock {
-            guard failure == nil else { return ([], false) }
+        struct Outcome {
+            let frames: [ExtractorProtocolFrame]
+            let failed: Bool
+            let completed: Bool
+        }
+        let outcome: Outcome = lock.withLock {
+            guard failure == nil else { return Outcome(frames: [], failed: false, completed: false) }
             do {
                 let frames = try decoder.append(data)
                 for frame in frames { try sequence.consume(frame) }
-                return (frames, false)
+                var completed = false
+                if sequence.terminalFrame != nil, !completionSignaled {
+                    completionSignaled = true
+                    completed = true
+                }
+                return Outcome(frames: frames, failed: false, completed: completed)
             } catch {
                 failure = error
-                return ([], true)
+                return Outcome(frames: [], failed: true, completed: false)
             }
         }
         for frame in outcome.frames { onFrame(frame) }
         if outcome.failed { onFailure() }
+        if outcome.completed { onCompletion() }
     }
 
     func finish() throws -> (terminalFrame: ExtractorProtocolFrame, progressEventCount: Int) {
@@ -578,5 +767,52 @@ private final class ManagedProtocolState: @unchecked Sendable {
             try decoder.finish()
             return (try sequence.finish(), sequence.progressEventCount)
         }
+    }
+}
+
+/// Thread-safe record of the most recent progress line and when it arrived,
+/// feeding the timeout detail (which phase hung, and for how long).
+/// Sendability invariant: `entry` is only read/written under `lock`, and the
+/// recorded Duration value types are themselves Sendable.
+// swiftlint:disable:next unchecked_sendable
+final class LastProgressBox: @unchecked Sendable {
+    struct Entry: Sendable {
+        let message: String
+        let offset: Duration
+    }
+
+    private let lock = NSLock()
+    private var entry: Entry?
+
+    func record(_ message: String, at instant: ContinuousClock.Instant, since start: ContinuousClock.Instant) {
+        lock.withLock { entry = Entry(message: message, offset: instant - start) }
+    }
+
+    var value: Entry? { lock.withLock { entry } }
+}
+
+extension ManagedExtractorProcessError {
+    /// Human-readable timeout diagnosis: how long the extractor ran against
+    /// its limit, and what it last reported (with the silence length).
+    static func timeoutDetail(
+        limit: Duration,
+        elapsed: Duration,
+        lastProgress: LastProgressBox.Entry?
+    ) -> String {
+        func seconds(_ duration: Duration) -> String {
+            let value = Double(duration.components.seconds)
+                + Double(duration.components.attoseconds) / 1e18
+            return String(format: "%.1f s", value)
+        }
+        var detail = "The extractor did not finish in time. It ran \(seconds(elapsed)) of the "
+            + "\(seconds(limit)) limit."
+        if let lastProgress {
+            let silence = elapsed - lastProgress.offset
+            detail += " Last progress: \"\(lastProgress.message)\" at "
+                + "\(seconds(lastProgress.offset)) (silent for the last \(seconds(silence)))."
+        } else {
+            detail += " No progress was reported — the extractor likely never completed startup."
+        }
+        return detail
     }
 }

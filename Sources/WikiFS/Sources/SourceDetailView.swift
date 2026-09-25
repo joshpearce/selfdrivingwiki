@@ -113,6 +113,10 @@ struct SourceDetailView: View {
     /// Cached once per source lifecycle so body evaluation and editor changes do
     /// not repeatedly synchronously fetch the complete SQLite blob.
     @State private var sourceBytesSnapshot: Data?
+    /// Active package registrations used to decide whether Raw Source has a
+    /// next step. The snapshot is presentation data only; execution remains
+    /// owned by the managed extraction queue.
+    @State private var activeExtractorRegistrations: [ExtractorRouteRegistrationSnapshot] = []
     /// Quote to highlight in the PDF view, set when a `[[source:Name#"…"]]` link
     /// targets an un-extracted PDF. Consumed from `store.pendingScrollAnchor`.
     @State private var pdfQuote: String?
@@ -157,13 +161,14 @@ struct SourceDetailView: View {
     /// Transcribe button gating switches on this kind's `capabilities` rather
     /// than re-deriving the PDF/HTML/transcript decision ad-hoc. Kept `private`
     /// to the view; tests exercise the same `resolve(mimeType:provider:ext:)`
-    /// call via the `internal static` seam (`SourceDetailView.extractionDecision`,
-    /// below).
+    /// call via the `internal static` seam below, with active extractor
+    /// registrations supplied by the store.
     private var contentKind: ContentKind {
         ContentKind.resolve(
             mimeType: file.mimeType,
             provider: origin?.provider,
-            ext: file.ext)
+            ext: file.ext,
+            registeredInputs: store.registeredExtractionInputs)
     }
 
     private var hasMarkdown: Bool { headVersion != nil }
@@ -219,10 +224,8 @@ struct SourceDetailView: View {
     /// `false` until `origin` loads, so the predicate is re-evaluated when
     /// `.task(id: file.id)` finishes loading origin — same shape as
     /// `isRefreshable`.
-    private var isPodcastEmbed: Bool { origin?.provider == .applePodcast }
-
-    /// `true` for byteless YouTube embed sources (issue #799 PR5). Mirrors
-    /// `isPodcastEmbed` — `origin.provider` is the single source of truth.
+    /// `true` for byteless YouTube embed sources (issue #799 PR5).
+    /// `origin.provider` is the single source of truth.
     /// Returns `false` until `origin` loads, same shape as `isRefreshable`.
     private var isYouTubeEmbed: Bool { origin?.provider == .youtube }
 
@@ -238,34 +241,34 @@ struct SourceDetailView: View {
     /// PR4 AC.16, generalized to YouTube in PR5). The registry half of the
     /// gate (PR2 §5.4) consults `contentKind.capabilities.hasTranscriptBackend`
     /// (true only for `.podcastTranscript` / `.youtubeTranscript`), then
-    /// runtime guards layer on top: the podcast runtime guard (bundled
-    /// signing helper present AND this build compiles podcast support via
-    /// `#if PODCAST_TRANSCRIPTS`) delegates to
-    /// `store.isSourceRefreshable(for:)` so the predicate is identical to
-    /// the Refresh button's guard for podcasts. YouTube and generic RSS need
-    /// no signing helper, so they're always "available" once the provider
-    /// matches (the model throws `.missingPlan` when the ID is missing,
-    /// surfaced by `runTranscription`).
+    /// route availability layers on top: the Apple Podcasts arm delegates to
+    /// `store.isSourceRefreshable(for:)`, which derives availability from the
+    /// reviewed package route (not from signing-helper presence — a missing
+    /// helper keeps the route usable through the package's RSS fallback).
+    /// YouTube and generic RSS need no runtime guard, so they're always
+    /// "available" once the provider matches (the model throws
+    /// `.missingPlan` when the ID is missing, surfaced by `runTranscription`).
     private var isTranscribable: Bool {
-        guard contentKind.capabilities.hasTranscriptBackend else { return false }
-        switch origin?.provider {
+        guard contentKind.capabilities.hasTranscriptBackend, let origin else { return false }
+        switch origin.provider {
         case .applePodcast:
-            // Mirror the Refresh button's runtime guard (helper present +
-            // build compiles podcast support). The predicate returns `false`
-            // for `.applePodcast` outside `#if PODCAST_TRANSCRIPTS` or when
-            // `ApplePodcastTranscriptService.bundled()` is nil.
+            // The reviewed package route decides: route disabled in
+            // settings → not transcribable; a missing signing helper does
+            // NOT disable the route (the package falls back to RSS).
             return store.isSourceRefreshable(for: file.id)
         case .podcast:
-            // Generic RSS-feed podcast: always transcribable on every build —
-            // the `podcast-transcript` script needs only `uv` (no signing
-            // helper). Mirrors YouTube's "no runtime guard" shape.
-            return true
+            // Generic RSS-feed podcast: the row must carry the feed URL the
+            // queue job transcribes; `uv` is the only runtime requirement.
+            return origin.plan != nil
         case .youtube:
-            // No signing helper needed — YouTube's pure-Swift scrape is always
-            // available on every build. The model throws `.missingPlan` if
-            // `origin.externalIdentity` is missing (a data-integrity edge case
-            // surfaced by `runTranscription`, not gated here).
-            return true
+            // The reviewed package route decides availability the same way
+            // the podcast routes do: the row must carry a usable operation
+            // URL (the stored plan URL, or a legacy row's validated video
+            // ID). A route disabled in settings is not gated here — the
+            // enqueue path reports the typed failure through Activity.
+            return YouTubeSourceURL.resolveOperationURL(
+                plan: origin.plan,
+                externalIdentity: origin.externalIdentity) != nil
         // Unreachable when `hasTranscriptBackend == true` (the registry
         // resolves `.applePodcast` / `.podcast` / `.youtube` providers to
         // transcript kinds and every other provider to a non-transcript
@@ -372,6 +375,24 @@ struct SourceDetailView: View {
     /// `isExtractable`'s registry-backed gate (no shape change to this
     /// predicate).
     private var needsExtraction: Bool { isExtractable && !hasMarkdown }
+
+    /// All matching extractors for the current Raw Source (#1252). Empty when
+    /// a derivation exists or nothing matches — the UI then shows no
+    /// affordance (issue #1252: no dead ends, no disabled controls).
+    private var rawSourceExtractors: [RawSourceExtractorMatch] {
+        guard !hasMarkdown, currentMarkdownContent == nil else { return [] }
+        return Self.rawSourceExtractorMatches(
+            mimeType: file.mimeType,
+            ext: file.ext,
+            registrations: activeExtractorRegistrations)
+    }
+
+    /// Title for the Extract button, hoisted out of the `Button` call so the
+    /// initializer overload resolves directly (nested ternary arguments are a
+    /// known type-checker cost).
+    private var extractButtonTitle: String {
+        isExtracting || isThisFileExtracting ? "Extracting…" : "Extract"
+    }
 
     /// `true` when this source has ≥2 extraction alternatives — the gate for the
     /// "Compare Extractions…" button (compare is meaningless with one).
@@ -511,6 +532,7 @@ struct SourceDetailView: View {
             editHistory = []
             isRefreshable = false
             sourceBytesSnapshot = nil
+            activeExtractorRegistrations = []
             beginRendererPresentationLoading()
             pdfQuote = nil
             pinnedExtraction = nil
@@ -525,6 +547,7 @@ struct SourceDetailView: View {
             origin = store.sourceOrigin(for: file.id)
             editHistory = store.sourceEditHistory(for: file.id)
             isRefreshable = store.isSourceRefreshable(for: file.id)
+            await loadActiveExtractorRegistrations()
             resolveRendererPresentation()
             updateRightSidebarRegistration()
         }
@@ -562,10 +585,21 @@ struct SourceDetailView: View {
             isEditing = false
             updateRightSidebarRegistration()
         }
+        // Tab availability and outline applicability both feed `outlinePayload`
+        // (its empty-content gate is the same `showsSourceOutlineTab`
+        // condition), so the payload observer below republishes the
+        // registration when they change. One exception needs a direct trigger:
+        // `sourceInspectorTabs` is carried in the registration but not in the
+        // payload, and a flip with zero parsed headings leaves the payload
+        // equal. It flips rarely, so no churn risk. Equal-payload keystrokes
+        // still publish nothing.
         .onChange(of: sourceInspectorTabs) { _, _ in
             updateRightSidebarRegistration()
         }
-        .onChange(of: showsSourceOutlineTab) { _, _ in updateRightSidebarRegistration() }
+        .modifier(SidebarRegistrationRefresh(
+            outlinePayload: outlinePayload,
+            onRefresh: { updateRightSidebarRegistration() }
+        ))
         // #842 PR2 C6, #1179: refresh the derived head whenever the store's
         // source data reloads. Extraction and transcript writes
         // (`appendDerivedMarkdown`) never touch the `sources` row, so a rebuild
@@ -582,7 +616,23 @@ struct SourceDetailView: View {
                 headVersion = store.processedMarkdownHead(for: file)
                 refreshRendererPresentation()
             }
-            updateRightSidebarRegistration()
+            // headVersion feeds `outlinePayload`; a real content change
+            // re-registers through the payload observer.
+        }
+        // #1252: standalone extraction runs in the wikid daemon and can
+        // outlive this view's 30s XPC `waitForCompletion` (pdf2md and
+        // docling runs take minutes). Tracker membership in
+        // `extractingSourceIDs` ends on the daemon's terminal queue event,
+        // so the extracting→idle edge here is the reliable "finished"
+        // signal: refresh the derived head and presentation immediately,
+        // instead of waiting for a close/reopen to re-run the load task.
+        .onChange(of: tracker.extractingSourceIDs.contains(file.id)) { wasExtracting, isExtractingNow in
+            guard wasExtracting, !isExtractingNow, !isEditing else { return }
+            if let head = store.processedMarkdownHead(for: file),
+               head.id != headVersion?.id {
+                headVersion = head
+                refreshRendererPresentation()
+            }
         }
         .background { findShortcutButton }
         .overlay(alignment: .top) { findBarOverlay }
@@ -590,7 +640,8 @@ struct SourceDetailView: View {
         .onChange(of: currentMarkdownContent) { _, newContent in
             findModel.content = newContent
             findModel.search()
-            updateRightSidebarRegistration()
+            // Content changes reach the registration through the payload
+            // observer; this handler only syncs the find bar.
         }
         .onChange(of: findModel.isShowing) { _, showing in
             if showing {
@@ -624,7 +675,7 @@ struct SourceDetailView: View {
             editBuffer = content
             isEditing = true
             shouldRestoreEditing = false
-            updateRightSidebarRegistration()
+            // The editBuffer change republishes via the payload observer.
         }
         .onChange(of: isEditing) { _, newValue in
             if let id = store.activeTabID {
@@ -632,7 +683,7 @@ struct SourceDetailView: View {
             }
             if newValue { isHeaderExpanded = true } // reveal Save/Cancel
             if !newValue { shouldRestoreEditing = false; caretCharIndex = nil }
-            updateRightSidebarRegistration()
+            // The content/caret change republishes via the payload observer.
         }
     }
 
@@ -795,18 +846,10 @@ struct SourceDetailView: View {
                         // sources dispatch to the inline package-only
                         // `runDocxExtraction` path for the same reason; PDF
                         // sources go through the queue as before.
-                        Button(isExtracting || isThisFileExtracting ? "Extracting…" : "Extract",
-                               systemImage: "doc.plaintext") {
-                            DebugLog.extraction("SourceDetailView: Extract tapped — id=\(file.id.rawValue), html=\(SourceRendererPresentationPlanner.isHTMLSource(file)), docx=\(SourceRendererPresentationPlanner.isDOCXSource(file))")
-                            Task {
-                                if SourceRendererPresentationPlanner.isHTMLSource(file) {
-                                    await runHtmlExtraction()
-                                } else if SourceRendererPresentationPlanner.isDOCXSource(file) {
-                                    await runDocxExtraction()
-                                } else {
-                                    await runExtraction()
-                                }
-                            }
+                        Button(
+                            extractButtonTitle,
+                            systemImage: "doc.plaintext") {
+                            runExtractForCurrentSource()
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(isExtracting
@@ -820,16 +863,16 @@ struct SourceDetailView: View {
                         // Issue #799 PR4 (podcasts) + PR5 (YouTube): a
                         // transcribable source with no transcript yet. The
                         // Transcribe button is the analog of the Extract
-                        // button for PDF/HTML, but its underlying mechanism is
-                        // a network fetch (signed bearer → AMP → TTML → parse
-                        // for podcasts; watch-page scrape → caption track →
-                        // parse for YouTube), NOT a bytes→markdown transform —
-                        // so it dispatches to the queue engine (`runTranscription`).
-                        // Disabled for podcasts when the signing helper binary
-                        // is unavailable (`isTranscribable` mirrors
-                        // `isSourceRefreshable`'s `.applePodcast` runtime guard);
-                        // YouTube needs no signing helper, so it's always
-                        // enabled when the provider matches.
+                        // button for PDF/HTML, but its underlying mechanism
+                        // is a package extraction (signed bearer → AMP →
+                        // TTML → parse for Apple Podcasts; feed → transcript
+                        // attachment → parse for RSS; captions fetch for
+                        // YouTube), NOT a bytes→markdown transform — so it
+                        // dispatches to the queue engine (`runTranscription`).
+                        // Availability is route-derived (`isTranscribable`),
+                        // never "no signing helper, so always on"; a route
+                        // disabled in settings surfaces as a typed failure
+                        // through Activity, not as a hidden button.
                         //
                         // #842 PR2 C5: when a transcription is already in flight
                         // for this source, the button swaps to "View
@@ -958,6 +1001,9 @@ struct SourceDetailView: View {
     /// materialization (network fetch) runs off-main inside the service; the
     /// store write + `reloadSources` happen on-main inside `refreshSource`.
     /// On success, reloads the head markdown so the reader updates.
+    /// Podcast and YouTube sources are queue-routed: the typed
+    /// `.transcriptQueueRequired` error from the refresh service triggers the
+    /// same durable extraction enqueue the Transcribe action uses.
     private func runRefresh() async {
         isRefreshing = true
         refreshError = nil
@@ -969,6 +1015,11 @@ struct SourceDetailView: View {
             refreshError = "This \(agent) source can't be refreshed."
         } catch SourceRefreshService.RefreshError.snapshotWithImages {
             refreshError = "This snapshot source includes images; re-snapshotting on refresh is coming soon."
+        } catch SourceRefreshService.RefreshError.transcriptQueueRequired {
+            await runTranscription()
+            if let head = store.processedMarkdownHead(for: file) {
+                headVersion = head
+            }
         } catch {
             refreshError = "Refresh failed: \(error.localizedDescription)"
         }
@@ -1076,8 +1127,8 @@ struct SourceDetailView: View {
     /// `body` so the type-checker can resolve each subtree independently.
     ///
     /// Uses the shared `DetailInspectorView` (same as `PageDetailView`) so
-    /// sources get the same tabbed inspector. The outline tab renders the
-    /// source's `PageOutlineView`.
+    /// sources get the same tabbed inspector. The outline tab renders
+    /// `InspectorOutlineView` from the registered outline payload.
     ///
     /// The explicit `.frame(maxWidth: .infinity, maxHeight: .infinity,
     /// alignment: .topLeading)` on `contentArea` is load-bearing and mirrors
@@ -1085,8 +1136,8 @@ struct SourceDetailView: View {
     /// `WikiReaderView` (an `NSViewRepresentable` wrapping a `WKWebView`)
     /// reports no intrinsic content size and SwiftUI leaves the layout
     /// indeterminate — for sources whose outline is hidden (PR #648's
-    /// `isOutlineApplicable` guard removed the always-present
-    /// `PageOutlineView` sibling that previously helped pin the `HStack`'s
+    /// `isOutlineApplicable` guard removed the always-present outline
+    /// sibling that previously helped pin the `HStack`'s
     /// vertical extent), the indeterminate layout leaks into the header area.
     /// The header's Show in List / Share / Reveal in Finder buttons render
     /// above, but no longer receive their click. Issue #656.
@@ -1096,9 +1147,29 @@ struct SourceDetailView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
+    /// The outline payload for the current source, derived in the body so
+    /// caret moves and content switches re-derive it;
+    /// `SidebarRegistrationRefresh` observes it and re-registers on change.
+    /// Nil or outline-inapplicable markdown yields an empty payload — the
+    /// inspector then shows the explicit empty state.
+    private var outlinePayload: InspectorOutlinePayload {
+        let headings: [OutlineHeading]
+        if let markdown = currentMarkdownContent, showsSourceOutlineTab {
+            headings = OutlineParser.headings(in: markdown)
+        } else {
+            headings = []
+        }
+        return InspectorOutlinePayload(
+            subject: .source(file.id),
+            content: .headings(headings),
+            highlightedItemID: OutlineParser.activeHeadingID(
+                caretUTF16Offset: caretCharIndex ?? -1, headings: headings))
+    }
+
     private func updateRightSidebarRegistration() {
         rightInspector.updateRegistration(
             RightSidebarRegistration(
+                subject: .source(file.id),
                 inspectorTab: $inspectorTab,
                 outlineWidth: $outlineWidth,
                 availableTabs: sourceInspectorTabs,
@@ -1123,10 +1194,19 @@ struct SourceDetailView: View {
                     },
                     copy: MetadataActionRouter.systemClipboardCopy,
                     openURL: { NSWorkspace.shared.open($0) }),
-                outline: {
-                    AnyView(sourceSidebarOutlineView())
+                outline: outlinePayload,
+                onOutlineSelect: { selection in
+                    guard case .heading(let heading) = selection else { return }
+                    if isEditing {
+                        editorScrollRequest = EditorScrollRequest(
+                            charOffset: heading.charOffset,
+                            version: (editorScrollRequest?.version ?? 0) + 1)
+                    } else {
+                        store.jumpToAnchorInCurrentSelection(heading.id)
+                    }
                 }
-            )
+            ),
+            activeSelection: store.selection
         )
     }
 
@@ -1183,26 +1263,6 @@ struct SourceDetailView: View {
             okfMetadata: okfMetadata))
     }
 
-
-    @ViewBuilder
-    private func sourceSidebarOutlineView() -> some View {
-        if let markdown = currentMarkdownContent, showsSourceOutlineTab {
-            outlineView(markdown: markdown)
-        }
-    }
-
-    private func outlineView(markdown: String) -> some View {
-        PageOutlineView(markdown: markdown,
-                        caretCharIndex: caretCharIndex) { heading in
-            if isEditing {
-                editorScrollRequest = EditorScrollRequest(
-                    charOffset: heading.charOffset,
-                    version: (editorScrollRequest?.version ?? 0) + 1)
-            } else {
-                store.jumpToAnchorInCurrentSelection(heading.id)
-            }
-        }
-    }
 
     // MARK: - Content area
 
@@ -1439,6 +1499,34 @@ struct SourceDetailView: View {
         sourceBytesSnapshot = store.sourceBytes(id: file.id)
     }
 
+    /// Loads the active package registration snapshots that gate the Raw
+    /// Source extract affordance. Kept in its own method rather than inlined
+    /// in the `body` modifier chain: an inline `await` + protocol call there
+    /// pushed the whole single-expression `body` past the type-checker's time
+    /// budget ("unable to type-check this expression in reasonable time").
+    private func loadActiveExtractorRegistrations() async {
+        activeExtractorRegistrations = await extractionCoordinator.activeRegistrationSnapshots()
+    }
+
+    /// Shared Extract tap handling: the header affordance (un-extracted
+    /// PDF/HTML/DOCX) and the Raw Source affordance (#1252) dispatch
+    /// identically — inline package-only paths for HTML/DOCX (the queue
+    /// engine is PDF-coupled via `ExtractionResolution.pdfData`), managed
+    /// queue otherwise. `backend` force-runs a package chosen from the Raw
+    /// Source dropdown. Kept as one method so all affordances share a path.
+    private func runExtractForCurrentSource(backend: ExtractionBackend? = nil) {
+        DebugLog.extraction("SourceDetailView: Extract tapped — id=\(file.id.rawValue), html=\(SourceRendererPresentationPlanner.isHTMLSource(file)), docx=\(SourceRendererPresentationPlanner.isDOCXSource(file)), backend=\(backend?.rawValue ?? "default")")
+        Task {
+            if SourceRendererPresentationPlanner.isHTMLSource(file) {
+                await runHtmlExtraction()
+            } else if SourceRendererPresentationPlanner.isDOCXSource(file) {
+                await runDocxExtraction()
+            } else {
+                await runExtraction(backend: backend)
+            }
+        }
+    }
+
     private func handleRendererFallback(_ reason: String) {
         DebugLog.tabs("SourceDetailView: renderer fallback (source=\(file.id.rawValue), reason=\(reason))")
         // The host owns the live Source fallback. Do not persist it: an
@@ -1523,7 +1611,7 @@ struct SourceDetailView: View {
     /// Extraction progress is shown in the transcript sidebar's PDF Conversion
     /// box — the detail view keeps only a minimal Extracting… spinner in the
     /// header. The queue engine's `.progress` events drive the tracker's log.
-    private func runExtraction() async {
+    private func runExtraction(backend: ExtractionBackend? = nil) async {
         isExtracting = true
         defer {
             isExtracting = false
@@ -1531,11 +1619,22 @@ struct SourceDetailView: View {
 
         // Route extraction through the queue engine instead of the old
         // inline slot machinery. The engine handles serialization (local
-        // pdf2md limit 1), readiness checks, and progress reporting.
+        // pdf2md limit 1), readiness checks, and progress reporting. A
+        // chosen-package run passes the backend override via stageRouting —
+        // the same channel re-extraction uses; the worker resolves it to the
+        // reviewed package lineage instead of the configured default.
         do {
+            let payload: QueueItemPayload
+            if let backend {
+                payload = QueueItemPayload(
+                    sourceIDs: [file.id],
+                    stageRouting: [StageRoutingKey.backend.rawValue: backend.rawValue])
+            } else {
+                payload = QueueItemPayload(sourceIDs: [file.id])
+            }
             let request = QueueItemRequest(
                 queue: .extraction, wikiID: store.eventBus?.wikiID ?? WikiID(rawValue: ""),
-                payload: QueueItemPayload(sourceIDs: [file.id]))
+                payload: payload)
             let itemID = try await queueEngine.enqueue(request)
             let result = try await queueEngine.waitForCompletion(of: itemID)
 
@@ -1674,28 +1773,12 @@ struct SourceDetailView: View {
         await runDocxExtraction()
     }
 
-    /// Transcription trigger (issue #799 PR4 for podcasts; generalized to
-    /// YouTube in PR5). Inline — does NOT route through the queue engine
-    /// (the queue is PDF-coupled via `ExtractionResolution.pdfData` /
-    /// `convert(pdfData:)` / `seedPdfMarkdown`; transcript "extraction" is a
-    /// NETWORK FETCH with a different input shape — signed bearer → AMP →
-    /// TTML → parse for podcasts; watch-page scrape → caption track → parse
-    /// for YouTube). Mirrors `runHtmlExtraction` (PR2) but calls
-    /// `WikiStoreModel.transcribe(sourceID:podcastFetcher:youtubeFetcher:)`
-    /// (the PR5 unified dispatch that routes per provider — the per-provider
-    /// helpers stay private on the model). Uses the configured
-    /// `store.podcastBackend` when set; otherwise falls back to
-    /// `.appleTranscript` (only backend today) for podcasts. YouTube has no
-    /// backend choice today (only the captions-scrape path).
-    /// On a build without `PODCAST_TRANSCRIPTS`, the predicate
-    /// `needsTranscription` returns `false` for `.applePodcast` (its
-    /// underlying `isTranscribable` returns `false` via
-    /// `isSourceRefreshable`'s phase-out arm), so the podcast path is
-    /// unreachable in production; the YouTube path stays available.
-    /// Run transcription through the queue engine instead of calling
-    /// `store.transcribe(sourceID:)` inline (#842). Enqueues a durable
-    /// `.extraction` queue job (transcription merged into extraction — the
-    /// provider resolves transcript sources to a `transcriptFetch` closure),
+    /// Enqueues a durable `.extraction` queue job for transcription. The queue
+    /// provider resolves the transcript fetch through the selected extractor
+    /// package: for Apple Podcasts the reviewed package picks TTML or RSS from
+    /// the host-staged operation support; for RSS feeds and YouTube the
+    /// reviewed podcast/youtube-transcript packages fetch captions directly.
+    /// The job
     /// waits for completion, and refreshes the head version on success —
     /// mirroring `runExtraction()`. Errors land on the queue item's `error`
     /// field + Activity window (not inline `transcribeError`, which was
@@ -1718,32 +1801,6 @@ struct SourceDetailView: View {
             }
         } catch {
             DebugLog.extraction("SourceDetailView: transcribe enqueue failed (\(file.id.rawValue)): \(error)")
-        }
-    }
-
-    /// Re-transcription trigger (issue #799 PR4). Now enqueues through the
-    /// queue engine too (#842) — the `backend` parameter rides in
-    /// `payload.stageRouting` (placeholder for future backends; only
-    /// `.appleTranscript` exists today).
-    private func runTranscription(with backend: PodcastTranscriptionBackend) async {
-        DebugLog.extraction("SourceDetailView: Re-transcribe tapped — id=\(file.id.rawValue), backend=\(backend.rawValue)")
-        do {
-            let request = QueueItemRequest(
-                queue: .extraction, wikiID: store.eventBus?.wikiID ?? WikiID(rawValue: ""),
-                payload: QueueItemPayload(sourceIDs: [file.id]))
-            let itemID = try await queueEngine.enqueue(request)
-            let result = try await queueEngine.waitForCompletion(of: itemID)
-
-            switch result {
-            case .success:
-                if let head = store.processedMarkdownHead(for: file) {
-                    headVersion = head
-                }
-            case .failure:
-                break
-            }
-        } catch {
-            DebugLog.extraction("SourceDetailView: re-transcribe enqueue failed (\(file.id.rawValue)): \(error)")
         }
     }
 
@@ -1790,26 +1847,8 @@ struct SourceDetailView: View {
                       : "Re-extract with another backend to enable compare")
             }
             Section("Re-extract with") {
-                // Content-type-aware: HTML sources list `HtmlExtractionBackend`
-                // (defuddle, tag-based), PDF sources list `ExtractionBackend`
-                // (local pdf2md, ACP, Anthropic, Gemini, Docling Serve),
-                // podcast sources list `PodcastTranscriptionBackend`
-                // (currently just `appleTranscript`; issue #799 PR4) and
-                // route to `runTranscription(with:)`. YouTube sources (PR5,
-                // issue #799 PR5) have a single entry today (the captions
-                // scrape — no `YouTubeTranscriptionBackend` enum added yet;
-                // revisit when the Python-subprocess backend lands, #584)
-                // and route to the parameterless `runTranscription()`. DOCX
-                // sources have a single entry too (the reviewed docx2md
-                // package — package-only, no backend enum) routing to the
-                // parameterless `runDocxReExtraction()`. A source is HTML xor
-                // DOCX xor PDF xor podcast xor YouTube xor other — the
-                // branches are mutually exclusive. The HTML, DOCX, podcast,
-                // and YouTube branches route through the inline `extractHtml`
-                // / `extractDocx` / `transcribe` paths (issues #799 PR2 +
-                // PR4 + PR5 — the queue engine is PDF-coupled; generalizing
-                // it is a deferred sub-project per the parent plan's "Out of
-                // scope" section).
+                // HTML and PDF sources offer backend choices. Transcript
+                // sources and DOCX use one package-driven action.
                 if SourceRendererPresentationPlanner.isHTMLSource(file) {
                     ForEach(HtmlExtractionBackend.allCases, id: \.self) { backend in
                         Button(backend.displayName) {
@@ -1820,30 +1859,8 @@ struct SourceDetailView: View {
                         .disabled(isThisFileExtracting
                                   || tracker.isSlotBusyForOtherSource(file.id))
                     }
-                } else if isPodcastEmbed {
-                    ForEach(PodcastTranscriptionBackend.allCases, id: \.self) { backend in
-                        Button(backend.displayName) {
-                            Task {
-                                await runTranscription(with: backend)
-                            }
-                        }
-                        .disabled(isTranscribing
-                                  || isThisFileExtracting
-                                  || tracker.isSlotBusyForOtherSource(file.id))
-                    }
-                } else if isYouTubeEmbed {
-                    // Issue #799 PR5: YouTube has a single transcript backend
-                    // today (the pure-Swift watch-page → caption-scrape path in
-                    // `YouTubeTranscriptService`). The menu entry dispatches
-                    // through the parameterless `runTranscription()` (which
-                    // calls `WikiStoreModel.transcribe(sourceID:)`, routing by
-                    // provider → `transcribeYouTube`). When a future backend
-                    // (e.g. a Python `youtube-transcript-api` subprocess, #584)
-                    // lands and we add a `YouTubeTranscriptionBackend` enum,
-                    // this branch mirrors the podcast arm: a `ForEach` over
-                    // `YouTubeTranscriptionBackend.allCases` calling
-                    // `runTranscription(with:)`.
-                    Button("YouTube captions") {
+                } else if contentKind.capabilities.hasTranscriptBackend {
+                    Button("Transcript") {
                         Task { await runTranscription() }
                     }
                     .disabled(isTranscribing
@@ -1935,9 +1952,55 @@ struct SourceDetailView: View {
         ContentUnavailableView {
             Label("Raw Source", systemImage: symbol)
         } description: {
-            Text("This file is stored verbatim in the wiki. Ingesting asks the agent to read it, create or update wiki pages, refresh index.md, and append log.md.")
+            Text("This file is stored verbatim in the wiki — extract and ingest never change it. **Extract** runs the matching extractor package and adds a Markdown version beside the original. **Ingest** asks the agent to read it, create or update wiki pages, refresh index.md, and append log.md.")
+        } actions: {
+            // Issue #1252: when registered extractors match this source's
+            // declared MIME type or extension, the next step lives right
+            // where the dead end is — the Raw Source reader. One match gets a
+            // button; several (a PDF matches both pdf2md and docling-serve)
+            // get a dropdown that force-runs the chosen package.
+            let extractors = rawSourceExtractors
+            if extractors.count == 1 {
+                rawSourceExtractButton(match: extractors[0])
+            } else if extractors.count > 1 {
+                Menu {
+                    ForEach(extractors, id: \.registration) { match in
+                        Button("Extract with \(match.packageName)") {
+                            runExtractForCurrentSource(backend: match.backend)
+                        }
+                    }
+                } label: {
+                    Label(extractMenuTitle, systemImage: "doc.plaintext")
+                }
+                .menuStyle(.button)
+                .buttonStyle(.borderedProminent)
+                .disabled(isExtracting || isThisFileExtracting
+                          // Another file currently holds the extraction
+                          // slot — mirror the header button's busy state.
+                          || tracker.isSlotBusyForOtherSource(file.id))
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Single-match Extract button for the Raw Source panel.
+    private func rawSourceExtractButton(match: RawSourceExtractorMatch) -> some View {
+        Button(
+            isExtracting || isThisFileExtracting
+                ? "Extracting…"
+                : "Extract with \(match.packageName)",
+            systemImage: "doc.plaintext") {
+            runExtractForCurrentSource(backend: match.backend)
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(isExtracting
+                  || isThisFileExtracting
+                  || tracker.isSlotBusyForOtherSource(file.id))
+    }
+
+    /// Title for the multi-match Extract dropdown.
+    private var extractMenuTitle: String {
+        isExtracting || isThisFileExtracting ? "Extracting…" : "Extract with…"
     }
 
     // MARK: - Edit helpers
@@ -2101,9 +2164,54 @@ private struct PDFTaskKey: Hashable {
     let anchorVersion: Int
 }
 
+/// Manifest-derived presentation for the packages chosen to act on a Raw
+/// Source — one entry per matching registration, deterministic order.
+/// `backend` is the queue-execution override that force-runs this package
+/// (nil: run with the configured route default).
+struct RawSourceExtractorMatch: Equatable, Sendable {
+    let packageName: String
+    let registration: ExtractorReference
+    let backend: ExtractionBackend?
+}
+
 // MARK: - PR2 testable seam — Extract / Transcribe affordance (§5.4)
 
 extension SourceDetailView {
+
+    /// All input matches for the Raw Source affordance (#1252): every active
+    /// registration that claims the source's MIME type or extension, one per
+    /// package, deterministic order. Unavailable catalog entries are never
+    /// passed here. The UI offers a single button for one match and a
+    /// dropdown for several (PDFs match both pdf2md and docling-serve).
+    nonisolated static func rawSourceExtractorMatches(
+        mimeType: String?,
+        ext: String?,
+        registrations: [ExtractorRouteRegistrationSnapshot]
+    ) -> [RawSourceExtractorMatch] {
+        return ExtractorRouteTableBuilder.activeRegistrations(
+            mimeType: mimeType,
+            filenameExtension: ext,
+            registrations: registrations)
+            .map { registration in
+                RawSourceExtractorMatch(
+                    packageName: registration.packageName.isEmpty ? registration.displayName : registration.packageName,
+                    registration: registration.reference,
+                    backend: ExtractorRouteTableBuilder.executionBackend(for: registration))
+            }
+    }
+
+    /// The deterministic primary match (`rawSourceExtractorMatches.first`).
+    nonisolated static func rawSourceExtractorMatch(
+        mimeType: String?,
+        ext: String?,
+        registrations: [ExtractorRouteRegistrationSnapshot]
+    ) -> RawSourceExtractorMatch? {
+        rawSourceExtractorMatches(
+            mimeType: mimeType,
+            ext: ext,
+            registrations: registrations)
+            .first
+    }
 
     /// The single-affordance decision for a source's content type, computed
     /// from the registry BEFORE any runtime guard (signing helper present /
@@ -2135,6 +2243,8 @@ extension SourceDetailView {
     /// reach it without instantiating a `SourceDetailView` (which needs a
     /// `WikiStoreModel`, `AgentLauncher`, `ExtractionCoordinator`, etc.).
     /// Mirrors the PR1 `BackgroundIngestCoordinator.ingestionDecision` seam.
+    /// Registration-driven kinds, such as DOCX, must receive the active
+    /// registration set from the caller.
     ///
     /// `nonisolated` because it's pure (a single `ContentKind.resolve(...)`
     /// call with no actor dependencies) despite the enclosing SwiftUI `View`
@@ -2146,13 +2256,21 @@ extension SourceDetailView {
     nonisolated static func extractionAffordance(
         mimeType: String?,
         provider: SourceProvider?,
-        ext: String?
+        ext: String?,
+        registeredInputs: RegisteredExtractionInputs = .none
     ) -> ExtractionAffordance {
-        let kind = ContentKind.resolve(mimeType: mimeType, provider: provider, ext: ext)
+        let kind = ContentKind.resolve(
+            mimeType: mimeType,
+            provider: provider,
+            ext: ext,
+            registeredInputs: registeredInputs)
         switch kind.capabilities.extractionPath {
         case .pdfBackend, .htmlToMarkdown, .docxBackend: return .extract
         case .podcastTranscript, .youtubeTranscript:   return .transcribe
-        case nil:                                       return .none
+        // Zotero acquisition is driven by `wikictl extractor sync zotero` (UI later),
+        // so no manual extraction button applies yet.
+        case .zoteroAttachment:                        return .none
+        case nil:                                      return .none
         }
     }
 

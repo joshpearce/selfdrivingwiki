@@ -68,8 +68,8 @@ public struct SourceProvenance: Sendable, Equatable {
 
 /// A materializer's output: the bytes to store + the provenance to record. Carries
 /// **no store handle** — the store owns the write (`storeMaterialized` →
-/// `addSource`). Also carries the retained Zotero legacy columns so the
-/// `ZoteroMaterializer` can populate both the PROV layer and the legacy columns in
+/// `addSource`). Also carries the retained Zotero legacy columns so an origin
+/// can populate both the PROV layer and the legacy columns in
 /// one call (§4.2: zotero columns are "legacy provenance, retained").
 ///
 /// `extractedMarkdown` (issue #599): non-nil when the source preserves its
@@ -433,126 +433,13 @@ public struct WebsiteSnapshot: Sendable {
     }
 }
 
-// MARK: - ApplePodcastMaterializer
-
-#if PODCAST_TRANSCRIPTS
-/// Materializes an Apple Podcasts episode transcript: the fetch (token signing →
-/// AMP metadata → TTML download → parse → markdown) runs off-main, producing a
-/// `MaterializedSource` with `agentName = "apple-podcast"`, `activityKind = "fetch"`,
-/// `plan`/`externalRef` = the episode's `podcasts.apple.com` URL, and
-/// `externalIdentity` = the numeric episode ID (`i=` value). This is the first real
-/// consumer of the `SourceMaterializer` protocol; `addURL` routes recognized episode
-/// URLs here instead of `WebsiteMaterializer`.
-///
-/// Holds the page URL separately from `EpisodeRef` so the provenance records the
-/// canonical `podcasts.apple.com` link (not the episode ID alone) — the ID is what
-/// the AMP endpoint wants, but the URL is what the user pasted and what the Origin
-/// row should surface.
-public struct ApplePodcastMaterializer: SourceMaterializer {
-    public let agentName = SourceProvider.applePodcast.rawValue
-    public let episode: PodcastEpisodeURL.EpisodeRef
-    public let pageURL: URL
-    public let fetcher: any PodcastTranscriptFetching
-
-    public init(
-        episode: PodcastEpisodeURL.EpisodeRef,
-        pageURL: URL,
-        fetcher: any PodcastTranscriptFetching
-    ) {
-        self.episode = episode
-        self.pageURL = pageURL
-        self.fetcher = fetcher
-    }
-
-    public func materialize() async throws -> MaterializedSource {
-        let episode = self.episode
-        let fetcher = self.fetcher
-        // The transcript fetch (helper subprocess + two HTTP round-trips) is
-        // off-main; the materializer never touches the store.
-        let transcript = try await Task.detached(priority: .userInitiated) {
-            try await fetcher.transcript(for: episode)
-        }.value
-        let urlString = pageURL.absoluteString
-        return MaterializedSource(
-            filename: transcript.filename,
-            data: Data(transcript.markdown.utf8),
-            mimeType: MimeType.markdown,
-            provenance: SourceProvenance(
-                agentName: agentName,
-                activityKind: "fetch",
-                plan: urlString,
-                externalRef: urlString,
-                externalIdentity: episode.id
-            )
-        )
-    }
-}
-#endif
-
-// MARK: - ZoteroMaterializer
-
-/// Materializes a Zotero attachment: resolves its local file (off-main read),
-/// recording `agentName = "zotero"`, `activityKind = "import"`,
-/// `externalIdentity` = the parent item key. Also populates the retained legacy
-/// `zoteroItemKey`/`zoteroItemTitle` columns (§4.2).
-public struct ZoteroMaterializer: SourceMaterializer {
-    public let agentName = SourceProvider.zotero.rawValue
-    public let attachment: ZoteroAttachment
-    public let parentItem: ZoteroItem
-    public let zoteroDir: URL
-
-    public init(attachment: ZoteroAttachment, parentItem: ZoteroItem, zoteroDir: URL) {
-        self.attachment = attachment
-        self.parentItem = parentItem
-        self.zoteroDir = zoteroDir
-    }
-
-    public func materialize() async throws -> MaterializedSource {
-        switch ZoteroLocalStorage.resolve(attachment, zoteroDir: zoteroDir) {
-        case .local(let path):
-            let data = try await Task.detached(priority: .userInitiated) {
-                try Data(contentsOf: path)
-            }.value
-            // Derive (stem, extensionHint) from the attachment filename and route
-            // through format dispatch — the SAME pipeline as website/local-file
-            // sources. This fixes a latent bug: a Zotero HTML attachment is now
-            // converted to Markdown instead of stored as raw HTML.
-            let filename = path.lastPathComponent
-            let ns = filename as NSString
-            let stem = ns.deletingPathExtension
-            let extRaw = ns.pathExtension.lowercased()
-            let extHint = extRaw.isEmpty ? nil : extRaw
-            #if canImport(UniformTypeIdentifiers)
-            let utiMIME = extHint.flatMap { UTType(filenameExtension: $0)?.preferredMIMEType }
-            #else
-            let utiMIME: String? = nil
-            #endif
-            let hints = ContentTypeDetectionHints(
-                declaredMIME: attachment.contentType.map { .init($0, origin: .zoteroMetadata) },
-                filenameExtension: extHint,
-                utiMIME: utiMIME)
-            let plan = FormatMaterializer.dispatch(
-                data: data, hints: hints,
-                stem: stem, extensionHint: extHint)
-            return MaterializedSource(
-                filename: plan.filename,
-                data: plan.data,
-                detectionHints: hints,
-                detectionResult: plan.detectionResult,
-                ingestMetadata: .init(
-                    externalItemID: parentItem.key,
-                    externalItemTitle: parentItem.title),
-                provenance: SourceProvenance(
-                    agentName: agentName,
-                    activityKind: "import",
-                    externalIdentity: parentItem.key
-                ),
-                extractedMarkdown: plan.extractedMarkdown)
-        case .unavailable(let reason):
-            throw ZoteroFetchError.unavailable(reason)
-        }
-    }
-}
+// MARK: - Apple Podcasts ingest
+//
+// The `ApplePodcastMaterializer` was REMOVED with the Apple TTML packaging:
+// Apple Podcasts transcripts run through the reviewed apple-podcast-transcript
+// package via the extraction queue, whose prepared adapter carries exact
+// installed-package provenance. The former built-in materializer could not
+// carry provenance and had no remaining production caller.
 
 // MARK: - MarkdownFolderMaterializer
 

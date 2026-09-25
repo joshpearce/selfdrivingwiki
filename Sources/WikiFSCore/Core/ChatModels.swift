@@ -26,15 +26,6 @@ public struct ChatSummary: Identifiable, Hashable, Sendable {
     public var updatedAt: Date
     /// Persisted message count, for the history list's subtitle.
     public var messageCount: Int
-    /// One-line summary of the model's first response, generated on chat
-    /// completion (issue #411). `nil` for chats that haven't been summarized
-    /// yet (existing chats after migration, or chats whose `finish()` never
-    /// fired). The sidebar shows this when present, falling back to the
-    /// relative timestamp.
-    public var summary: String?
-    /// When the summary was written, for staleness display. `nil` alongside
-    /// `summary`.
-    public var summaryAt: Date?
     /// The ACP session ID for resume (#830). Set after the chat's session is
     /// created; cleared on terminal teardown (resume permanently failed) or
     /// successful completion. `nil` for pre-#830 chats and chats whose resume
@@ -61,7 +52,6 @@ public struct ChatSummary: Identifiable, Hashable, Sendable {
     public init(
         id: ChatID, kind: ChatKind, title: String,
         createdAt: Date, updatedAt: Date, messageCount: Int,
-        summary: String? = nil, summaryAt: Date? = nil,
         acpSessionId: AcpSessionID? = nil,
         modelProviderId: ProviderID? = nil, modelId: ModelID? = nil,
         configuredThinkingOptionID: ChatConfigurationValueID? = nil,
@@ -73,8 +63,6 @@ public struct ChatSummary: Identifiable, Hashable, Sendable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.messageCount = messageCount
-        self.summary = summary
-        self.summaryAt = summaryAt
         self.acpSessionId = acpSessionId
         self.modelProviderId = modelProviderId
         self.modelId = modelId
@@ -88,13 +76,26 @@ public struct ChatSummary: Identifiable, Hashable, Sendable {
     /// `[[chat:…]]` attachment reference lines (prepended by `sendMessage`
     /// when sidebar items are dragged into the chat, issue #385) so the title
     /// is the user's actual question, not the first attachment's wikilink.
-    public static func title(fromFirstMessage message: String, maxLength: Int = 60) -> String {
-        let stripped = Self.stripAttachmentRefs(from: message)
+    /// Also strips the known agent skills-budget preamble (`AgentPresentationPreamble`)
+    /// — some backends prepend "Warning: Skill descriptions were shortened…"
+    /// to the message text, and without this the warning became the chat's
+    /// title while the transcript kept the real question.
+    ///
+    /// Returns `nil` when nothing usable remains (whitespace-only,
+    /// warning-only, or preamble-only input) — issue #1265. Writers skip the
+    /// title write on `nil`, leaving the row genuinely untitled (rendered as
+    /// "New Chat" by the display fallback) and retriable on the next send.
+    /// The derivation never returns the display fallback itself: a stored
+    /// "New Chat" would be a sentinel indistinguishable from a real title,
+    /// permanently blocking later automatic title writes.
+    public static func title(fromFirstMessage message: String, maxLength: Int = 60) -> String? {
+        let withoutPreamble = AgentPresentationPreamble.visibleText(message, policy: .completeOnly) ?? ""
+        let stripped = Self.stripAttachmentRefs(from: withoutPreamble)
         let firstLine = stripped
             .components(separatedBy: .newlines)
             .first ?? ""
         let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return "New Chat" }
+        guard !trimmed.isEmpty else { return nil }
         guard trimmed.count > maxLength else { return trimmed }
         return trimmed.prefix(maxLength - 1) + "…"
     }
@@ -145,7 +146,9 @@ public struct ChatSummary: Identifiable, Hashable, Sendable {
     }
 }
 
-/// Which summarizer produced a `chat_messages.summary` row. The raw values
+/// Which summarizer produced a transcript-item `summary` (chat-summary plan
+/// §4.2; stored in `chat_transcript_items.summary_kind` since v54, #1266).
+/// The raw values
 /// are EXPLICIT and must match the `summary_kind` column spec exactly —
 /// without them Swift would derive the rawValue from the case name
 /// (`"defaultTruncation"`), mismatching the column and breaking round-trips
@@ -172,18 +175,10 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
     public var id: PageID
     public var chatID: ChatID
     /// Dense, 0-based per-chat ordering. Assigned by the store on append.
+    /// The one-based durable transcript cursor is `seq + 1`.
     public var seq: Int
     public var event: AgentEvent
     public var createdAt: Date
-    /// Cached one-line summary (chat-summary plan). `nil` until the summarizer
-    /// runs; written once via `updateMessageSummary` and never recomputed.
-    public var summary: String?
-    /// Which summarizer produced `summary`. `nil` alongside `summary`. Stored
-    /// as `ChatMessageSummaryKind.rawValue` in the `summary_kind` column.
-    public var summaryKind: ChatMessageSummaryKind?
-    /// When the summary was written, for staleness display. `nil` alongside
-    /// `summary`.
-    public var summaryAt: Date?
     /// True when this row is a mid-generation streaming checkpoint not yet
     /// finalized (#826). Draft rows decode to a normal `.assistantText` and
     /// render as the (partial) assistant message; the flag is available for an
@@ -193,9 +188,6 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
 
     public init(
         id: PageID, chatID: ChatID, seq: Int, event: AgentEvent, createdAt: Date,
-        summary: String? = nil,
-        summaryKind: ChatMessageSummaryKind? = nil,
-        summaryAt: Date? = nil,
         isDraft: Bool = false
     ) {
         self.id = id
@@ -203,9 +195,6 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
         self.seq = seq
         self.event = event
         self.createdAt = createdAt
-        self.summary = summary
-        self.summaryKind = summaryKind
-        self.summaryAt = summaryAt
         self.isDraft = isDraft
     }
 }

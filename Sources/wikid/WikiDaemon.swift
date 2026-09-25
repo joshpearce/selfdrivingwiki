@@ -978,7 +978,13 @@ final class WikiDaemon: @unchecked Sendable {
         let queueStore = try QueueStore(databaseURL: queueDatabaseURL)
         let extractionProvider = DaemonQueueExtractionProvider(
             extractionServices: extractionServices,
-            storeResolver: storeResolver)
+            storeResolver: storeResolver,
+            openStore: { [weak self] wikiID in
+                guard let self else { return false }
+                _ = await self.openStore(wikiID: wikiID)
+                return self.preparedStoreIfAvailable(wikiID: wikiID) != nil
+            },
+            queueStore: queueStore)
         let dir = containerDirectory
         let ingestionProvider = DaemonQueueIngestionProvider(
             containerDirectory: dir,

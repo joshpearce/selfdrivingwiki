@@ -116,11 +116,20 @@ private final class StubExtractor: MarkdownExtractor {
 
 private struct StubExtractionProvider: QueueExtractionProvider {
     func resolveExtraction(wikiID: WikiID, sourceID: SourceID, backendOverride: ExtractionBackend?) async throws -> ExtractionResolution? { nil }
-    func persistExtraction(wikiID: WikiID, sourceID: SourceID, markdown: String, backend: ExtractionBackend, modelVersion: String?, technique: String?) async throws {}
+    func persistBytesExtraction(wikiID: WikiID, sourceID: SourceID, resolution: BytesExtractionResolution, markdown: String) async throws -> QueueExtractionOutputReference? { nil }
+    func persistTranscriptExtraction(wikiID: WikiID, sourceID: SourceID, resolution: TranscriptExtractionResolution, outcome: TranscriptFetchOutcome) async throws -> QueueExtractionOutputReference? { nil }
+    func persistAttachmentExtraction(wikiID: WikiID, sourceID: SourceID, resolution: AttachmentExtractionResolution, outcome: AttachmentFetchOutcome) async throws -> QueueExtractionOutputReference? { nil }
+    func enqueueFollowOnExtraction(wikiID: WikiID, sourceID: SourceID) async throws {}
 }
 
 private func makeTestQueueEngine() throws -> QueueEngine {
-    let store = try QueueStore(databaseURL: URL(fileURLWithPath: ":memory:"))
+    // Unique per-test database FILE — `URL(fileURLWithPath: ":memory:")` does
+    // not yield SQLite's private in-memory DB (the colon is lost in URL path
+    // conversion, so GRDB opens a shared literal `:memory:` file in the CWD).
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("menu-item-controller-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let store = try QueueStore(databaseURL: dir.appendingPathComponent("queue.sqlite"))
     let provider = StubExtractionProvider()
     let factory = QueueExtractionWorkerFactory(provider: provider, emitProgress: { _, _ in })
     return QueueEngine(store: store, workerFactory: factory)
