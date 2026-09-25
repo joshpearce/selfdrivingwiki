@@ -332,6 +332,7 @@ final class FileProviderFacade: ChangeSignaler {
     /// Make `id` the active wiki for path/signal purposes and resolve its mount
     /// path. Called when the user switches wikis.
     func activate(id: WikiID, displayName: String) async {
+        DebugLog.fileprovider("activate(\(displayName)): facade=\(ObjectIdentifier(self).debugDescription)")
         activeWikiID = id
         activeDisplayName = displayName
         await resolvePath(id: id, displayName: displayName)
