@@ -492,7 +492,6 @@ struct WikiFSApp: App {
             await fileProvider.migrateDomainsIfNeeded(
                 wikiIDs: registry.wikis.map(\.id))
             DebugLog.fileprovider("launch setup: schema migration check done")
-            DebugLog.fileprovider("launch setup: registry=\(ObjectIdentifier(registry).debugDescription) facade=\(ObjectIdentifier(fileProvider).debugDescription)")
             await registry.registerAllDomains()
             DebugLog.fileprovider("launch setup: domain registration done")
 
@@ -1408,13 +1407,8 @@ extension FileProviderFacade {
     /// `SessionManager`).
     @MainActor
     func wire(into registry: WikiRegistryClient) {
-        DebugLog.fileprovider("wire(into:): facade=\(ObjectIdentifier(self).debugDescription) registry=\(ObjectIdentifier(registry).debugDescription)")
         registry.registerDomain = { [weak self] id, name in
-            guard let self else {
-                DebugLog.fileprovider("registry.registerDomain(\(name)): the wired FileProviderFacade was deallocated — skipping")
-                return
-            }
-            await self.registerDomain(id: id, displayName: name)
+            await self?.registerDomain(id: id, displayName: name)
         }
         registry.removeDomain = { [weak self] id in
             await self?.removeDomain(id: id)
