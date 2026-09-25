@@ -178,7 +178,9 @@ final class FileProviderFacade: ChangeSignaler {
     /// is an async sleep — it never blocks the main actor.
     @discardableResult
     func registerDomain(id: WikiID, displayName: String) async -> Bool {
-        if ProcessInfo.processInfo.environment["WIKIFS_REENUMERATE"] == "1" {
+        let reenumerate = ProcessInfo.processInfo.environment["WIKIFS_REENUMERATE"] == "1"
+        DebugLog.fileprovider("registerDomain(\(displayName)): id=\(id.rawValue) reenumerate=\(reenumerate)")
+        if reenumerate {
             do { try await domainService.remove(id: id, reason: .reenumerateHatch) }
             catch { DebugLog.fileprovider("registerDomain: re-enumerate remove failed: \(error)") }
         }

@@ -158,8 +158,14 @@ public final class WikiRegistryClient {
     /// single-domain add-if-absent). Call after `bootstrap`, once the FP
     /// closures are wired.
     public func registerAllDomains() async {
+        guard let registerDomain else {
+            // Unwired: nothing would register, and nothing would say so.
+            DebugLog.fileprovider("registerAllDomains: registerDomain is not wired — skipping \(wikis.count) wiki(s)")
+            return
+        }
+        DebugLog.fileprovider("registerAllDomains: \(wikis.count) wiki(s)")
         for wiki in wikis {
-            await registerDomain?(wiki.id, wiki.displayName)
+            await registerDomain(wiki.id, wiki.displayName)
         }
     }
 
