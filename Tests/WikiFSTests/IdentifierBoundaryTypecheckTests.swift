@@ -187,9 +187,22 @@ struct IdentifierBoundaryTypecheckTests {
         }
     }
 
+    /// Where one build's products live. The two SwiftPM build systems lay
+    /// these out differently:
+    ///
+    /// | | native | Swift Build (default from Swift 6.4) |
+    /// |---|---|---|
+    /// | products | `.build/<triple>/debug/` | `.build/out/Products/Debug/` |
+    /// | Swift modules | `debug/Modules/` | `Products/Debug/` |
+    /// | C module maps | `debug/<Target>.build/` | `out/Intermediates.noindex/GeneratedModuleMaps/` |
     private struct BuildProducts {
         let debugDirectory: URL
         let modulesDirectory: URL
+        /// Swift Build's generated C module maps; `nil` for the native layout.
+        let generatedModuleMapsDirectory: URL?
+        /// Newest required `.swiftmodule`, so a stale tree from an older
+        /// toolchain loses to the build this test run just produced.
+        let newestModuleDate: Date
     }
 
     private struct CompilerResult {
@@ -227,18 +240,30 @@ struct IdentifierBoundaryTypecheckTests {
         )
         var candidates: [BuildProducts] = []
 
-        for case let candidate as URL in enumerator
-        where candidate.lastPathComponent == "Modules"
-            && candidate.deletingLastPathComponent().lastPathComponent == "debug" {
-            guard requiredModules.allSatisfy({
-                fileManager.fileExists(atPath: candidate.appendingPathComponent("\($0).swiftmodule").path)
-            }) else {
+        for case let candidate as URL in enumerator {
+            let parent = candidate.deletingLastPathComponent()
+            let products: (debug: URL, modules: URL, moduleMaps: URL?)
+            if candidate.lastPathComponent == "Modules", parent.lastPathComponent == "debug" {
+                products = (parent, candidate, nil)
+            } else if candidate.lastPathComponent == "Debug", parent.lastPathComponent == "Products" {
+                let moduleMaps = parent.deletingLastPathComponent()
+                    .appendingPathComponent("Intermediates.noindex/GeneratedModuleMaps", isDirectory: true)
+                products = (candidate, candidate, moduleMaps)
+            } else {
+                continue
+            }
+            let moduleURLs = requiredModules.map {
+                products.modules.appendingPathComponent("\($0).swiftmodule")
+            }
+            guard moduleURLs.allSatisfy({ fileManager.fileExists(atPath: $0.path) }) else {
                 continue
             }
             candidates.append(
                 BuildProducts(
-                    debugDirectory: candidate.deletingLastPathComponent(),
-                    modulesDirectory: candidate
+                    debugDirectory: products.debug,
+                    modulesDirectory: products.modules,
+                    generatedModuleMapsDirectory: products.moduleMaps,
+                    newestModuleDate: moduleURLs.map(modificationDate).max() ?? .distantPast
                 )
             )
         }
@@ -418,10 +443,23 @@ struct IdentifierBoundaryTypecheckTests {
         return Set(importedModules)
     }
 
-    private func candidateSortKey(_ candidate: BuildProducts) -> (Int, Int, String) {
+    /// Prefers a real build over index/analyze trees, then the newest
+    /// modules (a leftover tree from an older toolchain fails to import),
+    /// then the path, so the choice never depends on enumeration order.
+    private func candidateSortKey(_ candidate: BuildProducts) -> (Int, TimeInterval, String) {
         let path = candidate.modulesDirectory.path
         let isAuxiliary = path.contains("/index-build/") || path.contains("/analyze/")
-        return (isAuxiliary ? 1 : 0, path.count, path)
+        return (isAuxiliary ? 1 : 0, -candidate.newestModuleDate.timeIntervalSinceReferenceDate, path)
+    }
+
+    private func modificationDate(_ url: URL) -> Date {
+        do {
+            return try url.resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate ?? .distantPast
+        } catch {
+            // An unstattable module cannot be the newest build.
+            return .distantPast
+        }
     }
 
     private func compilerSearchArguments(root: URL, buildProducts: BuildProducts) -> [String] {
@@ -452,6 +490,19 @@ struct IdentifierBoundaryTypecheckTests {
             let tantivyModuleMap = directory.appendingPathComponent("tantivyFFI/module.modulemap")
             if fileManager.fileExists(atPath: tantivyModuleMap.path) {
                 arguments += ["-Xcc", "-fmodule-map-file=\(tantivyModuleMap.path)"]
+            }
+        }
+
+        // Swift Build names each C target's map `<Target>.modulemap` in one
+        // shared directory instead of `<Target>.build/module.modulemap`.
+        if let moduleMaps = buildProducts.generatedModuleMapsDirectory {
+            for target in ["CRendererPackageMove", "GRDB", "TantivyFFI", "TantivySwift"] {
+                let moduleMap = moduleMaps.appendingPathComponent("\(target).modulemap")
+                guard fileManager.fileExists(atPath: moduleMap.path) else { continue }
+                arguments += ["-Xcc", "-fmodule-map-file=\(moduleMap.path)"]
+            }
+            if fileManager.fileExists(atPath: moduleMaps.path) {
+                arguments += ["-Xcc", "-I\(moduleMaps.path)"]
             }
         }
 
