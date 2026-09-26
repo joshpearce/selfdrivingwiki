@@ -85,6 +85,13 @@ public final class QueueStore: @unchecked Sendable {
     private let closeLock = NSLock()
     private var closed = false
 
+    /// One-shot `getItem` outcome override armed by
+    /// ``injectGetItemOutcome(_:)``. `nil` in production — only tests arm it.
+    /// Lock-guarded because `getItem` runs on GRDB's queue while the test task
+    /// arms the seam.
+    private var getItemOverride: Result<QueueItem?, Error>?
+    private let getItemOverrideLock = NSLock()
+
     // MARK: - Init
 
     /// Open (creating if needed) the queue database at `databaseURL`.
@@ -180,6 +187,21 @@ public final class QueueStore: @unchecked Sendable {
         }
     }
 
+    // MARK: - Test seam: one-shot getItem failure injection
+
+    /// Arm a one-shot override for the NEXT ``getItem(_:)`` call: it returns
+    /// `override` instead of reading the database, and is consumed by that
+    /// single call. Internal (not public) deliberately — this seam exists so
+    /// engine tests can exercise both stranded-claim shapes after a successful
+    /// claim (`getItem` throws, or returns `nil`) without weakening the
+    /// store's public surface or subclassing a `final class`. See
+    /// `QueueEngineClaimTests`.
+    func injectGetItemOutcome(_ override: Result<QueueItem?, Error>) {
+        getItemOverrideLock.lock()
+        defer { getItemOverrideLock.unlock() }
+        getItemOverride = override
+    }
+
     // MARK: - GRDB connection helper
 
     /// Returns the live `DatabaseQueue`, or throws if the store has been closed.
@@ -215,6 +237,9 @@ public final class QueueStore: @unchecked Sendable {
     /// - v7: durable attempt report headers and target rows.
     /// - v8: nullable durable usage columns on attempt report headers.
     /// - v9: durable ingestion output snapshots with explicit presence.
+    /// - v10: nullable durable admission status on queue_items
+    ///   (`admission_reason`, `admission_checked_at`) — why a queued item is
+    ///   not yet dispatched.
     private static let migrator: DatabaseMigrator = {
         var m = DatabaseMigrator()
 
@@ -457,6 +482,26 @@ public final class QueueStore: @unchecked Sendable {
             """)
         }
 
+        m.registerMigration("v10_add_admission_status") { db in
+            // Durable admission status (queue hardening Phase 5): why a
+            // queued item is not yet dispatched. Additive + nullable —
+            // pre-migration rows decode with nils, and QueueItem rides XPC
+            // payloads as additive optional Codable fields only.
+            let existing = Set(try db.columns(in: "queue_items").map(\.name))
+            if !existing.contains("admission_reason") {
+                try db.execute(sql: """
+                ALTER TABLE queue_items
+                ADD COLUMN admission_reason TEXT;
+                """)
+            }
+            if !existing.contains("admission_checked_at") {
+                try db.execute(sql: """
+                ALTER TABLE queue_items
+                ADD COLUMN admission_checked_at INTEGER;
+                """)
+            }
+        }
+
         return m
     }()
 
@@ -561,7 +606,8 @@ public final class QueueStore: @unchecked Sendable {
     /// Shared SELECT column list for `queue_items`.
     private static let selectColumns = """
         id, queue, wiki_id, payload, state, ordering_key,
-        provider_id, attempt, error, created_at, started_at, finished_at
+        provider_id, attempt, error, created_at, started_at, finished_at,
+        admission_reason, admission_checked_at
     """
 
     /// Decode a stored `queue` raw value into a `QueueKind`.
@@ -618,6 +664,10 @@ public final class QueueStore: @unchecked Sendable {
         let createdAt: Int64 = row["created_at"]
         let startedAt: Int64? = row["started_at"]
         let finishedAt: Int64? = row["finished_at"]
+        // SQL/Row boundary: the raw TEXT/INTEGER columns wrap as the item's
+        // durable admission status (nil when no blocker is recorded).
+        let admissionReason: String? = row["admission_reason"]
+        let admissionCheckedAt: Int64? = row["admission_checked_at"]
 
         let queue = try decodeQueueKind(queueRaw)
         guard let state = QueueItemState(rawValue: stateRaw) else {
@@ -637,7 +687,9 @@ public final class QueueStore: @unchecked Sendable {
             error: errorText,
             createdAt: createdAt,
             startedAt: startedAt,
-            finishedAt: finishedAt
+            finishedAt: finishedAt,
+            admissionReason: admissionReason,
+            admissionCheckedAt: admissionCheckedAt
         )
     }
 
@@ -704,7 +756,17 @@ public final class QueueStore: @unchecked Sendable {
 
     /// Fetch a single item by ID, or `nil` if no row matches.
     public func getItem(_ id: QueueItem.ID) throws -> QueueItem? {
-        try Self.wrap {
+        // One-shot test override (see ``injectGetItemOutcome``): consumed by
+        // the first `getItem` call after arming, so production behavior is
+        // unchanged when no override is armed.
+        getItemOverrideLock.lock()
+        let override = getItemOverride
+        getItemOverride = nil
+        getItemOverrideLock.unlock()
+        if let override {
+            return try override.get()
+        }
+        return try Self.wrap { () -> QueueItem? in
             let queue = try self.queue()
             return try queue.read { db in
                 let row = try Row.fetchOne(
@@ -798,10 +860,11 @@ public final class QueueStore: @unchecked Sendable {
     // MARK: - Public API: State transitions
 
     /// Transition an item from `.queued` → `.running`, recording the provider
-    /// that claimed it and the start time. Throws if the item is not in
-    /// `.queued` state.
+    /// that claimed it and the start time. The state guard is folded into the
+    /// UPDATE statement (compare-and-set): a second claim of the same row
+    /// inside or across connections affects zero rows and throws
+    /// `.invalidStateTransition`, changing nothing.
     public func markRunning(id: QueueItem.ID, providerID: ProviderID) throws {
-        try validateTransition(id: id, allowedFrom: [.queued], to: .running)
         let now = Self.nowMillis()
 
         try Self.wrap {
@@ -812,18 +875,21 @@ public final class QueueStore: @unchecked Sendable {
                     UPDATE queue_items
                     SET state = 'running', provider_id = ?, started_at = ?,
                         finished_at = NULL, error = NULL
-                    WHERE id = ?;
+                    WHERE id = ? AND state = 'queued';
                     """,
                     // SQL argument boundary: bind the raw String.
                     arguments: [providerID.rawValue, now, id.rawValue])
+                guard db.changesCount == 1 else {
+                    try Self.casTransitionFailure(
+                        db, id: id, allowedFrom: [.queued], to: .running)
+                }
             }
         }
     }
 
     /// Transition an item from `.running` → `.completed`, recording the finish
-    /// time. Throws if the item is not in `.running` state.
+    /// time. Compare-and-set: the guard lives in the statement.
     public func markCompleted(id: QueueItem.ID) throws {
-        try validateTransition(id: id, allowedFrom: [.running], to: .completed)
         let now = Self.nowMillis()
 
         try Self.wrap {
@@ -833,17 +899,21 @@ public final class QueueStore: @unchecked Sendable {
                     sql: """
                     UPDATE queue_items
                     SET state = 'completed', finished_at = ?
-                    WHERE id = ?;
+                    WHERE id = ? AND state = 'running';
                     """,
                     arguments: [now, id.rawValue])
+                guard db.changesCount == 1 else {
+                    try Self.casTransitionFailure(
+                        db, id: id, allowedFrom: [.running], to: .completed)
+                }
             }
         }
     }
 
     /// Transition an item from `.running` → `.failed`, recording the finish
-    /// time and the error message. Throws if the item is not in `.running` state.
+    /// time and the error message. Compare-and-set: the guard lives in the
+    /// statement.
     public func markFailed(id: QueueItem.ID, error: String) throws {
-        try validateTransition(id: id, allowedFrom: [.running], to: .failed)
         let now = Self.nowMillis()
 
         try Self.wrap {
@@ -853,18 +923,21 @@ public final class QueueStore: @unchecked Sendable {
                     sql: """
                     UPDATE queue_items
                     SET state = 'failed', finished_at = ?, error = ?
-                    WHERE id = ?;
+                    WHERE id = ? AND state = 'running';
                     """,
                     arguments: [now, error, id.rawValue])
+                guard db.changesCount == 1 else {
+                    try Self.casTransitionFailure(
+                        db, id: id, allowedFrom: [.running], to: .failed)
+                }
             }
         }
     }
 
     /// Transition an item from `.queued` or `.running` → `.cancelled`,
-    /// recording the finish time. Preserves the `orderingKey`. Throws if the
-    /// item is in a terminal state.
+    /// recording the finish time. Preserves the `orderingKey`.
+    /// Compare-and-set: the guard lives in the statement.
     public func markCancelled(id: QueueItem.ID) throws {
-        try validateTransition(id: id, allowedFrom: [.queued, .running], to: .cancelled)
         let now = Self.nowMillis()
 
         try Self.wrap {
@@ -874,19 +947,22 @@ public final class QueueStore: @unchecked Sendable {
                     sql: """
                     UPDATE queue_items
                     SET state = 'cancelled', finished_at = ?
-                    WHERE id = ?;
+                    WHERE id = ? AND state IN ('queued', 'running');
                     """,
                     arguments: [now, id.rawValue])
+                guard db.changesCount == 1 else {
+                    try Self.casTransitionFailure(
+                        db, id: id, allowedFrom: [.queued, .running], to: .cancelled)
+                }
             }
         }
     }
 
     /// Transition an item from `.running` → `.queued` (the halt / cancel path).
     /// Clears `providerID` and `startedAt`. Preserves the `orderingKey` so the
-    /// item retains its position. Throws if the item is not in `.running` state.
+    /// item retains its position. Compare-and-set: the guard lives in the
+    /// statement.
     public func requeue(id: QueueItem.ID) throws {
-        try validateTransition(id: id, allowedFrom: [.running], to: .queued)
-
         try Self.wrap {
             let queue = try self.queue()
             try queue.write { db in
@@ -894,42 +970,105 @@ public final class QueueStore: @unchecked Sendable {
                     sql: """
                     UPDATE queue_items
                     SET state = 'queued', provider_id = NULL, started_at = NULL
-                    WHERE id = ?;
+                    WHERE id = ? AND state = 'running';
                     """,
                     arguments: [id.rawValue])
+                guard db.changesCount == 1 else {
+                    try Self.casTransitionFailure(
+                        db, id: id, allowedFrom: [.running], to: .queued)
+                }
             }
         }
     }
 
     /// Retry a `.failed` or `.cancelled` item: transition to `.queued`,
     /// increment `attempt`, and assign a NEW `orderingKey` (back of the
-    /// queue). Clears the error message. Throws if the item is not in
-    /// `.failed` or `.cancelled` state.
+    /// queue). Clears the error message. Compare-and-set: the guard lives in
+    /// the UPDATE statement, and the ordering-key computation + transcript
+    /// clear only run when the transition happened.
     ///
     /// `.cancelled → .queued` is permitted (#635): the Activity window offers
     /// a Retry button on cancelled/killed jobs, and silently rejecting the
     /// transition (the prior behavior) dead-ended the button — the UI's
     /// affordance must match the store's allowed transitions.
     public func retryItem(id: QueueItem.ID) throws {
-        try validateTransition(id: id, allowedFrom: [.failed, .cancelled], to: .queued)
-
         try Self.wrap {
             let queue = try self.queue()
             try queue.write { db in
+                try db.execute(
+                    sql: """
+                    UPDATE queue_items
+                    SET state = 'queued'
+                    WHERE id = ? AND state IN ('failed', 'cancelled');
+                    """,
+                    arguments: [id.rawValue])
+                guard db.changesCount == 1 else {
+                    try Self.casTransitionFailure(
+                        db, id: id, allowedFrom: [.failed, .cancelled], to: .queued)
+                }
+
                 let kind = try Self.fetchQueueKind(db, id: id)
                 let newOrderingKey = try Self.nextOrderingKey(db, for: kind)
 
                 try db.execute(
                     sql: """
                     UPDATE queue_items
-                    SET state = 'queued', ordering_key = ?, attempt = attempt + 1,
-                        error = NULL, finished_at = NULL
+                    SET ordering_key = ?, attempt = attempt + 1,
+                        error = NULL, finished_at = NULL,
+                        admission_reason = NULL, admission_checked_at = NULL
                     WHERE id = ?;
                     """,
                     arguments: [newOrderingKey, id.rawValue])
                 try db.execute(
                     sql: "DELETE FROM queue_item_transcript_items WHERE item_id = ?;",
                     arguments: [id.rawValue])
+            }
+        }
+    }
+
+    // MARK: - Public API: Admission status
+
+    /// Record why a queued item is not yet dispatched (durable admission
+    /// status). Compare-and-set on `state = 'queued'`: a record landing on a
+    /// row that just started running is rejected — running items have no
+    /// admission blocker.
+    public func recordAdmissionWait(id: QueueItem.ID, reason: String) throws {
+        try Self.wrap {
+            let queue = try self.queue()
+            try queue.write { db in
+                try db.execute(
+                    sql: """
+                    UPDATE queue_items
+                    SET admission_reason = ?, admission_checked_at = ?
+                    WHERE id = ? AND state = 'queued';
+                    """,
+                    arguments: [reason, Self.nowMillis(), id.rawValue])
+                guard db.changesCount == 1 else {
+                    try Self.casTransitionFailure(
+                        db, id: id, allowedFrom: [.queued], to: .queued)
+                }
+            }
+        }
+    }
+
+    /// Clear the recorded admission status for every queued item of one lane.
+    /// Called by the engine on lane resume (and implicitly by `retryItem`,
+    /// whose transition clears the columns) so a stale reason cannot outlive
+    /// the condition that produced it.
+    @discardableResult
+    public func clearAdmissionWaitForQueue(_ queue: QueueKind) throws -> Int {
+        try Self.wrap {
+            let dbQueue = try self.queue()
+            return try dbQueue.write { db in
+                try db.execute(
+                    sql: """
+                    UPDATE queue_items
+                    SET admission_reason = NULL, admission_checked_at = NULL
+                    WHERE queue = ? AND state = 'queued'
+                      AND admission_reason IS NOT NULL;
+                    """,
+                    arguments: [queue.rawValue])
+                return db.changesCount
             }
         }
     }
@@ -1319,36 +1458,33 @@ public final class QueueStore: @unchecked Sendable {
 
     // MARK: - Internal transition helpers
 
-    /// Validate that the item exists and is in one of `allowedFrom` states.
-    /// Throws `.notFound` if the item doesn't exist, or
-    /// `.invalidStateTransition` if its current state is not in `allowedFrom`.
-    private func validateTransition(
+    /// Build and throw the typed error for a failed compare-and-set
+    /// transition. Called inside the write transaction when the guarded UPDATE
+    /// affected zero rows: the row either doesn't exist (`.notFound`) or its
+    /// current state is outside `allowedFrom` (`.invalidStateTransition`) —
+    /// the same error contract the read-then-write validation used to give,
+    /// now race-free because the guard is part of the statement itself.
+    private static func casTransitionFailure(
+        _ db: Database,
         id: QueueItem.ID,
         allowedFrom: Set<QueueItemState>,
         to: QueueItemState
-    ) throws {
-        let currentState = try currentState(id: id)
-        guard allowedFrom.contains(currentState) else {
-            throw QueueStoreError.invalidStateTransition(from: currentState, to: to)
+    ) throws -> Never {
+        let raw = try String.fetchOne(
+            db,
+            sql: "SELECT state FROM queue_items WHERE id = ?;",
+            arguments: [id.rawValue])
+        guard let raw else { throw QueueStoreError.notFound(id) }
+        guard let state = QueueItemState(rawValue: raw) else {
+            throw QueueStoreError.sqlite(code: -1, message: "Unknown item state: \(raw)")
         }
-    }
-
-    /// Get the current state of an item by ID. Throws `.notFound` if no row.
-    private func currentState(id: QueueItem.ID) throws -> QueueItemState {
-        try Self.wrap {
-            let queue = try self.queue()
-            return try queue.read { db in
-                let raw = try String.fetchOne(
-                    db,
-                    sql: "SELECT state FROM queue_items WHERE id = ?;",
-                    arguments: [id.rawValue])
-                guard let raw else { throw QueueStoreError.notFound(id) }
-                guard let state = QueueItemState(rawValue: raw) else {
-                    throw QueueStoreError.sqlite(code: -1, message: "Unknown item state: \(raw)")
-                }
-                return state
-            }
+        guard allowedFrom.contains(state) else {
+            throw QueueStoreError.invalidStateTransition(from: state, to: to)
         }
+        // The row is in an allowed state yet the guarded UPDATE matched zero
+        // rows — the row must have vanished between the UPDATE and this read
+        // (same transaction, so effectively unreachable). Report notFound.
+        throw QueueStoreError.notFound(id)
     }
 
     /// Fetch the `QueueKind` of an item by ID. Throws `.notFound` if no row.

@@ -28,6 +28,35 @@ import WikiFSEngine
             text: "Failed", symbol: "exclamationmark.triangle.fill", style: .failure))
         #expect(QueueWorkspaceStatus.cancelled() == QueueWorkspaceStatus(
             text: "Cancelled", symbol: "xmark.circle", style: .secondary))
+        // Durable admission blocker: a queued item with a recorded reason
+        // renders the "Waiting for route" chip, not a bare "Queued".
+        let waiting = QueueWorkspaceStatus.waitingForRoute(
+            reason: QueueAdmissionReason.noExtractorRoute)
+        #expect(waiting.style == .warning)
+        #expect(waiting.text == "Waiting for route — no-extractor-route")
+    }
+
+    @Test func queuedItemWithAdmissionReasonMapsToWaitingForRouteChip() {
+        var item = QueueItem(
+            id: QueueItemID(rawValue: "01JADMCHIP000000000000000"),
+            queue: .ingestion,
+            wikiID: WikiID(rawValue: "01JADMCHIPWIKI00000000000"),
+            payload: QueueItemPayload(sourceIDs: []),
+            state: .queued,
+            orderingKey: 1_000,
+            attempt: 0,
+            createdAt: 0)
+        #expect(QueueWorkspaceMapper.status(for: item) == QueueWorkspaceStatus.queued())
+
+        item.admissionReason = QueueAdmissionReason.noExtractorRoute
+        item.admissionCheckedAt = 42
+        let status = QueueWorkspaceMapper.status(for: item)
+        #expect(status.style == .warning)
+        #expect(status.text == "Waiting for route — no-extractor-route")
+
+        // A running item never renders the admission chip.
+        item.state = .running
+        #expect(QueueWorkspaceMapper.status(for: item) == QueueWorkspaceStatus.running())
     }
 
     @Test func targetStatusVocabulary() {
@@ -685,6 +714,33 @@ import WikiFSEngine
                 label: "Resume Queue",
                 symbol: "play.fill",
                 help: "Resume Queue — allow queued jobs to start"))
+    }
+
+    // MARK: - Paused-lane notice bar
+
+    @Test func pausedNoticeCarriesWaitingCount() {
+        // One waiting job — singular grammar, count visible.
+        #expect(QueuePausedNoticePresentation.make(queueTitle: "Extraction", queuedCount: 1)
+            == QueuePausedNoticePresentation(
+                message: "Extraction is paused — 1 queued job waiting",
+                resumeLabel: "Resume",
+                symbol: "pause.circle.fill"))
+        // Several waiting jobs — plural grammar.
+        #expect(QueuePausedNoticePresentation.make(queueTitle: "Extraction", queuedCount: 3)
+            == QueuePausedNoticePresentation(
+                message: "Extraction is paused — 3 queued jobs waiting",
+                resumeLabel: "Resume",
+                symbol: "pause.circle.fill"))
+    }
+
+    @Test func pausedNoticeWithoutQueuedJobsStillExplainsTheState() {
+        // Paused with an empty queue must not say "0 jobs waiting" — the
+        // useful fact is that nothing will start.
+        #expect(QueuePausedNoticePresentation.make(queueTitle: "Ingestion", queuedCount: 0)
+            == QueuePausedNoticePresentation(
+                message: "Ingestion is paused — queued jobs will not start",
+                resumeLabel: "Resume",
+                symbol: "pause.circle.fill"))
     }
 
     // MARK: - Sidebar search

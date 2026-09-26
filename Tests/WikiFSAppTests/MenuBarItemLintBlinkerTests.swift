@@ -18,6 +18,11 @@ import Testing
 ///    blinker (the #1222 snapshot/event timing race).
 /// 5. Ingestion/extraction indication keeps working through the same
 ///    event-driven path (queue-agnostic membership).
+/// 6. A paused lane never animates the blinker over queued-only work (the
+///    false-activity regression), and it holds paused even while an item
+///    runs — the per-lane tooltip carries the live facts instead. A lane
+///    paused in a previous session is learned from the initial guarded
+///    snapshot, not only from a live `.runStateChanged` event.
 ///
 /// State is observed via `MenuBarItemController.lastDerivedIconState` — the
 /// value `updateIcon()` derived on its last pass. AppKit offers no way to
@@ -151,6 +156,90 @@ struct MenuBarItemLintBlinkerTests {
         #expect(idleAgain, "lint completion must stop the blinker (#1222)")
     }
 
+    // MARK: - Paused-lane semantics (false-blinker regression)
+
+    @Test("A lane paused before launch shows paused over a queued item — never a false blinker")
+    func persistedPausedLaneAtLaunchShowsPausedNotWorking() async throws {
+        let harness = try makeRealEngineHarness()
+        let controller = harness.controller
+        let engine = harness.engine
+
+        // Persist the pause BEFORE the controller exists. The
+        // `.runStateChanged` event fires with no subscriber and is never
+        // replayed, so only the controller's initial guarded snapshot can
+        // learn the lane state — the exact launch staleness that left the
+        // icon animating "working" forever over a queued item a paused lane
+        // would never claim.
+        await engine.pause(.extraction)
+        _ = try await engine.enqueue(QueueItemRequest(
+            queue: .extraction,
+            wikiID: wikiID,
+            payload: QueueItemPayload(sourceIDs: [SourceID(rawValue: "source-1")])))
+
+        controller.start()
+        defer { controller.stop() }
+
+        let paused = await waitUntil { controller.lastDerivedIconState == .paused }
+        #expect(
+            paused,
+            "a persisted-paused lane with a queued item must derive paused at launch, not working")
+
+        // Start the engine and resume the lane: the icon must flip to
+        // working — the queued item finally has a lane that will claim it.
+        // (The stub provider resolves no route, so the item stays queued and
+        // is never dispatched — safe to leave the engine running.)
+        await engine.start()
+        try await engine.resume(.extraction)
+
+        let working = await waitUntil { controller.lastDerivedIconState == .working }
+        #expect(working, "resuming the lane must restart the blinker for the still-queued item")
+    }
+
+    @Test("Paused beats queued-only and running; a drained paused lane returns to paused")
+    func pausedLaneSemanticsAcrossTheDrain() async throws {
+        let engine = GatedSnapshotEngine()
+        let controller = makeController(engine: engine)
+        controller.start()
+        defer {
+            engine.releaseAll(with: QueueSnapshot())
+            controller.stop()
+        }
+
+        let itemID = "01992222-paused-lane-item"
+        let pausedRunStates: [QueueKind: QueueRunState] = [.ingestion: .paused]
+
+        // Initial snapshot: persisted pause + a queued item → paused, never
+        // the animated working state.
+        _ = await waitUntil { engine.parkedCount == 1 }
+        engine.releaseOldest(with: QueueSnapshot(
+            activeItems: [makeLintItem(state: .queued, id: itemID)],
+            runStates: pausedRunStates))
+        let paused = await waitUntil { controller.lastDerivedIconState == .paused }
+        #expect(paused, "queued-only work under a paused lane must not animate the blinker")
+
+        // The item starts: the landed per-lane precedence HOLDS the glyph on
+        // paused anyway — a paused lane never animates over work it will not
+        // claim, and live progress conveys via the per-lane tooltip and the
+        // activity window instead.
+        engine.yield(.started(makeLintItem(state: .running, id: itemID)))
+        await settle()
+        engine.releaseAll(with: QueueSnapshot(
+            activeItems: [makeLintItem(state: .running, id: itemID)],
+            runStates: pausedRunStates))
+        await settle()
+        #expect(
+            controller.lastDerivedIconState == .paused,
+            "a paused lane holds the glyph on paused even while an item runs; the tooltip names the lanes")
+
+        // Terminal: nothing queued or running, lane still paused → paused.
+        engine.yield(.completed(makeLintItem(state: .completed, id: itemID)))
+        let drainedFetch = await waitUntil { engine.parkedCount >= 1 }
+        #expect(drainedFetch)
+        engine.releaseAll(with: QueueSnapshot(runStates: pausedRunStates))
+        let pausedAgain = await waitUntil { controller.lastDerivedIconState == .paused }
+        #expect(pausedAgain, "after the drain the paused lane shows paused again")
+    }
+
     // MARK: - Fixtures
 
     private struct RealEngineHarness {
@@ -206,14 +295,56 @@ struct MenuBarItemLintBlinkerTests {
         return QueueEngine(store: store, workerFactory: factory)
     }
 
+    // MARK: - Per-lane truth (Phase 6)
+
+    /// Mixed lanes: ingestion RUNNING while extraction is PAUSED with a
+    /// queued item. The precedence stays paused-first (a paused lane must
+    /// not be masked), but the tooltip NAMES each lane's facts — the paused
+    /// extraction lane is explicit, not a bare "Paused".
+    @Test("Mixed lanes: paused extraction is named alongside running ingestion")
+    func mixedLaneTooltipNamesEachLane() async throws {
+        let engine = GatedSnapshotEngine()
+        let controller = makeController(engine: engine)
+        controller.start()
+        defer { controller.stop() }
+        _ = await waitUntil { controller.lastDerivedIconState == .idle }
+
+        engine.yield(.started(makeLintItem(
+            state: .running, queue: .ingestion, id: "01992222-mixed-ingestion")))
+        engine.yield(.runStateChanged(queue: .extraction, state: .paused))
+        engine.yield(.enqueued(makeLintItem(
+            state: .queued, queue: .extraction, id: "01992222-mixed-extraction")))
+
+        // Paused precedence wins the icon (unchanged), and the tooltip names
+        // BOTH lanes: the paused extraction lane with its waiting count, and
+        // the running ingestion lane.
+        let pausedSettled = await waitUntil {
+            controller.lastDerivedIconState == .paused
+                && controller.currentTooltipText?.contains("Extraction: paused (1 waiting)") == true
+        }
+        #expect(pausedSettled, "the tooltip must name the paused extraction lane")
+        let tooltip = try #require(controller.currentTooltipText)
+        #expect(tooltip.contains("Ingestion: running (1 active)"))
+
+        // Resume extraction: the paused line disappears and the working
+        // state takes over (both lanes active).
+        engine.yield(.runStateChanged(queue: .extraction, state: .running))
+        let working = await waitUntil { controller.lastDerivedIconState == .working }
+        #expect(working)
+        let resumedTooltip = try #require(controller.currentTooltipText)
+        #expect(!resumedTooltip.contains("paused"))
+        #expect(resumedTooltip.contains("Extraction:"))
+    }
+
     private func makeLintItem(
         state: QueueItemState,
+        queue: QueueKind = .ingestion,
         id: String = "01992222-lint-item",
         lintPageIDs: [PageID] = [PageID(rawValue: "lint-page-1")]
     ) -> QueueItem {
         QueueItem(
             id: QueueItemID(rawValue: id),
-            queue: .ingestion,
+            queue: queue,
             wikiID: wikiID,
             payload: QueueItemPayload(sourceIDs: [], lintPageIDs: lintPageIDs),
             state: state,

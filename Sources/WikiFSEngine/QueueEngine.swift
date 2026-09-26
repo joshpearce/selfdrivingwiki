@@ -64,6 +64,15 @@ public actor QueueEngine {
     /// `resume`. Persisted via `QueueStore.setQueueRunState`.
     private var runStates: [QueueKind: QueueRunState] = [:]
 
+    /// Halted dispatches whose capacity attribution `rebuildInMemoryState`
+    /// has already rebuilt away: the item was requeued, so the store no
+    /// longer counts it as running and the rebuilt counts belong to whatever
+    /// dispatches the rebuilt state actually holds. When such a dispatch
+    /// finally settles, its release must be SKIPPED — decrementing would
+    /// release a sibling dispatch's slot — while the settle-once entry
+    /// removal and the waiter resume still happen exactly once.
+    private var releaseDeferredByRebuild: Set<WorkerLeaseID> = []
+
     /// Ready-at-construction output boundary shared with worker factories.
     /// It owns event multicast, transcript reduction, and output persistence.
     public nonisolated let outputChannel: QueueWorkerOutputChannel
@@ -350,7 +359,9 @@ public actor QueueEngine {
         emit(.runStateChanged(queue: queue, state: .paused))
     }
 
-    /// Resume a queue: restart dispatch. Persists the run state.
+    /// Resume a queue: restart dispatch. Persists the run state. Recorded
+    /// admission blockers on this lane's queued items are cleared first — a
+    /// resume is the operator saying "re-check admission now".
     public func resume(_ queue: QueueKind) async throws {
         try requireRunning()
         runStates[queue] = .running
@@ -358,6 +369,11 @@ public actor QueueEngine {
             try store.setQueueRunState(queue, .running)
         } catch {
             DebugLog.store("QueueEngine: failed to persist resume state for \(queue): \(error)")
+        }
+        do {
+            _ = try store.clearAdmissionWaitForQueue(queue)
+        } catch {
+            DebugLog.store("QueueEngine: failed to clear admission status for \(queue): \(error)")
         }
         emit(.runStateChanged(queue: queue, state: .running))
         await dispatchScan()
@@ -384,7 +400,11 @@ public actor QueueEngine {
             activeItems = []
         }
         for item in activeItems where item.state == .running {
-            let dispatch = runningTasks.removeValue(forKey: item.id)
+            // The dispatch entry STAYS in `runningTasks` until settlement —
+            // `handleWorkerFinished` uses it (keyed by lease) as the
+            // settle-once ticket, releasing slots and resuming waiters
+            // exactly once after the worker task actually returns.
+            let dispatch = runningTasks[item.id]
             dispatch?.task.cancel()
             // Same ordering as `cancelItem`: drain this dispatch's in-flight
             // output (report commits included) before the requeue's interrupted
@@ -414,7 +434,12 @@ public actor QueueEngine {
                 DebugLog.store("QueueEngine.halt: failed to requeue \(item.id.rawValue): \(error)")
             }
         }
-        // Rebuild counts after halting.
+        // Rebuild counts after halting. This stays as the defensive resync:
+        // the requeued items drop out of the counts here even though their
+        // worker tasks may still be unwinding — the later settlement's
+        // decrement is clamped at zero, so it cannot corrupt the rebuilt
+        // state. Settlement-owned release (waiters, provider counts) happens
+        // in `handleWorkerFinished`.
         await rebuildInMemoryState()
     }
 
@@ -456,9 +481,27 @@ public actor QueueEngine {
     /// Cancel a specific queued or running item. Running items have their
     /// worker `Task` cancelled, then transition to `.cancelled` (preserving
     /// `orderingKey`).
+    ///
+    /// **Settlement-owned bookkeeping:** this method does NOT release the
+    /// provider slot, the per-wiki ingestion slot, or resume completion
+    /// waiters. The `runningTasks` entry stays until the worker settles, and
+    /// `handleWorkerFinished` — the single settlement point — releases
+    /// capacity and resumes waiters exactly once on EVERY path (success,
+    /// failure, user cancellation, halt, orphan). Freeing the slot here
+    /// instead would (a) double-free at settlement and (b) let a new dispatch
+    /// claim capacity the cancelling worker still physically holds.
+    ///
+    /// **Cancellation contract:** `Task.cancel` is cooperative. Extraction
+    /// workers are deadline-bounded by their manifests and handle
+    /// cancellation explicitly; ingestion workers settle through the ACP
+    /// launcher's cancellation handling — the same contract the shutdown
+    /// settlement relies on. A worker that ignored cancellation entirely
+    /// would hold its slot until shutdown; that is a documented decision
+    /// (see plans/queue-engine-hardening.md), not an accident.
     public func cancelItem(_ id: QueueItem.ID) async {
-        // Cancel the worker task if running.
-        let dispatch = runningTasks.removeValue(forKey: id)
+        // Cancel the worker task if running. The dispatch entry STAYS in
+        // `runningTasks` until settlement — it is the settle-once key.
+        let dispatch = runningTasks[id]
         dispatch?.task.cancel()
 
         // Invalidate the lease and drain in-flight worker output BEFORE the
@@ -475,8 +518,6 @@ public actor QueueEngine {
             try store.markCancelled(id: id)
             if let updated = try store.getItem(id) {
                 emit(.cancelled(updated))
-                decrementProviderCount(for: updated)
-                activeIngestionWikis.remove(updated.wikiID)
             }
             // Retain observed outcomes and project unfinished targets as
             // interrupted (never failed/succeeded) in the durable report.
@@ -487,12 +528,21 @@ public actor QueueEngine {
             } catch {
                 DebugLog.store("QueueEngine.cancelItem: report projection failed for \(id.rawValue): \(error)")
             }
+            // A QUEUED item has no dispatch, so no settlement will ever run
+            // for it — resume its completion waiters here, exactly once. A
+            // RUNNING item's waiters are resumed by its settlement (the
+            // settle-once path below), never here.
+            if dispatch == nil {
+                resumeWaiters(for: id, result: .failure(CancellationError()))
+            }
         } catch {
             // The item may be in a terminal state already, or the
             // transition is invalid. Best-effort + log.
             DebugLog.store("QueueEngine.cancelItem: failed for \(id.rawValue): \(error)")
         }
-        await dispatchScan()
+        // No dispatch scan here: capacity is released at settlement, and
+        // settlement triggers the next scan. (A queued-item cancel releases
+        // nothing, so there is nothing to backfill.)
     }
 
     /// Retry a failed item: `failed` → `queued`, `attempt + 1`, new
@@ -658,10 +708,79 @@ public actor QueueEngine {
             DebugLog.store("QueueEngine.waitForCompletion: failed to fetch item \(id): \(error)")
         }
 
-        // Register a waiter.
-        return await withCheckedContinuation { c in
-            completionWaiters[id, default: []].append(c)
+        // Race the registered waiter against the completion deadline. On
+        // timeout the waiter entries are REMOVED BEFORE the continuation is
+        // resumed (remove-then-resume, exactly-once — both under the actor
+        // lock) — otherwise the worker's eventual settlement would resume the
+        // same continuation a second time: a continuation-misuse crash, not a
+        // catchable failure. The item is left untouched (still running): the
+        // WAIT is bounded, not the work, and a later waitForCompletion
+        // observes the item's real outcome.
+        return await withTaskGroup(of: Result<Void, Error>.self) { group in
+            group.addTask { [self] in
+                await awaitSettlement(id: id)
+            }
+            group.addTask { [self] in
+                for await _ in deadlineSource.stream(
+                    after: QueueEngineWaitPolicy.completionWaitDeadline) { break }
+                // Settlement won the race — do not steal waiters registered
+                // after its sweep.
+                if Task.isCancelled { return .failure(CancellationError()) }
+                return await timeoutWaiters(for: id)
+            }
+            let first = await group.next()
+                ?? .failure(QueueEngineCompletionWaitError.timeout(itemID: id))
+            group.cancelAll()
+            return first
         }
+    }
+
+    /// Register a completion waiter and park until settlement resumes it.
+    /// The registration body is synchronous on the actor, so the
+    /// post-registration re-check below is atomic with it: if the item
+    /// settled between the fast-path check above and this registration, the
+    /// waiter would otherwise strand forever (the settlement already swept
+    /// the waiters array). Detecting the terminal state HERE resumes every
+    /// late registrant instead.
+    private func awaitSettlement(id: QueueItem.ID) async -> Result<Void, Error> {
+        await withCheckedContinuation { (c: CheckedContinuation<Result<Void, Error>, Never>) in
+            completionWaiters[id, default: []].append(c)
+            let terminal: Result<Void, Error>?
+            do {
+                guard let item = try store.getItem(id) else { return }
+                switch item.state {
+                case .running, .queued:
+                    return  // Registered cleanly; settlement will resume it.
+                case .completed:
+                    terminal = .success(())
+                case .failed:
+                    terminal = .failure(QueueExtractionError.notReady(item.error ?? "unknown"))
+                case .cancelled:
+                    terminal = .failure(CancellationError())
+                }
+            } catch {
+                DebugLog.store("QueueEngine.waitForCompletion: post-registration fetch failed for \(id): \(error)")
+                return
+            }
+            if let terminal {
+                resumeWaiters(for: id, result: terminal)
+            }
+        }
+    }
+
+    /// Deadline expiry for `waitForCompletion`: remove-then-resume every
+    /// waiter for the item with the typed timeout, on the actor. Returns the
+    /// timeout result for the racing caller.
+    private func timeoutWaiters(for id: QueueItem.ID) -> Result<Void, Error> {
+        let timeout = Result<Void, Error>.failure(
+            QueueEngineCompletionWaitError.timeout(itemID: id))
+        guard let waiters = completionWaiters.removeValue(forKey: id) else {
+            return timeout
+        }
+        for waiter in waiters {
+            waiter.resume(returning: timeout)
+        }
+        return timeout
     }
 
     /// Load durable typed transcript items for a queue item.
@@ -823,9 +942,32 @@ public actor QueueEngine {
             for item in active where item.state == .queued {
                 // The ONE await — resolve the provider up front.
                 guard let providerID = await workerFactory.providerID(for: item) else {
-                    continue  // No provider available; item stays queued.
+                    // No route: record the durable admission status so the
+                    // forever-queued item carries a visible, persisted reason
+                    // (Activity chip + `wikictl job`), and surface it on the
+                    // progress trail. Re-record only when the reason changed —
+                    // scans run on every event; the row write and the progress
+                    // line must not.
+                    if item.admissionReason != QueueAdmissionReason.noExtractorRoute {
+                        do {
+                            try store.recordAdmissionWait(
+                                id: item.id, reason: QueueAdmissionReason.noExtractorRoute)
+                        } catch {
+                            DebugLog.store("QueueEngine.dispatchScan: admission record failed for \(item.id.rawValue): \(error)")
+                        }
+                        emit(.progress(item.id, line: QueueAdmissionReason.noExtractorRouteProgressLine))
+                    }
+                    continue
                 }
+                // Actors are reentrant: `pause()` may have run while the
+                // provider resolution above was suspended. Re-check the lane's
+                // run state alongside the lifecycle so a pause landing
+                // mid-resolution cannot be raced by a claim — the item stays
+                // queued and the next `resume` re-scans. A lifecycle stop
+                // aborts the whole scan; a lane pause only stops THIS lane,
+                // so the other lane's queued items still get their shot.
                 guard lifecycle == .running else { return }
+                guard runStates[queue] == .running else { break }
 
                 // From here, NO await until the item is claimed and the
                 // in-memory counts are updated. This keeps the check-and-claim
@@ -861,10 +1003,22 @@ public actor QueueEngine {
                 // Read back the running item for the event (synchronous).
                 let runningItem: QueueItem
                 do {
-                    guard let updated = try store.getItem(item.id) else { continue }
+                    guard let updated = try store.getItem(item.id) else {
+                        // The row vanished between the claim and this read.
+                        // The claim left it `.running` with no worker about
+                        // to run — repair the stranded claim before moving on
+                        // (the requeue throws `.notFound` for a deleted row,
+                        // which the repair helper logs).
+                        repairStrandedClaim(for: item)
+                        continue
+                    }
                     runningItem = updated
                 } catch {
                     DebugLog.store("QueueEngine.dispatchScan: failed to load updated item \(item.id.rawValue): \(error)")
+                    // Same stranded-claim shape: claimed in the store, then the
+                    // read-back threw. Requeue so the item cannot sit
+                    // `.running` with no worker until restart.
+                    repairStrandedClaim(for: item)
                     continue
                 }
 
@@ -893,6 +1047,21 @@ public actor QueueEngine {
                     outputScope: outputScope,
                     task: task)
             }
+        }
+    }
+
+    /// Return a claimed-but-workerless item to `.queued`. The two stranded-
+    /// claim paths are the post-claim read-back failures in `dispatchScan`
+    /// (the read threw, or the row vanished): the item is `.running` in the
+    /// store with no worker task about to run, and without this repair it
+    /// would sit there until restart. Best-effort: a `.notFound` from a
+    /// vanished row is logged and skipped.
+    private func repairStrandedClaim(for item: QueueItem) {
+        do {
+            try store.requeue(id: item.id)
+            DebugLog.store("QueueEngine.dispatchScan: requeued stranded claim for \(item.id.rawValue)")
+        } catch {
+            DebugLog.store("QueueEngine.dispatchScan: failed to requeue stranded claim for \(item.id.rawValue): \(error)")
         }
     }
 
@@ -944,7 +1113,7 @@ public actor QueueEngine {
         // on a cancelled/halted job. Idempotent — no-op when the stored
         // projection already stands.
         if case .failure(let error) = result, error is CancellationError {
-            reprojectInterruptedReportAfterDrain(for: item)
+            reprojectInterruptedReportAfterDrain(for: item, leaseID: outputScope.leaseID)
         }
 
         await handleWorkerFinished(
@@ -969,13 +1138,21 @@ public actor QueueEngine {
     /// Publishes `.reportUpdated` only when the projection actually changed
     /// the stored report (otherwise the cancel/halt path's projection already
     /// stands and the event stream is left undisturbed).
-    private func reprojectInterruptedReportAfterDrain(for item: QueueItem) {
-        // Only project when no new dispatch owns the item: a halt-resume
+    private func reprojectInterruptedReportAfterDrain(
+        for item: QueueItem,
+        leaseID: WorkerLeaseID
+    ) {
+        // Only project when no NEW dispatch owns the item: a halt-resume
         // redispatch resets the report when its lease activates, and a stale
-        // projection here would regress the new dispatch's live targets. The
-        // check and the store write are synchronous on the engine actor, so
-        // `dispatchScan` cannot interleave between them.
-        guard runningTasks[item.id] == nil else { return }
+        // projection here would regress the new dispatch's live targets. Under
+        // lease-keyed settlement the cancel/halt paths deliberately leave this
+        // dispatch's entry in `runningTasks` until settlement, so the guard is
+        // by lease IDENTITY, not entry presence: an entry with this same lease
+        // (still unsettled) may project; a different lease (a re-dispatch)
+        // must not be regressed. The check and the store write are
+        // synchronous on the engine actor, so `dispatchScan` cannot
+        // interleave between them.
+        if let existing = runningTasks[item.id], existing.leaseID != leaseID { return }
         do {
             let before = try store.loadReport(itemID: item.id)
             guard let report = try store.projectInterruptedReport(itemID: item.id) else { return }
@@ -987,16 +1164,25 @@ public actor QueueEngine {
         }
     }
 
-    /// Handle the completion of a worker. Transitions the item to a terminal
-    /// state, cleans up in-memory tracking, emits an event, and triggers a
-    /// dispatch scan.
+    /// Handle the completion of a worker — the SINGLE settlement point for a
+    /// dispatch. Transitions the item to a terminal state, releases the
+    /// dispatch's capacity, resumes completion waiters, emits events, and
+    /// triggers a dispatch scan.
     ///
-    /// **Slot ownership:** the provider count and wiki set are only decremented
-    /// in the branches that own the transition (success / failure). For the
-    /// cancellation path, `cancelItem` or `halt` has ALREADY freed the slot —
-    /// so we skip the decrement to avoid double-freeing. The only exception is
-    /// if the item is still `.running` (orphaned after cancellation), which we
-    /// requeue + free.
+    /// **Settle-once, lease-keyed:** the `runningTasks` entry keyed by this
+    /// dispatch's lease is the settlement ticket. `cancelItem` and `halt`
+    /// keep the entry in place precisely so a cancelled dispatch still
+    /// settles here; a RE-dispatch (halt → resume) replaces the entry with a
+    /// new lease, which makes a stale dispatch's late return a no-op instead
+    /// of a double settlement. Entry removal below makes settlement
+    /// exactly-once for every path.
+    ///
+    /// **Settlement-owned bookkeeping:** the provider count, the per-wiki
+    /// ingestion slot, and the waiter resume happen HERE and only here, on
+    /// every path — success, failure, user cancellation, halt, orphan. The
+    /// cancel/halt paths no longer free slots themselves: the worker still
+    /// physically holds its resource until it returns, so capacity must not
+    /// be handed out before settlement.
     private func handleWorkerFinished(
         _ item: QueueItem,
         leaseID: WorkerLeaseID,
@@ -1005,43 +1191,40 @@ public actor QueueEngine {
         guard runningTasks[item.id]?.leaseID == leaseID else { return }
         runningTasks.removeValue(forKey: item.id)
 
+        // The result the waiters receive. Usually the worker's outcome, but
+        // when the store transition loses a race (the item was cancelled or
+        // requeued elsewhere mid-finish), the item's terminal state won —
+        // waiters learn that (a cancelled item is terminal; a requeued one
+        // tells them THIS wait is over), not the worker's raw outcome.
+        var waiterResult = result
+
         switch result {
         case .success:
             do {
                 try store.markCompleted(id: item.id)
-                decrementProviderCount(for: item)
-                if item.queue == .ingestion {
-                    activeIngestionWikis.remove(item.wikiID)
-                }
                 if let updated = try store.getItem(item.id) {
                     emit(.completed(updated))
                 }
             } catch {
-                // markCompleted can fail if the item was requeued/cancelled
-                // while the worker was finishing. The work is done — log and
-                // free the slot defensively.
+                // markCompleted can fail if the item was cancelled or requeued
+                // while the worker was finishing. The work is done, but the
+                // item's terminal state is whatever won that race — waiters
+                // learn that, not the worker's success.
                 DebugLog.store("QueueEngine: markCompleted failed for \(item.id.rawValue): \(error)")
-                decrementProviderCount(for: item)
-                if item.queue == .ingestion {
-                    activeIngestionWikis.remove(item.wikiID)
-                }
+                waiterResult = .failure(CancellationError())
             }
 
         case .failure(let error):
             if error is CancellationError {
-                // Cancellation from halt: the item was already requeued by
-                // `halt` (which calls `store.requeue` + `rebuildInMemoryState`).
-                // Cancellation from `cancelItem`: the item was already marked
-                // `.cancelled` and the slot was freed there.
-                // Either way, the slot is already freed — DON'T double-decrement.
-                // Only act if the item is orphaned (still .running).
+                // Cancellation from `cancelItem` (item now `.cancelled`) or
+                // `halt` (item now `.queued`) — the store transition already
+                // happened on those paths, and this settlement releases the
+                // capacity below. The remaining case is the orphan: nobody
+                // transitioned the item (still `.running`) yet the worker
+                // reports cancellation — requeue + project defensively.
                 do {
                     if let updated = try store.getItem(item.id), updated.state == .running {
                         try store.requeue(id: item.id)
-                        decrementProviderCount(for: item)
-                        if item.queue == .ingestion {
-                            activeIngestionWikis.remove(item.wikiID)
-                        }
                         if let requeued = try store.getItem(item.id) {
                             emit(.cancelled(requeued))
                         }
@@ -1050,13 +1233,13 @@ public actor QueueEngine {
                         // `cancelItem`/`halt`), so its report may still show
                         // unfinished targets in live states. Project them as
                         // interrupted now — same truth rule 10 the cancel/halt
-                        // paths enforce, applied to the defensive branch. The
-                        // task entry was removed above and this block is
-                        // synchronous on the engine actor, so the helper's
-                        // "no new dispatch owns the item" guard holds; a later
-                        // re-dispatch resets the report under a new execution
-                        // identity anyway.
-                        reprojectInterruptedReportAfterDrain(for: item)
+                        // paths enforce, applied to the defensive branch. This
+                        // block is synchronous on the engine actor, and the
+                        // lease identity check in the projector rejects a
+                        // projection only when a DIFFERENT dispatch owns the
+                        // item; a later re-dispatch resets the report under a
+                        // new execution identity anyway.
+                        reprojectInterruptedReportAfterDrain(for: item, leaseID: leaseID)
                     }
                 } catch {
                     DebugLog.store("QueueEngine.handleWorkerFinished: failed to handle cancellation for \(item.id.rawValue): \(error)")
@@ -1071,25 +1254,30 @@ public actor QueueEngine {
                     ?? String(describing: error)
                 do {
                     try store.markFailed(id: item.id, error: errorMsg)
-                    decrementProviderCount(for: item)
-                    if item.queue == .ingestion {
-                        activeIngestionWikis.remove(item.wikiID)
-                    }
                     if let updated = try store.getItem(item.id) {
                         emit(.failed(updated, error: errorMsg))
                     }
                 } catch {
                     DebugLog.store("QueueEngine: markFailed failed for \(item.id.rawValue): \(error)")
-                    decrementProviderCount(for: item)
-                    if item.queue == .ingestion {
-                        activeIngestionWikis.remove(item.wikiID)
-                    }
+                    // Same race rule as the success branch: the transition
+                    // lost to a cancel/requeue, and the waiters learn that.
+                    waiterResult = .failure(CancellationError())
                 }
             }
         }
 
+        // Settlement-owned bookkeeping: exactly once per dispatch, on every
+        // path (success, failure, user cancellation, halt, orphan). A halt's
+        // rebuild may have already rebuilt this dispatch's attribution away —
+        // then the rebuilt state owns the slot and the release is skipped,
+        // while the settle-once entry removal and the waiter resume above
+        // still happen.
+        if releaseDeferredByRebuild.remove(leaseID) == nil {
+            releaseDispatchSlots(for: item)
+        }
+
         // Resume any `waitForCompletion` waiters for this item.
-        resumeWaiters(for: item.id, result: result)
+        resumeWaiters(for: item.id, result: waiterResult)
 
         // Trigger dispatch for potentially unblocked items.
         await dispatchScan()
@@ -1099,6 +1287,17 @@ public actor QueueEngine {
             try store.pruneHistory(maxPerQueue: config.recentLimit)
         } catch {
             DebugLog.store("QueueEngine.handleWorkerFinished: pruneHistory failed: \(error)")
+        }
+    }
+
+    /// Release the capacity a dispatch held: the per-provider active count
+    /// and the per-wiki ingestion slot. Clamped, and called only from
+    /// `handleWorkerFinished`, so no cancel/halt path can double-free — or
+    /// prematurely free — a slot the worker still physically holds.
+    private func releaseDispatchSlots(for item: QueueItem) {
+        decrementProviderCount(for: item)
+        if item.queue == .ingestion {
+            activeIngestionWikis.remove(item.wikiID)
         }
     }
 
@@ -1143,13 +1342,24 @@ public actor QueueEngine {
         providerActiveCounts.removeAll()
         activeIngestionWikis.removeAll()
 
+        var stillRunning = Set<QueueItem.ID>()
         for item in active where item.state == .running {
+            stillRunning.insert(item.id)
             if let providerID = item.providerID {
                 incrementProviderCount(providerID)
             }
             if item.queue == .ingestion {
                 activeIngestionWikis.insert(item.wikiID)
             }
+        }
+
+        // Halted-but-still-settling dispatches: the rebuild no longer counts
+        // their items as running, so their slot attribution is gone. Record
+        // the leases so their eventual settlement skips the release instead
+        // of decrementing a sibling dispatch's slot (the clamp cannot restore
+        // attribution — only skipping can).
+        for (id, dispatch) in runningTasks where !stillRunning.contains(id) {
+            releaseDeferredByRebuild.insert(dispatch.leaseID)
         }
     }
 

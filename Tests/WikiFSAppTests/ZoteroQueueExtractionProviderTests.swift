@@ -1,5 +1,6 @@
 #if os(macOS)
 import Foundation
+import Synchronization
 import Testing
 import WikiFSCore
 import WikiFSTypes
@@ -125,7 +126,10 @@ struct ZoteroQueueExtractionProviderTests {
 
     /// Builds one prepared Zotero operation over a real (empty) operation
     /// directory tree and registers it in a fresh extraction registry.
-    private func makeServices(executor: FakeZoteroExecutor) async throws -> any ExtractionServices {
+    private func makeServices(
+        executor: FakeZoteroExecutor,
+        formatRoutePreparation: ExtractionPreparation? = nil
+    ) async throws -> any ExtractionServices {
         let revision = Self.zoteroPackage.revision
         let manifest = try Self.manifest()
         let root = FileManager.default.temporaryDirectory
@@ -173,17 +177,26 @@ struct ZoteroQueueExtractionProviderTests {
                 .zotero(ProcessPackageZoteroAttachment(operation: operation))
             },
             key: adapterKey)
-        return StubZoteroExtractionServices(registry: registry, adapterKey: adapterKey)
+        return StubZoteroExtractionServices(
+            registry: registry,
+            adapterKey: adapterKey,
+            formatRoutePreparation: formatRoutePreparation)
     }
 
     /// Only the Zotero prepare seam is overridden; everything else inherits
     /// the protocol defaults (unavailable), which the zotero arm never calls.
+    /// `formatRoutePreparation`, when set, is what the bytes (format) route's
+    /// `prepare` returns instead of throwing unavailable.
     private struct StubZoteroExtractionServices: ExtractionServices {
         let registry: ExtractionBackendRegistry
         let adapterKey: ExtractionAdapterKey
+        var formatRoutePreparation: ExtractionPreparation?
 
         func prepare(backendOverride: ExtractionBackend?) async throws -> ExtractionPreparation {
-            throw ExtractionServicesError.unavailable
+            guard let formatRoutePreparation else {
+                throw ExtractionServicesError.unavailable
+            }
+            return formatRoutePreparation
         }
 
         func prepareZoteroAttachment() async throws -> ProcessPackageZoteroAttachment {
@@ -370,6 +383,146 @@ struct ZoteroQueueExtractionProviderTests {
             wikiID: WikiID(rawValue: "w"), sourceID: sourceID)
         let active = try queueStore.loadActive(for: .extraction)
         #expect(active.count == 1)
+    }
+
+    // MARK: - Acquisition runs once (regression: follow-on re-fetch loop)
+
+    /// Satisfies the format route's `prepare` seam. The regression tests
+    /// assert on the resolution, never on a conversion, so the extractor is
+    /// inert beyond being a real handle.
+    private struct FakeFormatRouteExtractor: MarkdownExtractor {
+        var displayName: String { "Fake format route" }
+
+        func readiness() async -> ExtractionReadiness { .ready }
+
+        func convert(
+            pdfData: Data,
+            filename: String,
+            onProgress: (@Sendable (String) -> Void)?
+        ) async throws -> String {
+            "# Fake format-route markdown\n"
+        }
+    }
+
+    private static let formatRoutePreparation = ExtractionPreparation(
+        extractor: FakeFormatRouteExtractor(),
+        backend: .localPdf2md,
+        modelVersion: nil)
+
+    /// Once a bytes result has landed, the source must resolve through the
+    /// bytes (format) route — never another acquisition. The follow-on item a
+    /// bytes result enqueues relies on this; before the guard it resolved as
+    /// `.attachment` again and re-fetched the same attachment forever
+    /// (observed live: one PDF re-acquired 200+ times, one queue item per
+    /// fetch, no markdown ever produced).
+    @Test func appProviderAcquiredBytesResolveThroughFormatRoute() async throws {
+        let store = try makeStore()
+        let sourceID = try seedZoteroSource(store)
+        let pdfBytes = Data("%PDF-1.4 fixture bytes".utf8)
+        let executor = FakeZoteroExecutor(
+            outputBytes: pdfBytes,
+            resultMIMEType: try ExtractorMIMEType(validating: "application/pdf"),
+            identifier: "PARENT10")
+        let box = SessionLookupBox()
+        box.setLookup { _ in WikiStoreModel(store: store) }
+        let provider = AppQueueExtractionProvider(
+            extractionServices: try await makeServices(
+                executor: executor,
+                formatRoutePreparation: Self.formatRoutePreparation),
+            sessionBox: box)
+
+        // First resolution (byteless source): the acquisition arm.
+        guard case .attachment(let attachment)? = try await provider.resolveExtraction(
+            wikiID: WikiID(rawValue: "w"), sourceID: sourceID, backendOverride: nil) else {
+            Issue.record("expected an attachment resolution")
+            return
+        }
+        let outcome = try await attachment.fetch { _ in }
+        _ = try await provider.persistAttachmentExtraction(
+            wikiID: WikiID(rawValue: "w"), sourceID: sourceID,
+            resolution: attachment, outcome: outcome)
+
+        // Second resolution (the follow-on format-route item): the acquired
+        // bytes route the host's own format path, not another acquisition.
+        guard case .bytes(let bytes)? = try await provider.resolveExtraction(
+            wikiID: WikiID(rawValue: "w"), sourceID: sourceID, backendOverride: nil) else {
+            Issue.record("expected a bytes (format-route) resolution after acquisition")
+            return
+        }
+        #expect(bytes.sourceBytes == pdfBytes)
+        #expect(bytes.backend == ExtractionBackend.localPdf2md)
+    }
+
+    /// The daemon host runs the same follow-on; the same invariant holds.
+    @Test func daemonProviderAcquiredBytesResolveThroughFormatRoute() async throws {
+        let store = try makeStore()
+        let sourceID = try seedZoteroSource(store)
+        let pdfBytes = Data("%PDF-1.4 daemon fixture".utf8)
+        let executor = FakeZoteroExecutor(
+            outputBytes: pdfBytes,
+            resultMIMEType: try ExtractorMIMEType(validating: "application/pdf"),
+            identifier: "PARENT11")
+        let provider = DaemonQueueExtractionProvider(
+            extractionServices: try await makeServices(
+                executor: executor,
+                formatRoutePreparation: Self.formatRoutePreparation),
+            storeResolver: { _ in store })
+
+        guard case .attachment(let attachment)? = try await provider.resolveExtraction(
+            wikiID: WikiID(rawValue: "w"), sourceID: sourceID, backendOverride: nil) else {
+            Issue.record("expected an attachment resolution")
+            return
+        }
+        let outcome = try await attachment.fetch { _ in }
+        try await provider.persistAttachmentExtraction(
+            wikiID: WikiID(rawValue: "w"), sourceID: sourceID,
+            resolution: attachment, outcome: outcome)
+
+        guard case .bytes(let bytes)? = try await provider.resolveExtraction(
+            wikiID: WikiID(rawValue: "w"), sourceID: sourceID, backendOverride: nil) else {
+            Issue.record("expected a bytes (format-route) resolution after acquisition")
+            return
+        }
+        #expect(bytes.sourceBytes == pdfBytes)
+    }
+
+    // MARK: - Engine wakeup (Tier 1 Phase 4)
+
+    /// With the engine-enqueue seam injected, a follow-on format route goes
+    /// THROUGH the engine — the closure receives the request (and the
+    /// engine's dispatch scan runs) without needing any other engine event.
+    /// The store-only fallback is not used.
+    @Test func followOnEnqueueWakesTheEngineWhenTheSeamIsInjected() async throws {
+        let executor = FakeZoteroExecutor(
+            outputBytes: Data("%PDF-1.4\n".utf8),
+            resultMIMEType: try ExtractorMIMEType(validating: "application/pdf"),
+            identifier: "WAKE01")
+        let (queueStore, _) = try makeFollowOnQueueStore()
+        defer { queueStore.close() }
+
+        let recorded = Mutex<[QueueItemRequest]>([])
+        let provider = DaemonQueueExtractionProvider(
+            extractionServices: try await makeServices(executor: executor),
+            storeResolver: { _ in nil },
+            queueStore: queueStore,
+            engineEnqueue: { request in
+                var seen = recorded.withLock { $0 }
+                seen.append(request)
+                recorded.withLock { $0 = seen }
+                return QueueItemID(rawValue: "01JWAKEDINSERT00000000000")
+            })
+
+        let sourceID = SourceID(rawValue: "01JWAKESOURCE00000000000")
+        try await provider.enqueueFollowOnExtraction(
+            wikiID: WikiID(rawValue: "w"), sourceID: sourceID)
+
+        let requests = recorded.withLock { $0 }
+        #expect(requests.count == 1)
+        #expect(requests.first?.queue == QueueKind.extraction)
+        #expect(requests.first?.wikiID == WikiID(rawValue: "w"))
+        #expect(requests.first?.payload.sourceIDs == [sourceID])
+        // The engine route means the bare store row was never written.
+        #expect(try queueStore.loadActive(for: .extraction).isEmpty)
     }
 }
 #endif

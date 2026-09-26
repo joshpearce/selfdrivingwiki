@@ -52,6 +52,17 @@ extension QueueWorkspaceStatus {
         QueueWorkspaceStatus(text: "Queued", symbol: "clock", style: .secondary)
     }
 
+    /// Queued with a durable admission blocker — the item carries a
+    /// recorded, persisted reason for why nothing is happening yet (e.g.
+    /// `no-extractor-route`). Distinct from `queued()`: "nothing happens"
+    /// must show its reason, not a bare "Queued" chip.
+    static func waitingForRoute(reason: String) -> QueueWorkspaceStatus {
+        QueueWorkspaceStatus(
+            text: "Waiting for route — \(reason)",
+            symbol: "questionmark.circle",
+            style: .warning)
+    }
+
     /// A worker is actively processing.
     static func running() -> QueueWorkspaceStatus {
         QueueWorkspaceStatus(text: "Running", symbol: "ellipsis.circle", style: .running)
@@ -150,6 +161,29 @@ struct QueuePauseResumePresentation: Equatable, Sendable {
                 symbol: "play.fill",
                 help: "Resume Queue — allow queued jobs to start")
         }
+    }
+}
+
+/// The paused-lane notice bar's visible copy. Derived from the lane title and
+/// its queued-job count so every surface reporting a paused lane says the
+/// same thing by construction — and so the singular/plural "job(s)" grammar
+/// is pinned by value-level tests, not string surgery at the call site.
+struct QueuePausedNoticePresentation: Equatable, Sendable {
+    /// The status line, e.g. "Extraction is paused — 2 queued jobs waiting".
+    let message: String
+    /// The bar's action label ("Resume").
+    let resumeLabel: String
+    /// The leading SF Symbol name.
+    let symbol: String
+
+    static func make(queueTitle: String, queuedCount: Int) -> QueuePausedNoticePresentation {
+        let message = queuedCount > 0
+            ? "\(queueTitle) is paused — \(queuedCount) queued job\(queuedCount == 1 ? "" : "s") waiting"
+            : "\(queueTitle) is paused — queued jobs will not start"
+        return QueuePausedNoticePresentation(
+            message: message,
+            resumeLabel: "Resume",
+            symbol: "pause.circle.fill")
     }
 }
 

@@ -26,17 +26,26 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider {
     /// format-route enqueue (enqueue-only — never a queue engine). Nil
     /// disables the follow-on (tests).
     private let queueStore: QueueStore?
+    /// Engine-side enqueue for follow-on format routes. When injected, a
+    /// follow-on item is enqueued THROUGH the engine — its dispatch scan
+    /// runs immediately, so the follow-on job starts without waiting for an
+    /// unrelated engine event to notice the bare store row. When `nil`, the
+    /// store-only fallback below applies (construction sites without an
+    /// engine; the row is still visible to any later scan).
+    private let engineEnqueue: (@Sendable (QueueItemRequest) async throws -> QueueItem.ID)?
 
     init(
         extractionServices: any ExtractionServices,
         storeResolver: @escaping @Sendable (WikiID) -> GRDBWikiStore?,
         openStore: @escaping @Sendable (WikiID) async -> Bool = { _ in false },
-        queueStore: QueueStore? = nil
+        queueStore: QueueStore? = nil,
+        engineEnqueue: (@Sendable (QueueItemRequest) async throws -> QueueItem.ID)? = nil
     ) {
         self.extractionServices = extractionServices
         self.storeResolver = storeResolver
         self.openStore = openStore
         self.queueStore = queueStore
+        self.engineEnqueue = engineEnqueue
     }
 
     // MARK: - QueueExtractionProvider
@@ -134,6 +143,17 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider {
                     resultMode: .installedPackage(producer)))
 
             case .zotero:
+                // An acquisition arm runs once. A source that already holds
+                // content bytes — from a previous acquisition, or from the
+                // follow-on format-route item this provider enqueues after a
+                // bytes result — belongs to the bytes route below. Without
+                // this guard the follow-on resolved as another acquisition
+                // and re-fetched the same attachment forever (observed live:
+                // one PDF re-acquired 200+ times, one queue item per fetch).
+                let alreadyAcquired = !(DebugLog.trying("sourceContent", operation: {
+                    try store.sourceContent(id: sourceID)
+                }) ?? Data()).isEmpty
+                guard alreadyAcquired == false else { break }
                 // Zotero attachment acquisition runs through the
                 // reviewed/selected extractor package. The sync command
                 // wrote the canonical Zotero file endpoint as the plan URL;
@@ -341,15 +361,30 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider {
     }
 
     func enqueueFollowOnExtraction(wikiID: WikiID, sourceID: SourceID) async throws {
+        let request = QueueItemRequest(
+            queue: .extraction,
+            wikiID: wikiID,
+            payload: QueueItemPayload(sourceIDs: [sourceID]))
+        // Preferred route: enqueue through the engine so its dispatch scan
+        // runs immediately — the follow-on job dispatches with no other
+        // trigger required.
+        if let engineEnqueue {
+            do {
+                _ = try await engineEnqueue(request)
+            } catch {
+                DebugLog.store("DaemonQueueExtractionProvider: follow-on format-route engine enqueue failed (source=\(sourceID.rawValue)): \(error)")
+                throw error
+            }
+            return
+        }
+        // Fallback: no engine available at this construction site. The row
+        // still lands in the store and is picked up by any later scan.
         guard let queueStore else {
             DebugLog.extraction("DaemonQueueExtractionProvider: no queue store; follow-on format route not enqueued (source=\(sourceID.rawValue))")
             return
         }
         do {
-            _ = try queueStore.enqueue(QueueItemRequest(
-                queue: .extraction,
-                wikiID: wikiID,
-                payload: QueueItemPayload(sourceIDs: [sourceID])))
+            _ = try queueStore.enqueue(request)
         } catch {
             DebugLog.store("DaemonQueueExtractionProvider: follow-on format-route enqueue failed (source=\(sourceID.rawValue)): \(error)")
             throw error
