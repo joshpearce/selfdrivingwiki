@@ -825,7 +825,15 @@ public actor QueueEngine {
                 guard let providerID = await workerFactory.providerID(for: item) else {
                     continue  // No provider available; item stays queued.
                 }
+                // Actors are reentrant: `pause()` may have run while the
+                // provider resolution above was suspended. Re-check the lane's
+                // run state alongside the lifecycle so a pause landing
+                // mid-resolution cannot be raced by a claim — the item stays
+                // queued and the next `resume` re-scans. A lifecycle stop
+                // aborts the whole scan; a lane pause only stops THIS lane,
+                // so the other lane's queued items still get their shot.
                 guard lifecycle == .running else { return }
+                guard runStates[queue] == .running else { break }
 
                 // From here, NO await until the item is claimed and the
                 // in-memory counts are updated. This keeps the check-and-claim
@@ -861,10 +869,22 @@ public actor QueueEngine {
                 // Read back the running item for the event (synchronous).
                 let runningItem: QueueItem
                 do {
-                    guard let updated = try store.getItem(item.id) else { continue }
+                    guard let updated = try store.getItem(item.id) else {
+                        // The row vanished between the claim and this read.
+                        // The claim left it `.running` with no worker about
+                        // to run — repair the stranded claim before moving on
+                        // (the requeue throws `.notFound` for a deleted row,
+                        // which the repair helper logs).
+                        repairStrandedClaim(for: item)
+                        continue
+                    }
                     runningItem = updated
                 } catch {
                     DebugLog.store("QueueEngine.dispatchScan: failed to load updated item \(item.id.rawValue): \(error)")
+                    // Same stranded-claim shape: claimed in the store, then the
+                    // read-back threw. Requeue so the item cannot sit
+                    // `.running` with no worker until restart.
+                    repairStrandedClaim(for: item)
                     continue
                 }
 
@@ -893,6 +913,21 @@ public actor QueueEngine {
                     outputScope: outputScope,
                     task: task)
             }
+        }
+    }
+
+    /// Return a claimed-but-workerless item to `.queued`. The two stranded-
+    /// claim paths are the post-claim read-back failures in `dispatchScan`
+    /// (the read threw, or the row vanished): the item is `.running` in the
+    /// store with no worker task about to run, and without this repair it
+    /// would sit there until restart. Best-effort: a `.notFound` from a
+    /// vanished row is logged and skipped.
+    private func repairStrandedClaim(for item: QueueItem) {
+        do {
+            try store.requeue(id: item.id)
+            DebugLog.store("QueueEngine.dispatchScan: requeued stranded claim for \(item.id.rawValue)")
+        } catch {
+            DebugLog.store("QueueEngine.dispatchScan: failed to requeue stranded claim for \(item.id.rawValue): \(error)")
         }
     }
 
