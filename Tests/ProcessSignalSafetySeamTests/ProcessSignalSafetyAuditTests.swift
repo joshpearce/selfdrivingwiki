@@ -10,6 +10,11 @@ import Testing
 /// child was the intended target. Nothing in the build would have objected to
 /// that line being added, or to it being added back. This test objects.
 ///
+/// Tests are scanned too. On 2026-09-25 a test read a child's PID file after
+/// the child had created it but before it wrote the PID, fell back to `-1`,
+/// and ran `kill(-1, SIGKILL)` — which signals every process the user owns.
+/// The whole login session died. The audit had skipped `Tests/`.
+///
 /// It is deliberately shaped like `StoreEmissionExhaustivenessTests`: a
 /// discovered set is compared against a reviewed inventory, so a NEW call site
 /// fails the build until someone writes down why it is safe.
@@ -52,8 +57,8 @@ struct ProcessSignalSafetyAuditTests {
     /// Every process-control call site in the repository, with the number of
     /// occurrences and the reason it is acceptable.
     ///
-    /// Adding a process-control call anywhere under `Sources/`, `scripts/`, or
-    /// in the `Makefile` will fail `everyProcessControlCallSiteIsReviewed`
+    /// Adding a process-control call anywhere under `Sources/`, `scripts/`,
+    /// `Tests/`, or in the `Makefile` will fail `everyProcessControlCallSiteIsReviewed`
     /// until it is recorded here with a rationale.
     private var reviewed: [Site: (count: Int, rationale: String)] {
         [
@@ -125,6 +130,15 @@ struct ProcessSignalSafetyAuditTests {
                     + "self, PPID, and PID 1. Not on any build or test path; out of "
                     + "scope for this change"),
 
+            // --- Tests ---------------------------------------------------------
+            .init(path: "Tests/WikiFSTests/AsyncProcessRunnerTests.swift",
+                  primitive: .posixSignal):
+                (1, "guarded: the single kill sits inside signalDescendant, which "
+                    + "#require-s the PID is > 1 and is neither this process nor its "
+                    + "parent. The PID comes from waitForPIDFile, which polls until it "
+                    + "parses a valid PID and throws on timeout — it never substitutes "
+                    + "a sentinel. The child writes the file by atomic rename"),
+
             // --- Developer app lifecycle, not test helpers -------------------
             // NOT a safety approval. These match by absolute installed-app path
             // to stop the developer's own app before reinstalling it.
@@ -142,7 +156,16 @@ struct ProcessSignalSafetyAuditTests {
     private let excludedPaths: Set<String> = [
         // Asserts that pkill/killall/kill -0 do NOT appear in the watchdog.
         "scripts/tests/test-test-with-watchdog-process-control.sh",
+        // This file. Its scanner fixtures are multi-line string literals, which
+        // the per-line quote stripper cannot see as literals.
+        "Tests/ProcessSignalSafetySeamTests/ProcessSignalSafetyAuditTests.swift",
     ]
+
+    /// Primitives not inventoried under `Tests/`. Tests call `terminate()` on a
+    /// `Process` they launched and still hold, so object identity is the
+    /// authority and no numeric PID is involved. Every other primitive takes a
+    /// PID or a pattern and is inventoried in tests exactly as in sources.
+    private let primitivesExemptInTests: Set<Primitive> = [.processTermination]
 
     @Test func everyProcessControlCallSiteIsReviewed() throws {
         let discovered = try discoveredSites()
@@ -253,6 +276,47 @@ struct ProcessSignalSafetyAuditTests {
         }
     }
 
+    /// A PID parsed with a sentinel fallback (`Int32(text) ?? -1`) must never
+    /// sit in a file that sends POSIX signals. `kill(-1, sig)` signals every
+    /// process the user owns and `kill(0, sig)` signals the whole process
+    /// group, and both *succeed*, so a liveness `#expect` passes right before
+    /// the kill. This is the 2026-09-25 incident.
+    /// `Int32(…) ?? <n>`, `pid_t(…) ?? <n>`, or any `?? -1`.
+    private static let sentinelPIDFallbackPattern =
+        #"(\bInt32|\bpid_t)\s*\([^\n]*\)\s*\?\?\s*-?\d|\?\?\s*-1\b"#
+
+    @Test func noSentinelPIDFallbackInFilesThatSignal() throws {
+        let root = repositoryRoot()
+        let sentinel = regex(Self.sentinelPIDFallbackPattern)
+        let signalling = try discoveredSites().keys
+            .filter { $0.primitive == .posixSignal }
+            .map(\.path)
+
+        for relativePath in Set(signalling).sorted() {
+            let source = try String(
+                contentsOf: root.appendingPathComponent(relativePath), encoding: .utf8)
+            let executable = strippingCommentsAndLiterals(source, path: relativePath)
+            let matches = sentinel.numberOfMatches(
+                in: executable, range: NSRange(executable.startIndex..., in: executable))
+            #expect(
+                matches == 0,
+                """
+                \(relativePath) sends POSIX signals and contains a sentinel numeric \
+                fallback. Parse the PID or throw; never substitute -1 or 0.
+                """)
+        }
+    }
+
+    @Test func scannerFlagsSentinelPIDFallback() {
+        let sentinel = regex(Self.sentinelPIDFallbackPattern)
+        for line in ["return Int32(text) ?? -1", "let p = pid_t(s) ?? 0", "x ?? -1"] {
+            #expect(sentinel.numberOfMatches(in: line, range: NSRange(line.startIndex..., in: line)) == 1, "\(line)")
+        }
+        for line in ["let n = count ?? 0", "guard let pid = Int32(text) else { throw e }"] {
+            #expect(sentinel.numberOfMatches(in: line, range: NSRange(line.startIndex..., in: line)) == 0, "\(line)")
+        }
+    }
+
     @Test func processTerminationRequiresAValidProcessIdentifier() throws {
         let root = repositoryRoot()
         let expectedGuardCounts = [
@@ -313,6 +377,9 @@ struct ProcessSignalSafetyAuditTests {
             let source = try String(
                 contentsOf: root.appendingPathComponent(relativePath), encoding: .utf8)
             for (primitive, count) in counted(source, path: relativePath) {
+                if relativePath.hasPrefix("Tests/"), primitivesExemptInTests.contains(primitive) {
+                    continue
+                }
                 result[Site(path: relativePath, primitive: primitive), default: 0] += count
             }
         }
@@ -381,7 +448,7 @@ struct ProcessSignalSafetyAuditTests {
     private func scannedSourceFiles(root: URL) throws -> [String] {
         var paths: [String] = ["Makefile"]
 
-        for directory in ["Sources", "scripts"] {
+        for directory in ["Sources", "scripts", "Tests"] {
             let base = root.appendingPathComponent(directory)
             guard let enumerator = FileManager.default.enumerator(
                 at: base,
