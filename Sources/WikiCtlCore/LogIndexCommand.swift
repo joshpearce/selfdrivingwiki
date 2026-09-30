@@ -8,8 +8,9 @@ import WikiFSCore
 public enum LogIndexCommand {
 
     public enum Action: Equatable {
-        /// Append one dated row to the chronological log. `source` (set only on an
-        /// ingest) is the ingested-file id to additionally stamp as ingested.
+        /// Append one dated row to the chronological log. `source` (valid only
+        /// with kind `ingest`) is the ingested-file id to additionally stamp as
+        /// ingested — the agent-asserted "this ingest completed" switch.
         case logAppend(kind: LogEntry.Kind, title: String, note: String?, source: SourceID?)
         /// Replace the singleton wiki-index body wholesale (UPSERT, version + 1).
         /// When `workspace` is set (Phase 7), stage into the workspace instead of
@@ -24,10 +25,33 @@ public enum LogIndexCommand {
     public static func run(_ action: Action, in store: WikiStore) throws -> PageCommand.Result {
         switch action {
         case .logAppend(let kind, let title, let note, let source):
+            // The Ingested stamp is agent-asserted, and the assertion is only
+            // meaningful for an ingest: on a completed ingest workflow the
+            // agent passes --source <file-id> so the UI shows the file as
+            // Ingested without guessing from the title. The parser already
+            // rejects --source on other kinds; this gate is defense-in-depth
+            // for programmatic Action construction (a query/lint entry that
+            // names a source must never flip its ingest state).
+            //
+            // The stamp must also fail LOUDLY on a target that does not
+            // exist: markSourceIngested is a no-op UPDATE on a missing id, so
+            // without this check a typo'd --source would append the log row,
+            // exit 0, and leave the file unmarked — the same
+            // believed-it-worked failure this command exists to prevent.
+            // Validation runs BEFORE the append so nothing commits on failure.
+            if kind == .ingest, let source {
+                let exists = try store.listSources().contains { $0.id == source }
+                guard !source.rawValue.isEmpty, exists else {
+                    throw PageCommand.Failure.message(
+                        "log append: --source \(source.rawValue) does not name a source in this wiki — "
+                        + "the Ingested stamp was NOT applied and the log entry was NOT written. "
+                        + "Pass the id from `wikictl source list`.")
+                }
+            }
             let entry = try store.appendLog(kind: kind, title: title, note: note)
-            // On a successful ingest the agent passes --source <file-id>; stamp it
-            // so the UI shows the file as Ingested without guessing from the title.
-            if let source { try store.markSourceIngested(id: source) }
+            if kind == .ingest, let source {
+                try store.markSourceIngested(id: source)
+            }
             return PageCommand.Result(output: entry.id.rawValue, didCommit: true)
         case .indexSet(let body, let workspace):
             guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
