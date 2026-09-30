@@ -5781,13 +5781,24 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         }
     }
 
+    /// Marks the source Ingested by stamping `ingested_at`. The FIRST
+    /// completed ingest wins: the UPDATE only touches rows that are not yet
+    /// stamped, so re-stamps — a host re-drain, or an agent following the
+    /// chat prompt's `wikictl log append --source` ritual after the host
+    /// already stamped (#1344) — are no-ops that never rewrite the timestamp.
+    ///
+    /// The unconditional `mutate()` emission is deliberate: a no-op UPDATE
+    /// still emits one `sourceUpdated`, which is a harmless reload. A no-op
+    /// means the row was already stamped, or the source row is gone (the
+    /// CLI path validates existence first; the host path does not need to —
+    /// there is nothing to stamp on a deleted row).
     public func markSourceIngested(id: SourceID) throws {
         try mutate(event: { _ in
             self.localEvent(.source, id: id.rawValue, change: .updated)
         }) { db in
             try db.execute(sql: """
             UPDATE sources SET ingested_at = ?, updated_at = ?
-            WHERE id = ?;
+            WHERE id = ? AND ingested_at IS NULL;
             """, arguments: [Date().timeIntervalSince1970,
                             Date().timeIntervalSince1970, id.rawValue])
         }

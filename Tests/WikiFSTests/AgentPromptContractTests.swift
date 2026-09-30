@@ -45,6 +45,9 @@ struct AgentPromptContractTests {
         "wiki-tree-render.md",
         "ingest-executor.md",
         "ingest-finalizer.md",
+        "ingest-single-task.md",
+        "ingest-curator-task.md",
+        "ingest-planner.md",
     ]
 
     // MARK: - Resource sync (AC.9)
@@ -144,6 +147,49 @@ struct AgentPromptContractTests {
         #expect(writeRule.contains("RUN ENVIRONMENT"))
         #expect(writeRule.contains("--wiki"))
     }
+
+    // MARK: - Host-stamped ingest state (#1344)
+
+    /// The pipeline ingest task prompts no longer mention `--source` at
+    /// all: the host stamps Ingested at validated-successful job
+    /// completion, so the agent log-append ritual is retired for pipeline
+    /// ingests. (The page-write evidence flag lives in the write-rule and
+    /// executor prompts, which are not task prompts.) Asserted on BOTH the
+    /// canonical sources and the bundled copies the runtime actually loads.
+    @Test func pipelineIngestPromptsDropTheSourceRitual() {
+        let taskPromptNames = [
+            "ingest-single-task.md",
+            "ingest-curator-task.md",
+            "ingest-finalizer.md",
+            "ingest-planner.md",
+        ]
+        for name in taskPromptNames {
+            for (copy, origin) in [
+                (canonical(name), "prompts/\(name)"),
+                (bundled(name), "Sources/WikiFSCore/Resources/Prompts/\(name)"),
+            ] {
+                guard let prompt = copy else {
+                    Issue.record("missing prompt: \(origin)")
+                    continue
+                }
+                #expect(!prompt.contains("--source"),
+                        "\(origin): pipeline task prompts must not teach the --source ritual (#1344)")
+                #expect(!prompt.contains("REQUIRED — it marks"),
+                        "\(origin): the --source REQUIRED sentence is retired (#1344)")
+            }
+        }
+    }
+
+    /// The ad-hoc chat path keeps the agent-asserted `--source` switch:
+    /// only pipeline ingests moved to host stamping (#1344).
+    @Test func chatPromptKeepsAdHocSourcePath() {
+        guard let system = canonical("system-prompt-default.md") else {
+            Issue.record("missing canonical prompt: prompts/system-prompt-default.md")
+            return
+        }
+        #expect(system.contains("--source <file-id>"))
+        #expect(system.contains("completed-ingest switch"))
+    }
 }
 
 /// Byte-synchronization guard for the canonical → bundled prompt copies of the
@@ -168,6 +214,9 @@ struct PromptResourceSyncTests {
             "wiki-tree-render.md",
             "ingest-executor.md",
             "ingest-finalizer.md",
+            "ingest-single-task.md",
+            "ingest-curator-task.md",
+            "ingest-planner.md",
         ]
         for name in names {
             let source = read(canonicalDir.appendingPathComponent(name))
