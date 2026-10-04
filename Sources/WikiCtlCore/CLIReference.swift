@@ -1,4 +1,5 @@
 import Foundation
+import WikiFSCore
 
 /// Which help surface to print. `leaf` carries an `operation` only for the
 /// nested OKF operations (`wikictl page okf verify --help`).
@@ -243,19 +244,21 @@ public enum CLIReference {
                     ]),
                 CLILeaf(
                     "add",
-                    summary: "create-or-update a page; --expect-head enables CAS (exit 3 on conflict)",
-                    commandLine: "add --title X [--id Y] --body-file <path|-> [--expect-head <ver>] [--workspace W] [--author <who>] [--source <source-id[:role]> …]",
+                    summary: "create-or-update a page; --expect-head enables CAS, --create-only requires absence (exit 3 on conflict)",
+                    commandLine: "add --title X [--id Y] --body-file <path|-> [--expect-head <ver> | --create-only] [--workspace W] [--author <who>] [--source <source-id[:role]> …]",
                     options: [
                         CLIOption("--title <title>", required: true, summary: "page title; the create-or-update key"),
                         CLIOption("--id <page-id>", summary: "target an existing page by id instead of by title"),
                         CLIOption("--body-file <path|->", required: true, summary: "markdown body; `-` reads stdin — use a pipe or heredoc"),
                         CLIOption("--expect-head <ver>", summary: "CAS: fail with exit 3 if HEAD moved since your read"),
+                        CLIOption("--create-only", summary: "create-only: fail with exit 3 if the title already exists (closes the create-vs-create race); mutually exclusive with --expect-head, --id, and --workspace"),
                         CLIOption("--workspace <name>", summary: "write into workspace W instead of main"),
                         CLIOption("--author <who>", summary: "stamp created_by/last_edited_by (default: WIKI_AUTHOR env)"),
                         CLIOption("--source <source-id[:role]>", repeated: true, summary: "provenance stamp; repeatable, role defaults to primary"),
                     ],
                     details: [
                         "CAS discipline: read head_version_id first (`page get --json`, or the stderr line in text mode), pass it as --expect-head; on exit 3 re-read, reapply, and retry once.",
+                        "Create-only discipline: use --create-only when your page read found NO page under the title. Exit 3 means another writer created it since — re-read that page, reconcile against its head, and write with --expect-head. Never retry --create-only blindly.",
                         "On success the write echoes the new head_version_id on stderr, so the next CAS write needs no extra read.",
                         "--author accepts `chat:<id>`, `agent:<kind>`, or a plain name; the WIKI_AUTHOR env fills it when omitted.",
                     ],
@@ -263,6 +266,7 @@ public enum CLIReference {
                         "wikictl page add --title \"Meeting Notes\" --body-file notes.md",
                         "cat draft.md | wikictl page add --title Draft --body-file -",
                         "wikictl page add --title Draft --body-file - --expect-head 01ABC --author chat:01XYZ",
+                        "wikictl page add --title Fresh --body-file - --create-only --author agent:executor",
                     ]),
                 CLILeaf(
                     "delete", summary: "delete a page (removes bookmarks targeting it)",
@@ -622,6 +626,48 @@ public enum CLIReference {
                     "reap", summary: "abandon stale open workspaces (default 3600s)",
                     commandLine: "reap [--ttl <seconds>]",
                     options: [CLIOption("--ttl <seconds>", summary: "age threshold in seconds (default 3600)")]),
+            ]),
+        CLIFamily(
+            name: "strategy",
+            summary: "read, save, or reset the per-wiki editorial strategy (CAS-protected)",
+            leaves: [
+                CLILeaf(
+                    "read", summary: "print the committed strategy + revision (or Default) — the revision feeds the next save's --expect-revision",
+                    commandLine: "read [--json]",
+                    options: [CLIOption("--json", summary: "one JSON object instead of text")],
+                    details: [
+                        "`revision: absent` means no strategy row has ever been written — pass `--expect-revision absent` to the first save. A wiki at Default after a reset KEEPS its revision (a tombstone row); pass that number, not `absent`.",
+                    ]),
+                CLILeaf(
+                    "save", summary: "compare-and-swap save of the strategy document; whitespace-only instructions reset to Default (exit 3 on conflict)",
+                    commandLine: "save [--name NAME] (--content <md> | --file <path|->) --expect-revision <n|absent> [--json]",
+                    options: [
+                        CLIOption("--name <name>", summary: "display name; trimmed, may be empty (limit \(WikiStrategy.nameCharacterLimit) characters)"),
+                        CLIOption("--content <md>", summary: "inline instructions — exactly one of --content / --file"),
+                        CLIOption("--file <path|->", summary: "instructions from a file or stdin — exactly one of --content / --file"),
+                        CLIOption("--expect-revision <n|absent>", required: true, summary: "CAS: the revision `strategy read` printed (`absent` = no row ever written); fails with exit 3 if it moved"),
+                        CLIOption("--json", summary: "machine-readable result"),
+                    ],
+                    details: [
+                        "CAS discipline: read the committed revision first (`strategy read`), pass it as --expect-revision; on exit 3 re-read, reapply, and retry once — never loop.",
+                        "Limits are enforced, never truncated: name ≤ \(WikiStrategy.nameCharacterLimit) characters after trimming; instructions ≤ \(WikiStrategy.instructionsUTF8ByteLimit) UTF-8 bytes. Oversized input fails with exit 1.",
+                        "Whitespace-only instructions reset the wiki to the Default strategy (same as `strategy reset`). A save identical to the committed strategy changes nothing and does not advance the revision.",
+                    ],
+                    examples: [
+                        "wikictl strategy read",
+                        "cat strategy.md | wikictl strategy save --name \"Research wiki\" --file - --expect-revision absent",
+                    ]),
+                CLILeaf(
+                    "reset", summary: "reset the wiki to the Default strategy, keeping the revision counter (exit 3 on conflict)",
+                    commandLine: "reset --expect-revision <n|absent> [--json]",
+                    options: [
+                        CLIOption("--expect-revision <n|absent>", required: true, summary: "CAS: the revision `strategy read` printed (`absent` = no row ever written); fails with exit 3 if it moved"),
+                        CLIOption("--json", summary: "machine-readable result"),
+                    ],
+                    details: [
+                        "Reset writes a tombstone: the strategy reads back as Default, and the revision counter stays monotonic for the next save.",
+                        "Resetting a wiki already at Default changes nothing (no revision advance, no event).",
+                    ]),
             ]),
         CLIFamily(
             name: "wiki",

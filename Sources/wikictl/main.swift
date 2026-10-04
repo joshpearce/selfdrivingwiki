@@ -151,6 +151,7 @@ func run() async -> Int32 {
         let output = try await makeRunner().runOrdinary(
             command: invocation.command,
             wikiSelector: invocation.wikiSelector,
+            databasePath: invocation.databasePath,
             environment: ProcessInfo.processInfo.environment)
         write(output)
         return 0
@@ -170,6 +171,37 @@ func run() async -> Int32 {
         """
         FileHandle.standardError.write(Data(message.utf8))
         return 3
+    } catch let conflict as PageCreateConflictError {
+        // Create-only conflict (cumulative ingestion, phase 4 §4): the caller's
+        // read found no page under the title, but one exists now. Same exit
+        // code 3 as the CAS conflict — the agent re-reads the page, reconciles
+        // against its head, and writes with --expect-head. Nothing was written.
+        let actual = conflict.actualVersionID?.rawValue ?? "(none)"
+        let message = """
+        wikictl: create-only conflict on page \(conflict.pageID.rawValue) — \
+        --create-only requires the title to be absent, \
+        but a page now exists under \(conflict.title) (head \(actual)). \
+        Read that page, reconcile against its head, and write with --expect-head. \
+        Nothing was written.
+
+        """
+        FileHandle.standardError.write(Data(message.utf8))
+        return 3
+    } catch let conflict as PageExpectedTargetMissingError {
+        // Expected-head write whose target no longer exists (deleted or
+        // renamed away since the caller's read) — same exit code 3 family:
+        // re-read, reconcile, write again. Nothing was written, and no page
+        // was silently created.
+        let target = conflict.pageID?.rawValue ?? "title \(conflict.title)"
+        let message = """
+        wikictl: expected-head conflict — the page you pinned (\(target)) \
+        does not exist anymore (deleted or renamed since your read). \
+        Re-read (`page list` / `page get`), reconcile, and write again. \
+        Nothing was written.
+
+        """
+        FileHandle.standardError.write(Data(message.utf8))
+        return 3
     } catch let conflict as SourceMarkdownConflictError {
         // CAS conflict on a processed-markdown rewrite — the chain's head
         // moved after the caller read it (another writer won the race). Exit
@@ -184,6 +216,26 @@ func run() async -> Int32 {
         head_version_id (`source info`), reapply your edit, and retry once. \
         Nothing was written. If it conflicts again, report the conflict \
         instead of retrying.
+
+        """
+        FileHandle.standardError.write(Data(message.utf8))
+        return 3
+    } catch let conflict as WikiStrategyConflictError {
+        // CAS conflict on the strategy singleton — another editor committed
+        // since the caller's read (the app's strategy editor, another agent,
+        // another wikictl). Exit code 3 (same convention as the page/source
+        // CAS families) signals the agent to re-read, reapply once, and
+        // retry once — never loop. The write threw before any row change.
+        let expected = conflict.expectedRevision.map { "revision \($0.rawValue)" }
+            ?? "absent (no strategy row ever written)"
+        let current = conflict.currentRevision.map { "revision \($0.rawValue)" }
+            ?? "absent (no strategy row has ever been written)"
+        let message = """
+        wikictl: CAS conflict on strategy — \
+        expected \(expected), \
+        but the committed revision is \(current). \
+        Re-read (`strategy read`), reapply your edit, and retry once with the \
+        new revision. Nothing was written.
 
         """
         FileHandle.standardError.write(Data(message.utf8))
@@ -292,6 +344,12 @@ func execute(
     case .workspace(let action):
         let r = try WorkspaceCommand.run(action, in: store)
         return SourceCommand.Result(payload: .text(r.output), didCommit: r.didCommit)
+    case .strategy(let action):
+        let r = try StrategyCommand.run(action, in: store)
+        return SourceCommand.Result(
+            payload: .text(r.output),
+            didCommit: r.didCommit,
+            stderrOutput: r.stderrOutput)
     case .help, .version, .dumpConfig:
         // Handled before wiki resolution in `run()` — unreachable here.
         return SourceCommand.Result(payload: .text(""), didCommit: false)

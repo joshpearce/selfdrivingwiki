@@ -19,6 +19,15 @@ import WikiFSCore
 /// subcommand recognition and option validation (#1224).
 ///
 /// `--wiki` may be omitted when the `WIKI_DB` env var supplies the selector.
+///
+/// An EXPLICIT database file may replace the registry selector:
+/// `wikictl --database-path /abs/<ulid>.sqlite page list`. The flag and the
+/// `WIKI_DB_PATH` env var are mutually exclusive with `--wiki`/`WIKI_DB`
+/// (mixed forms are a usage error), the path must be an absolute `.sqlite`
+/// file outside the App Group container, and the two raw strings are typed
+/// into a `WikiSelection` at the runner boundary — never inside the parser.
+/// This form exists for disposable fixture databases (the live semantic
+/// evaluation harness); ordinary invocations are unchanged.
 public enum ArgumentParser {
 
     /// A fully-parsed invocation: which wiki, what to do, and — for `page add`
@@ -27,10 +36,15 @@ public enum ArgumentParser {
     /// reads it.
     public struct Invocation: Equatable {
         public var wikiSelector: String
+        /// Raw `--database-path`/`WIKI_DB_PATH` value, empty when the ordinary
+        /// `--wiki` selector form was used. Exactly one of `wikiSelector` /
+        /// `databasePath` is non-empty once parsing succeeds.
+        public var databasePath: String
         public var command: Command
 
-        public init(wikiSelector: String, command: Command) {
+        public init(wikiSelector: String, databasePath: String = "", command: Command) {
             self.wikiSelector = wikiSelector
+            self.databasePath = databasePath
             self.command = command
         }
     }
@@ -68,6 +82,10 @@ public enum ArgumentParser {
         case queue(QueueCommand.Action)
         /// Workspace commands (W1, PR #312): create, status, abandon, merge.
         case workspace(WorkspaceCommand.Action)
+        /// Strategy commands: read, save, reset for the per-wiki editorial
+        /// strategy singleton. Save/reset carry the REQUIRED CAS expectation
+        /// (`.absent` = no strategy row has ever been written).
+        case strategy(StrategyCommand.Action)
         /// Print scoped command usage (`wikictl [source [add]] --help`).
         /// Does not require a wiki selection (#1224).
         case help(CLIHelpScope)
@@ -155,7 +173,11 @@ public enum ArgumentParser {
             }
         }
 
-        // A leading `--wiki <id>` or `--wiki=<id>` is optional; otherwise fall back to WIKI_DB.
+        // A leading `--wiki <id>`/`--wiki=<id>`, `--database-path <file>`/
+        // `--database-path=<file>`, or their `WIKI_DB`/`WIKI_DB_PATH` env
+        // fallbacks. The parser records the raw winning form(s); typed
+        // conversion and mutual-exclusion checks live in
+        // `WikiResolver.selection(wikiSelector:databasePath:)`.
         var wikiSelector: String?
         if args.first == "--wiki" {
             guard args.count >= 2 else { throw Failure.usage("--wiki requires a value") }
@@ -169,8 +191,27 @@ public enum ArgumentParser {
         } else if let envValue = env("WIKI_DB"), !envValue.isEmpty {
             wikiSelector = envValue
         }
-        guard let selector = wikiSelector else {
-            throw Failure.usage("no wiki selected — pass --wiki <id> (or --wiki=<id>) or set WIKI_DB")
+        var databasePath: String?
+        if args.first == "--database-path" {
+            guard args.count >= 2 else { throw Failure.usage("--database-path requires a value") }
+            databasePath = args[1]
+            args.removeFirst(2)
+        } else if let first = args.first, first.hasPrefix("--database-path=") {
+            let value = String(first.dropFirst("--database-path=".count))
+            guard !value.isEmpty else { throw Failure.usage("--database-path requires a value") }
+            databasePath = value
+            args.removeFirst()
+        } else if databasePath == nil, let envValue = env("WIKI_DB_PATH"), !envValue.isEmpty {
+            // Env fallback only when no --database-path FLAG was given. Both
+            // env vars set, or flag+env mixing, reaches the typed conflict
+            // check in `WikiResolver.selection` — never a silent winner.
+            databasePath = envValue
+        }
+        let selectedWikiSelector = wikiSelector ?? ""
+        let selectedDatabasePath = databasePath ?? ""
+        guard !selectedWikiSelector.isEmpty || !selectedDatabasePath.isEmpty else {
+            throw Failure.usage(
+                "no wiki selected — pass --wiki <id> (or --wiki=<id>), --database-path <file>, or set WIKI_DB/WIKI_DB_PATH")
         }
 
         let command: Command
@@ -197,10 +238,15 @@ public enum ArgumentParser {
             command = try parseQueueCommand(Array(args.dropFirst()))
         case "workspace":
             command = try parseWorkspaceCommand(Array(args.dropFirst()))
+        case "strategy":
+            command = try parseStrategyCommand(Array(args.dropFirst()))
         default:
             throw Failure.usage("unknown command \((args.first ?? "").debugDescription)")
         }
-        return Invocation(wikiSelector: selector, command: command)
+        return Invocation(
+            wikiSelector: selectedWikiSelector,
+            databasePath: selectedDatabasePath,
+            command: command)
     }
 
     private static func parsePageCommand(_ args: [String]) throws -> Command {
@@ -235,10 +281,37 @@ public enum ArgumentParser {
             }
             let id = options.value("--id").map { PageID(rawValue: $0) }
             let expectHead = options.value("--expect-head").map(PageVersionID.init(rawValue:))
+            let createOnly = options.flag("--create-only")
             let workspace = options.value("--workspace")
+            // Expected-state gate (cumulative ingestion, plan phase 4 §4):
+            // `--create-only` and `--expect-head` state contradictory
+            // preconditions (page must NOT exist vs. page must exist at the
+            // given head), so combining them is a usage error, not a
+            // resolution order question. `--create-only` also cannot target
+            // an explicit id (an id IS an existing-page target) or stage into
+            // a workspace (staging resolves absence itself).
+            if createOnly, expectHead != nil {
+                throw Failure.usage(
+                    "page add: --create-only and --expect-head are mutually exclusive — "
+                    + "--create-only writes a page that must NOT exist, --expect-head "
+                    + "writes a page that must. Pick one."
+                )
+            }
+            if createOnly, id != nil {
+                throw Failure.usage(
+                    "page add: --create-only cannot be combined with --id — an explicit "
+                    + "id targets an existing page; drop --create-only or --id."
+                )
+            }
+            if createOnly, workspace != nil {
+                throw Failure.usage(
+                    "page add: --create-only cannot be combined with --workspace — "
+                    + "workspace staging resolves page absence itself."
+                )
+            }
             let author = options.value("--author")
             let provenance = try decodePageVersionSources(options.values("--source"))
-            return .page(.add(id: id, title: title, body: .file(bodyFile), expectHead: expectHead, workspace: workspace, author: author, provenance: provenance))
+            return .page(.add(id: id, title: title, body: .file(bodyFile), expectHead: expectHead, createOnly: createOnly, workspace: workspace, author: author, provenance: provenance))
 
         case "delete":
             guard let id = options.value("--id") else {
@@ -937,6 +1010,80 @@ public enum ArgumentParser {
         }
     }
 
+    private static func parseStrategyCommand(_ args: [String]) throws -> Command {
+        guard let sub = args.first else {
+            throw Failure.usage(CLIReference.missingSubcommandMessage(familyName: "strategy"))
+        }
+        guard CLIReference.leaf(family: "strategy", named: sub) != nil else {
+            throw Failure.usage(CLIReference.unknownSubcommandMessage(familyName: "strategy", given: sub))
+        }
+        let options = try Options(Array(args.dropFirst()), options: CLIReference.options(forFamily: "strategy"))
+
+        switch sub {
+        case "read":
+            return .strategy(.read(json: options.flag("--json")))
+
+        case "save":
+            // `--content` is inline; `--file` defers to BodySource resolution
+            // (read at execution time, not parse time — the parser stays pure).
+            let contentValue = options.value("--content")
+            let fileValue = options.value("--file")
+            let content: BodySource
+            switch (contentValue, fileValue) {
+            case (.some, .some):
+                throw Failure.usage("strategy save: pass exactly one of --content / --file, not both")
+            case (.none, .none):
+                throw Failure.usage("strategy save: pass --content <text> or --file <path|->")
+            case (let inline?, nil):
+                content = .inline(inline)
+            case (nil, let file?):
+                content = .file(file)
+            }
+            let expect = try parseStrategyExpectation(options, sub: "save")
+            return .strategy(.save(
+                name: options.value("--name"),
+                content: content,
+                expect: expect,
+                json: options.flag("--json")))
+
+        case "reset":
+            let expect = try parseStrategyExpectation(options, sub: "reset")
+            return .strategy(.reset(expect: expect, json: options.flag("--json")))
+
+        default:
+            // Unreachable: recognition is the CLIReference leaf table above.
+            throw Failure.usage(CLIReference.unknownSubcommandMessage(familyName: "strategy", given: sub))
+        }
+    }
+
+    /// `--expect-revision` is REQUIRED for save/reset — the CAS token that
+    /// keeps a concurrent human/agent edit from being silently clobbered.
+    /// `absent` spells the never-written row (the store's `nil` expectation —
+    /// true absence, not a reset tombstone, which keeps a real revision); a
+    /// positive integer pins the committed revision. `0` is the floor no
+    /// committed row stores, so it is rejected with the `absent` spelling
+    /// pointed at rather than silently compared.
+    private static func parseStrategyExpectation(
+        _ options: Options, sub: String
+    ) throws -> StrategyCommand.ExpectedRevision {
+        guard let raw = options.value("--expect-revision"),
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw Failure.usage("""
+                strategy \(sub): --expect-revision <n|absent> is required — \
+                read the committed revision first (`strategy read` prints it), \
+                then retry with it. `absent` means no strategy row has ever \
+                been written. On exit 3 (conflict), re-read, reapply once, \
+                and retry once.
+                """)
+        }
+        if raw == "absent" { return .absent }
+        guard let value = Int64(raw), value >= 1 else {
+            throw Failure.usage(
+                "strategy \(sub): --expect-revision must be a committed revision number (≥ 1) or `absent`, got \(raw.debugDescription)")
+        }
+        return .revision(WikiStrategyRevision(rawValue: value))
+    }
+
     /// A tiny `--key value` / `--flag` option bag. Tolerates options in any
     /// order; rejects an unbalanced trailing `--key` with no value.
     ///
@@ -1080,15 +1227,15 @@ public enum ArgumentParser {
         case .page(.get(let selector, let json, let workspace))
             where workspace == nil && workspaceID?.isEmpty == false:
             return .page(.get(selector, json: json, workspace: workspaceID))
-        case .page(.add(let id, let title, let bodySource, let expectHead, let workspace, let existingAuthor, let provenance))
+        case .page(.add(let id, let title, let bodySource, let expectHead, let createOnly, let workspace, let existingAuthor, let provenance))
             where workspace == nil && workspaceID?.isEmpty == false:
             return .page(.add(id: id, title: title, body: bodySource,
-                             expectHead: expectHead, workspace: workspaceID,
+                             expectHead: expectHead, createOnly: createOnly, workspace: workspaceID,
                              author: existingAuthor ?? author, provenance: provenance))
-        case .page(.add(let id, let title, let bodySource, let expectHead, let workspace, let existingAuthor, let provenance))
+        case .page(.add(let id, let title, let bodySource, let expectHead, let createOnly, let workspace, let existingAuthor, let provenance))
             where existingAuthor == nil && author?.isEmpty == false:
             return .page(.add(id: id, title: title, body: bodySource,
-                             expectHead: expectHead, workspace: workspace,
+                             expectHead: expectHead, createOnly: createOnly, workspace: workspace,
                              author: author, provenance: provenance))
         case .indexSet(let bodyFile, let workspace)
             where workspace == nil && workspaceID?.isEmpty == false:
