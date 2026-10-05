@@ -916,7 +916,7 @@ github-release:
 DEV_RELEASE_TAG := dev-$(shell git rev-list --count HEAD)-$(shell git rev-parse --short=8 HEAD)
 DEV_RELEASE_ZIP := $(DIST_DIR)/$(APP_NAME)-$(DEV_RELEASE_TAG)-macos.zip
 DEV_RELEASE_NOTES := $(DIST_DIR)/$(DEV_RELEASE_TAG)-notes.md
-DEV_RELEASE_REPO ?= $(shell git remote get-url origin | sed -E 's#^(git@github.com:|https://github.com/)##; s#\.git$$##')
+DEV_RELEASE_REPO ?= $(shell git remote get-url origin | sed -E 's,^(git@github.com:|https://github.com/),,; s,\.git$$,,')
 
 .PHONY: dev-release-zip dev-release
 
