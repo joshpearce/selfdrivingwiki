@@ -85,6 +85,16 @@ struct SourcesListCallbacks {
     /// Again?" confirmation. `names` lists the already-ingested sources.
     var onIngestNeedsConfirmation: (_ ids: [SourceID], _ names: [String]) -> Void
     var onExtract: ([SourceExtractItem]) -> Void
+    /// Navigate to the running job for a source in the given queue's Activity
+    /// window. Backs the IN-PLACE swap of the context menu's single-row
+    /// Ingest / Extract Markdown item while that lane's job runs for the
+    /// clicked source ("View Ingestion Job…" / "View Extraction Job…") — the
+    /// menu never gains a separate navigation item. The container owns the
+    /// tracker and the Activity-window opener, so the AppKit side stays
+    /// queue-engine-free. The queue item is resolved at tap time — a job that
+    /// finished between menu build and click opens the window without a
+    /// selection.
+    var onShowRunningJob: (SourceID, QueueKind) -> Void
     var onRename: (SourceSummary) -> Void
     var onDelete: ([SourceID]) -> Void
     /// Bookmark a multi-row selection (or a single row) into a folder the user
@@ -471,8 +481,17 @@ extension SourcesListViewController {
             }
         } else if canIngest(clicked) {
             menu.addItem(.separator())
-            menu.addItem(item(title: "Ingest", systemImage: "text.badge.plus",
-                              action: #selector(ingestAction(_:)), payload: payload))
+            // While an ingest job runs for the clicked source, the SAME item
+            // becomes the navigation affordance — one control per lane, never
+            // an added item (#837/#842 replacement pattern).
+            if ingestingIDs.contains(clicked.id) {
+                menu.addItem(item(title: "View Ingestion Job…", systemImage: "text.badge.plus",
+                                  action: #selector(showRunningIngestJobAction(_:)),
+                                  payload: payload))
+            } else {
+                menu.addItem(item(title: "Ingest", systemImage: "text.badge.plus",
+                                  action: #selector(ingestAction(_:)), payload: payload))
+            }
         }
 
         let extractable = effective.filter { canExtract($0) }
@@ -485,8 +504,16 @@ extension SourcesListViewController {
             }
         } else if canExtract(clicked) {
             menu.addItem(.separator())
-            menu.addItem(item(title: "Extract Markdown", systemImage: "doc.plaintext",
-                              action: #selector(extractAction(_:)), payload: payload))
+            // Same in-place swap as Ingest above: while an extraction job
+            // runs for the clicked source, the Extract item navigates.
+            if extractingIDs.contains(clicked.id) {
+                menu.addItem(item(title: "View Extraction Job…", systemImage: "doc.plaintext",
+                                  action: #selector(showRunningExtractJobAction(_:)),
+                                  payload: payload))
+            } else {
+                menu.addItem(item(title: "Extract Markdown", systemImage: "doc.plaintext",
+                                  action: #selector(extractAction(_:)), payload: payload))
+            }
         }
 
         menu.addItem(.separator())
@@ -596,6 +623,16 @@ extension SourcesListViewController {
         }
         guard !toExtract.isEmpty else { return }
         callbacks?.onExtract(toExtract)
+    }
+    @objc private func showRunningIngestJobAction(_ sender: NSMenuItem) {
+        if let p = sender.representedObject as? SourcesMenuPayload {
+            callbacks?.onShowRunningJob(p.clicked.id, .ingestion)
+        }
+    }
+    @objc private func showRunningExtractJobAction(_ sender: NSMenuItem) {
+        if let p = sender.representedObject as? SourcesMenuPayload {
+            callbacks?.onShowRunningJob(p.clicked.id, .extraction)
+        }
     }
     @objc private func renameAction(_ sender: NSMenuItem) {
         if let p = sender.representedObject as? SourcesMenuPayload { callbacks?.onRename(p.clicked) }

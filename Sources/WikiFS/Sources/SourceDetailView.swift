@@ -850,18 +850,34 @@ struct SourceDetailView: View {
                         // sources dispatch to the inline package-only
                         // `runDocxExtraction` path for the same reason; PDF
                         // sources go through the queue as before.
-                        Button(
-                            extractButtonTitle,
-                            systemImage: "doc.plaintext") {
-                            runExtractForCurrentSource()
+                        // While THIS source's extraction job is in flight, the
+                        // button swaps to "View Extraction" and navigates to
+                        // the running job in the Activity window — the same
+                        // swap as the Transcribe button below (#842 PR2 C5)
+                        // and PageDetailView's "View Lint" (#837). Import-time
+                        // extraction (DOCX auto-extract) runs outside the
+                        // queue, so it has no item to select — the busy
+                        // disabled look below stays until a queue job exists.
+                        if runningExtractionJobItemID != nil {
+                            Button("View Extraction", systemImage: "checkmark.seal.fill") {
+                                navigateToRunningExtractionJob()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .help("View the running extraction job in the Activity window")
+                        } else {
+                            Button(
+                                extractButtonTitle,
+                                systemImage: "doc.plaintext") {
+                                runExtractForCurrentSource()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(isExtracting
+                                      || isThisFileExtracting
+                                      // Another file currently holds the extraction
+                                      // slot — this extract would await it, so show
+                                      // it as busy rather than letting the tap hang.
+                                      || tracker.isSlotBusyForOtherSource(file.id))
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(isExtracting
-                                  || isThisFileExtracting
-                                  // Another file currently holds the extraction
-                                  // slot — this extract would await it, so show
-                                  // it as busy rather than letting the tap hang.
-                                  || tracker.isSlotBusyForOtherSource(file.id))
                     }
                     if needsTranscription {
                         // Issue #799 PR4 (podcasts) + PR5 (YouTube): a
@@ -2035,27 +2051,64 @@ struct SourceDetailView: View {
 
     // MARK: - Shared sub-views
 
+    // MARK: - Running-job navigation (source → Activity window)
+
+    /// The queue item ID of this source's in-flight extraction job, or `nil`
+    /// when none runs. Import-time DOCX extraction runs outside the queue, so
+    /// it has no item — the Extract button keeps its busy look for that case.
+    private var runningExtractionJobItemID: QueueItem.ID? {
+        tracker.runningItemID(for: file.id, queue: .extraction)
+    }
+
+    /// Open the Extraction Queue window focused on this source's running
+    /// extraction job. Mirrors the Transcribe button's navigation (#842 PR2
+    /// C5): stage the pending selection, then open the window. When the job
+    /// finished between render and tap, the staging resolves nothing and the
+    /// window still opens — the honest degradation.
+    private func navigateToRunningExtractionJob() {
+        if let itemID = tracker.stagePendingSelectionForRunningJob(of: file.id, queue: .extraction) {
+            DebugLog.extraction("Extract button: navigating to running extraction job \(itemID) for source \(file.id.rawValue)")
+        } else {
+            DebugLog.extraction("Extract button: extraction job for source \(file.id.rawValue) not found; opening Activity window")
+        }
+        openActivityWindow?(.extraction)
+    }
+
     /// The ingest control now carries the source's ingest *state*, so status and
     /// action are one thing: a not-yet-ingested source shows a prominent
     /// call-to-action; a processed one reads as a green "Ingested" affordance
     /// (still clickable to re-ingest, behind the existing confirmation); mid-run
-    /// it shows a spinner. This replaces the separate "Ready to ingest / Processed"
-    /// status tag that used to sit in the metadata row.
+    /// it swaps IN PLACE to a "View Ingestion" affordance that opens the Agent
+    /// Queue focused on the running job — the same replacement pattern as the
+    /// Extract and Transcribe buttons (#837/#842). This replaces the separate
+    /// "Ready to ingest / Processed" status tag that used to sit in the
+    /// metadata row.
     @ViewBuilder
     private var ingestButton: some View {
         let button = Button {
-            DebugLog.ingest("SourceDetailView: Ingest tapped — id=\(file.id.rawValue)")
-            if hasBeenIngested {
-                showReingestConfirmation = true
+            // While this source's ingest job is in flight, the tap navigates
+            // to the running job in the Agent Queue window (#837/#842 "view
+            // the running job" pattern). A mid-run re-enqueue was already a
+            // no-op — the queue dedupes a source with an active item — so the
+            // tap is repurposed, not lost.
+            if tracker.stagePendingSelectionForRunningJob(of: file.id, queue: .ingestion) != nil {
+                DebugLog.ingest("Ingest button: navigating to running ingest job for source \(file.id.rawValue)")
+                openActivityWindow?(.ingestion)
             } else {
-                runIngest(file.id)
+                DebugLog.ingest("SourceDetailView: Ingest tapped — id=\(file.id.rawValue)")
+                if hasBeenIngested {
+                    showReingestConfirmation = true
+                } else {
+                    runIngest(file.id)
+                }
             }
         } label: {
+            // Mid-run, the control becomes the navigation affordance in place —
+            // the same replacement as the Extract/Transcribe swaps. The sidebar
+            // row spinner and the Activity window carry the progress signal;
+            // the button names its new action.
             if isIngesting {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("Ingesting…")
-                }
+                Label("View Ingestion", systemImage: "checkmark.seal.fill")
             } else if hasBeenIngested {
                 Label("Ingested", systemImage: "checkmark.circle.fill")
             } else {
@@ -2063,6 +2116,9 @@ struct SourceDetailView: View {
             }
         }
         .keyboardShortcut(.return, modifiers: .command)
+        .help(isIngesting
+              ? "View the running ingest job in the Agent Queue window"
+              : "Ingest this source into the wiki")
         // Don't disable during an active ingestion or extraction — the queue
         // engine serializes both (ingestion maxConcurrent=1 per provider;
         // extraction limit 1 for local pdf2md). A second tap just appends to
@@ -2096,7 +2152,12 @@ struct SourceDetailView: View {
         // Ingest is a real next step; a source that can't be ingested at all
         // (byteless with no processed markdown — e.g. a video whose transcript
         // never arrived) stays secondary and is disabled above.
-        if hasBeenIngested {
+        if isIngesting {
+            // Mid-run the control navigates — keep the prominent action
+            // styling. The green tint reads "done", which mid-run would
+            // misstate.
+            button.buttonStyle(.borderedProminent)
+        } else if hasBeenIngested {
             button.tint(.green)
         } else if !canIngest {
             button
