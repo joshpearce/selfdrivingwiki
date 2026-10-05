@@ -38,6 +38,26 @@ public enum ExtractorOperationCleanupScope: Sendable {
     case staleSessions
 }
 
+/// An operation-session directory name: `<pid>-<staging-id>`. The pid names
+/// the process that created the session. A name that does not parse belongs
+/// to no live process's session.
+struct ExtractorOperationSessionName: Equatable, Sendable {
+    let processID: Int32
+    let stagingID: ExtractorStagingID
+
+    /// Parses `<pid>-<staging-id>`. The pid must be positive. The staging id
+    /// must satisfy the staging-id rules (ASCII letters, digits, `-`, `_`).
+    /// A directory named by a process that later died keeps parsing; pid
+    /// liveness is a separate question with a separate answer per caller.
+    static func parse(_ name: String) -> ExtractorOperationSessionName? {
+        guard let separator = name.firstIndex(of: "-") else { return nil }
+        guard let processID = Int32(name[..<separator]), processID > 0 else { return nil }
+        let remainder = String(name[name.index(after: separator)...])
+        guard let stagingID = ExtractorStagingID(rawValue: remainder) else { return nil }
+        return ExtractorOperationSessionName(processID: processID, stagingID: stagingID)
+    }
+}
+
 public struct ExtractorPackageStoreLayout: Sendable {
     public let appGroupContainerRoot: URL
     public let processRole: ExtractorPackageProcessRole
@@ -464,13 +484,11 @@ public enum ExtractorDirectoryValidator {
     }
 
     private static func operationSessionIsStale(_ name: String) -> Bool {
-        guard let separator = name.firstIndex(of: "-"),
-              let processID = Int32(name[..<separator]),
-              processID > 0 else {
+        guard let session = ExtractorOperationSessionName.parse(name) else {
             return true
         }
-        if processID == getpid() { return true }
-        if kill(processID, 0) == 0 { return false }
+        if session.processID == getpid() { return true }
+        if kill(session.processID, 0) == 0 { return false }
         return errno != EPERM
     }
 
@@ -908,19 +926,32 @@ public enum ExtractorDirectoryValidator {
             throw ExtractorDirectoryAdmissionError.sourceChanged
         }
         let packages = try openOrCreateDirectory(named: "packages", in: root)
+        // Every descriptor opened below is owned by this scope until the
+        // tuple is returned: on any failure the catch closes each one
+        // exactly once; on success the caller owns all five. The failure
+        // path must not close anything itself — a close here plus a close
+        // in the catch double-closes the same descriptor, and a thread that
+        // reused the number in between loses its open file to that second
+        // close.
+        var openedDescriptors: [Int32] = [packages]
         do {
             let staging = try openOrCreateDirectory(named: "staging", in: root)
+            openedDescriptors.append(staging)
             let derived = try openOrCreateDirectory(named: "derived", in: root)
+            openedDescriptors.append(derived)
             let operations = try openOrCreateDirectory(named: "operations", in: root)
+            openedDescriptors.append(operations)
             let rootBaseline = try status(of: root)
             try verifyDirectory(root, matches: rootBaseline)
             let retainedRoot = dup(root)
             guard retainedRoot >= 0 else {
-                close(packages); close(staging); close(derived); close(operations)
                 throw ExtractorDirectoryAdmissionError.preparationFailure(errno: errno, stage: "dup root descriptor")
             }
             return (retainedRoot, packages, staging, derived, operations)
-        } catch { close(packages); throw error }
+        } catch {
+            for descriptor in openedDescriptors { close(descriptor) }
+            throw error
+        }
     }
     private static func lstat(_ u: URL) throws -> stat { var s = stat(); guard DarwinOrGlibc.lstat(u.path, &s) == 0 else { throw ExtractorDirectoryAdmissionError.copyFailed(u.lastPathComponent) }; return s }
     private static func sameMetadata(_ a: stat, _ b: stat) -> Bool {

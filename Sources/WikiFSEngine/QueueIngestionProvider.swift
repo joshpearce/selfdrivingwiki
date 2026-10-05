@@ -161,6 +161,64 @@ public enum QueueIngestionError: Error, LocalizedError {
     }
 }
 
+// MARK: - Ingestion outcome validation (#1354)
+
+/// The terminal turn-failure fact a validated run carries: no turn failure
+/// observed; one observed but a later clean turn end recovered it; or one
+/// observed and never recovered (#1364). The validator reports only what
+/// this states — it never infers a cause from the exit-status sign.
+public enum QueueIngestionTurnFailureFact: Sendable, Equatable {
+    case none
+    case recovered
+    case unrecovered
+}
+
+/// The host-agnostic launcher-outcome contract, defined ONCE for every
+/// `QueueIngestionProvider` host (app + daemon); each host keeps a thin
+/// static seam that delegates here, so its tests pin that the host actually
+/// routes through this contract.
+///
+/// Ordering: preflight first — a recorded launch failure is terminal
+/// REGARDLESS of the exit status. Then a strict nonzero-exit rejection:
+/// every successful completion path finishes with status 0, so nonzero
+/// always means an abort (user stop, safety-net teardown, spawn failure),
+/// even when no `.turnFailed` event was observed. `turnFailure` only
+/// selects the message; it never changes pass/fail.
+public enum QueueIngestionOutcomeValidator {
+    /// - Parameter turnFailure: the run's turn-failure fact (the launcher's
+    ///   `runTurnFailureFact`). A turn failure that a later clean turn end
+    ///   recovered from is not the run's terminal cause (#1364). Message
+    ///   selection only — the fact is stated by the launcher, never inferred
+    ///   from the exit-status sign (negative statuses are synthesized by the
+    ///   launcher, not observed signal deaths).
+    public static func validate(
+        exitStatus: Int32?,
+        preflightError: String?,
+        turnFailure: QueueIngestionTurnFailureFact
+    ) throws {
+        if let preflightError {
+            throw QueueIngestionError.spawnFailed(preflightError)
+        }
+        guard let exitStatus else {
+            throw QueueIngestionError.spawnFailed("The agent did not start.")
+        }
+        if exitStatus != 0 {
+            // Message selection only — every branch throws (pass/fail is
+            // decided by the exit status; #765/#1354).
+            let message: String
+            switch turnFailure {
+            case .unrecovered:
+                message = "The agent turn exceeded the time ceiling or failed unexpectedly (exit status \(exitStatus))."
+            case .recovered:
+                message = "The agent run failed after recovering from an earlier turn failure (exit status \(exitStatus))."
+            case .none:
+                message = "The agent run aborted before completing (exit status \(exitStatus))."
+            }
+            throw QueueIngestionError.spawnFailed(message)
+        }
+    }
+}
+
 // MARK: - QueueIngestionWorkerFactory
 
 /// A `QueueWorkerFactory` that creates `QueueIngestionWorker` instances.

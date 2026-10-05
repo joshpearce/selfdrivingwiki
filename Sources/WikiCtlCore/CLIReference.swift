@@ -1,4 +1,5 @@
 import Foundation
+import WikiFSCore
 
 /// Which help surface to print. `leaf` carries an `operation` only for the
 /// nested OKF operations (`wikictl page okf verify --help`).
@@ -243,19 +244,21 @@ public enum CLIReference {
                     ]),
                 CLILeaf(
                     "add",
-                    summary: "create-or-update a page; --expect-head enables CAS (exit 3 on conflict)",
-                    commandLine: "add --title X [--id Y] --body-file <path|-> [--expect-head <ver>] [--workspace W] [--author <who>] [--source <source-id[:role]> …]",
+                    summary: "create-or-update a page; --expect-head enables CAS, --create-only requires absence (exit 3 on conflict)",
+                    commandLine: "add --title X [--id Y] --body-file <path|-> [--expect-head <ver> | --create-only] [--workspace W] [--author <who>] [--source <source-id[:role]> …]",
                     options: [
                         CLIOption("--title <title>", required: true, summary: "page title; the create-or-update key"),
                         CLIOption("--id <page-id>", summary: "target an existing page by id instead of by title"),
                         CLIOption("--body-file <path|->", required: true, summary: "markdown body; `-` reads stdin — use a pipe or heredoc"),
                         CLIOption("--expect-head <ver>", summary: "CAS: fail with exit 3 if HEAD moved since your read"),
+                        CLIOption("--create-only", summary: "create-only: fail with exit 3 if the title already exists (closes the create-vs-create race); mutually exclusive with --expect-head, --id, and --workspace"),
                         CLIOption("--workspace <name>", summary: "write into workspace W instead of main"),
                         CLIOption("--author <who>", summary: "stamp created_by/last_edited_by (default: WIKI_AUTHOR env)"),
                         CLIOption("--source <source-id[:role]>", repeated: true, summary: "provenance stamp; repeatable, role defaults to primary"),
                     ],
                     details: [
                         "CAS discipline: read head_version_id first (`page get --json`, or the stderr line in text mode), pass it as --expect-head; on exit 3 re-read, reapply, and retry once.",
+                        "Create-only discipline: use --create-only when your page read found NO page under the title. Exit 3 means another writer created it since — re-read that page, reconcile against its head, and write with --expect-head. Never retry --create-only blindly.",
                         "On success the write echoes the new head_version_id on stderr, so the next CAS write needs no extra read.",
                         "--author accepts `chat:<id>`, `agent:<kind>`, or a plain name; the WIKI_AUTHOR env fills it when omitted.",
                     ],
@@ -263,6 +266,7 @@ public enum CLIReference {
                         "wikictl page add --title \"Meeting Notes\" --body-file notes.md",
                         "cat draft.md | wikictl page add --title Draft --body-file -",
                         "wikictl page add --title Draft --body-file - --expect-head 01ABC --author chat:01XYZ",
+                        "wikictl page add --title Fresh --body-file - --create-only --author agent:executor",
                     ]),
                 CLILeaf(
                     "delete", summary: "delete a page (removes bookmarks targeting it)",
@@ -317,13 +321,17 @@ public enum CLIReference {
             summary: "append dated rows to the wiki log (log.md)",
             leaves: [
                 CLILeaf(
-                    "append", summary: "append one dated row to log.md; --source stamps that file \"Processed\"",
+                    "append", summary: "append one dated row to log.md; with --kind ingest, --source also marks that file Ingested (agent runs excepted)",
                     commandLine: "append --kind ingest|query|lint --title X [--note N] [--source <file-id>]",
                     options: [
                         CLIOption("--kind <ingest|query|lint>", required: true, summary: "row kind"),
                         CLIOption("--title <title>", required: true, summary: "row title"),
                         CLIOption("--note <note>", summary: "optional extra text"),
-                        CLIOption("--source <file-id>", summary: "mark this ingested file as Processed"),
+                        CLIOption("--source <file-id>", summary: "mark this file Ingested — ONLY with --kind ingest, ONLY after a completed ingest workflow (never a plain import); refused for agent-authored runs"),
+                    ],
+                    details: [
+                        "The Ingested stamp applies only when the resolved author (the WIKI_AUTHOR env, e.g. chat:<id>) is not an agent run: a queued pipeline agent (agent:<kind>) cannot flip the stamp — the app records completion at job success (#1367). The log row is still written and the command still succeeds; a stdout note names the rule when the stamp is refused.",
+                        "Trust boundary: the gate reads the host-set WIKI_AUTHOR. A process that strips or overrides that env can still stamp — the gate covers the taught workflow, not an adversarial agent.",
                     ],
                     examples: [
                         "wikictl log append --kind ingest --title \"report.pdf\" --source 01ABC",
@@ -354,10 +362,17 @@ public enum CLIReference {
                     "add", summary: "fetch a URL or add raw file/stdin bytes; use --body-file - with a pipe or heredoc; --name is required for stdin",
                     commandLine: "add (--url URL [--allow-duplicate] | --body-file <path|-> [--name NAME])",
                     options: [
-                        CLIOption("--url <URL>", summary: "fetch a web page — exactly one of --url / --body-file"),
+                        CLIOption("--url <URL>", summary: "fetch a public web page — no credentials are sent — exactly one of --url / --body-file"),
                         CLIOption("--body-file <path|->", summary: "raw bytes from a file; `-` reads stdin — exactly one of --url / --body-file"),
                         CLIOption("--name <name>", summary: "display name; required when --body-file is -"),
                         CLIOption("--allow-duplicate", summary: "permit a URL already in the wiki (--url only)"),
+                    ],
+                    details: [
+                        "The --url fetcher sends no credentials — it is for public web pages",
+                        "only. A source behind a login or an API key (a Zotero library, any",
+                        "private-library URL) will not come back this way; run `wikictl",
+                        "extractor list` to see whether an installed acquisition package can",
+                        "fetch it instead.",
                     ],
                     examples: [
                         "wikictl source add --url https://example.com/article",
@@ -617,6 +632,48 @@ public enum CLIReference {
                     options: [CLIOption("--ttl <seconds>", summary: "age threshold in seconds (default 3600)")]),
             ]),
         CLIFamily(
+            name: "strategy",
+            summary: "read, save, or reset the per-wiki editorial strategy (CAS-protected)",
+            leaves: [
+                CLILeaf(
+                    "read", summary: "print the committed strategy + revision (or Default) — the revision feeds the next save's --expect-revision",
+                    commandLine: "read [--json]",
+                    options: [CLIOption("--json", summary: "one JSON object instead of text")],
+                    details: [
+                        "`revision: absent` means no strategy row has ever been written — pass `--expect-revision absent` to the first save. A wiki at Default after a reset KEEPS its revision (a tombstone row); pass that number, not `absent`.",
+                    ]),
+                CLILeaf(
+                    "save", summary: "compare-and-swap save of the strategy document; whitespace-only instructions reset to Default (exit 3 on conflict)",
+                    commandLine: "save [--name NAME] (--content <md> | --file <path|->) --expect-revision <n|absent> [--json]",
+                    options: [
+                        CLIOption("--name <name>", summary: "display name; trimmed, may be empty (limit \(WikiStrategy.nameCharacterLimit) characters)"),
+                        CLIOption("--content <md>", summary: "inline instructions — exactly one of --content / --file"),
+                        CLIOption("--file <path|->", summary: "instructions from a file or stdin — exactly one of --content / --file"),
+                        CLIOption("--expect-revision <n|absent>", required: true, summary: "CAS: the revision `strategy read` printed (`absent` = no row ever written); fails with exit 3 if it moved"),
+                        CLIOption("--json", summary: "machine-readable result"),
+                    ],
+                    details: [
+                        "CAS discipline: read the committed revision first (`strategy read`), pass it as --expect-revision; on exit 3 re-read, reapply, and retry once — never loop.",
+                        "Limits are enforced, never truncated: name ≤ \(WikiStrategy.nameCharacterLimit) characters after trimming; instructions ≤ \(WikiStrategy.instructionsUTF8ByteLimit) UTF-8 bytes. Oversized input fails with exit 1.",
+                        "Whitespace-only instructions reset the wiki to the Default strategy (same as `strategy reset`). A save identical to the committed strategy changes nothing and does not advance the revision.",
+                    ],
+                    examples: [
+                        "wikictl strategy read",
+                        "cat strategy.md | wikictl strategy save --name \"Research wiki\" --file - --expect-revision absent",
+                    ]),
+                CLILeaf(
+                    "reset", summary: "reset the wiki to the Default strategy, keeping the revision counter (exit 3 on conflict)",
+                    commandLine: "reset --expect-revision <n|absent> [--json]",
+                    options: [
+                        CLIOption("--expect-revision <n|absent>", required: true, summary: "CAS: the revision `strategy read` printed (`absent` = no row ever written); fails with exit 3 if it moved"),
+                        CLIOption("--json", summary: "machine-readable result"),
+                    ],
+                    details: [
+                        "Reset writes a tombstone: the strategy reads back as Default, and the revision counter stays monotonic for the next save.",
+                        "Resetting a wiki already at Default changes nothing (no revision advance, no event).",
+                    ]),
+            ]),
+        CLIFamily(
             name: "wiki",
             summary: "create, list, rename, and delete whole wikis (registry operations)",
             leaves: [
@@ -657,19 +714,48 @@ public enum CLIReference {
             ]),
         CLIFamily(
             name: "extractor",
-            summary: "sync extractor-package acquisitions into byteless sources",
+            summary: "list acquisition packages, fetch one item now, or sync a package's configured items",
             leaves: [
                 CLILeaf(
-                    "sync", summary: "create one byteless source per configured acquisition key of <package> and enqueue its extraction",
+                    "list", summary: "list installed acquisition packages — sync names, fetch templates, credential state, config sidecars",
+                    commandLine: "list [--json]",
+                    options: [CLIOption("--json", summary: "print JSON instead of text")],
+                    details: [
+                        "Answers, at runtime, which sources this machine can acquire through",
+                        "package fetchers (a Zotero library, another remote library): the name",
+                        "`extractor fetch`/`extractor sync` accept, the URL template the package",
+                        "fetches, the credential it needs and whether that credential is",
+                        "configured, and the config sidecar that names the items to sync.",
+                        "Package data is dynamic — this is where you discover it.",
+                    ]),
+                CLILeaf(
+                    "fetch", summary: "acquire ONE item now through <package>'s fetcher — full provenance, no watch-list edit",
+                    commandLine: "fetch <package> --item <key> [--force]",
+                    options: [
+                        CLIOption("--item <key>", required: true, summary: "the item key to acquire (the sidecar's key rules apply)"),
+                        CLIOption("--force", summary: "re-enqueue extraction when the item's source already exists"),
+                    ],
+                    details: [
+                        "The ad-hoc acquisition verb: creates the byteless source with fetch",
+                        "provenance and enqueues its extraction. The queue's fetch route",
+                        "downloads through the package with its credential and records the",
+                        "external identity, so the source shows its real origin. Template",
+                        "fields (e.g. libraryID) come from the package's config sidecar; the",
+                        "sidecar's item list is not consulted and never modified. Enqueued",
+                        "items drain when the app or the wikid daemon next runs its",
+                        "dispatch scan — this command only writes them.",
+                    ]),
+                CLILeaf(
+                    "sync", summary: "import the items configured in <package>'s sidecar as sources and queue their extraction",
                     commandLine: "sync <package> [--force]",
                     options: [CLIOption("--force", summary: "re-enqueue extraction for already-synced sources")],
                     details: [
                         "Reads the package's declared config sidecar from the App Group",
-                        "container (the file name comes from the package manifest) and",
-                        "checks any required credential from Keychain (presence check",
-                        "only). The enqueued extraction items drain when the app or the",
-                        "wikid daemon next runs its dispatch scan — this command only",
-                        "writes them.",
+                        "container (the file name comes from the package manifest; `extractor",
+                        "list` shows it) and checks any required credential from Keychain",
+                        "(presence check only). The enqueued extraction items drain when the",
+                        "app or the wikid daemon next runs its dispatch scan — this command",
+                        "only writes them.",
                     ]),
             ]),
         CLIFamily(

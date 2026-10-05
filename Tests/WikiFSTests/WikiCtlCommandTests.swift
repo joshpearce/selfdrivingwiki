@@ -125,7 +125,7 @@ struct WikiCtlCommandTests {
             ["--wiki", "W", "page", "add", "--title", "T", "--body-file", "-",
              "--author", "chat:01ABC"],
             env: noEnv)
-        guard case .page(.add(_, _, _, _, _, let author, _)) = inv.command else {
+        guard case .page(.add(_, _, _, _, _, _, let author, _)) = inv.command else {
             Issue.record("expected .page(.add)")
             return
         }
@@ -140,7 +140,7 @@ struct WikiCtlCommandTests {
             env: { _ in nil })
         let applied = ArgumentParser.applyEnv(
             inv.command, env: ["WIKI_AUTHOR": "chat:01DEF"])
-        guard case .page(.add(_, _, _, _, _, let author, _)) = applied else {
+        guard case .page(.add(_, _, _, _, _, _, let author, _)) = applied else {
             Issue.record("expected .page(.add)")
             return
         }
@@ -154,7 +154,7 @@ struct WikiCtlCommandTests {
             env: { _ in nil })
         let applied = ArgumentParser.applyEnv(
             inv.command, env: ["WIKI_AUTHOR": "chat:01DEF"])
-        guard case .page(.add(_, _, _, _, _, let author, _)) = applied else {
+        guard case .page(.add(_, _, _, _, _, _, let author, _)) = applied else {
             Issue.record("expected .page(.add)")
             return
         }
@@ -166,8 +166,37 @@ struct WikiCtlCommandTests {
             ["--wiki", "W", "page", "add", "--title", "T", "--body-file", "-"],
             env: { _ in nil })
         let applied = ArgumentParser.applyEnv(inv.command, env: [:])
-        guard case .page(.add(_, _, _, _, _, let author, _)) = applied else {
+        guard case .page(.add(_, _, _, _, _, _, let author, _)) = applied else {
             Issue.record("expected .page(.add)")
+            return
+        }
+        #expect(author == nil)
+    }
+
+    /// #1367: `log append` takes no `--author` flag, so `WIKI_AUTHOR` is the
+    /// author's only source — `applyEnv` routes it onto the command so the
+    /// stamp gate in `LogIndexCommand` can tell an agent-authored run from
+    /// the ad-hoc chat/shell path.
+    @Test func wikiAuthorEnvRoutesOntoLogAppend() throws {
+        let inv = try ArgumentParser.parse(
+            ["--wiki", "W", "log", "append", "--kind", "ingest", "--title", "T"],
+            env: { _ in nil })
+        let applied = ArgumentParser.applyEnv(
+            inv.command, env: ["WIKI_AUTHOR": "agent:ingest"])
+        guard case .logAppend(_, _, _, _, let author) = applied else {
+            Issue.record("expected .logAppend")
+            return
+        }
+        #expect(author == "agent:ingest")
+    }
+
+    @Test func wikiAuthorEnvLeavesLogAppendAloneWhenAbsent() throws {
+        let inv = try ArgumentParser.parse(
+            ["--wiki", "W", "log", "append", "--kind", "ingest", "--title", "T"],
+            env: { _ in nil })
+        let applied = ArgumentParser.applyEnv(inv.command, env: [:])
+        guard case .logAppend(_, _, _, _, let author) = applied else {
+            Issue.record("expected .logAppend")
             return
         }
         #expect(author == nil)
@@ -1400,7 +1429,7 @@ struct WikiCtlCommandTests {
             externalIdentity: "https://example.com/article")
         let summary = try store.addSource(
             filename: "Article.md", data: Data("# Article".utf8),
-            zoteroItemKey: nil, zoteroItemTitle: nil, mimeType: nil,
+            externalItemKey: nil, externalItemTitle: nil, mimeType: nil,
             provenance: prov)
 
         let byID = try SourceCommand.run(.info(.id(summary.id)), in: store, cwd: "/tmp")
@@ -1457,7 +1486,7 @@ struct WikiCtlCommandTests {
         let source = try await provider.materialize()
         let summary = try store.addSource(
             filename: source.filename, data: source.data,
-            zoteroItemKey: nil, zoteroItemTitle: nil, mimeType: nil,
+            externalItemKey: nil, externalItemTitle: nil, mimeType: nil,
             provenance: source.provenance)
         let historyBefore = try store.contentVersionHistory(sourceID: summary.id).count
 

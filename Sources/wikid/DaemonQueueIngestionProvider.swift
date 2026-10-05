@@ -100,7 +100,7 @@ final class DaemonQueueIngestionProvider: QueueIngestionProvider {
 
         let launcher = try await makeLauncher(wikiID: wikiID)
 
-        let stateMarkdown = daemonStateMarkdown(from: store)
+        let stateMarkdown = try daemonStateMarkdown(from: store)
 
         var sources: [OperationRequest.StagedSource] = []
         var stagingOutcomes: [(id: SourceID, outcome: QueueIngestionReporting.StagingOutcome)] = []
@@ -178,6 +178,25 @@ final class DaemonQueueIngestionProvider: QueueIngestionProvider {
         // running phase with the job lifecycle carrying the failure — the
         // report never claims a completion that validate rejected.
         try validateLauncherResults(results)
+        // #1344: the validated-successful run is the authoritative completion
+        // fact for the sources this job staged — stamp them Ingested now.
+        // Report truth rules are separate: report targets still stay
+        // `.submitted` below (per-source completion is never inferred from
+        // agent exit there). Stamp failures are logged and never throw: the
+        // agent work succeeded and the item must still complete.
+        let stampIDs = QueueIngestionReporting.stampableSourceIDs(requested: stagingOutcomes)
+        for id in stampIDs {
+            do {
+                try store.markSourceIngested(id: id)
+            } catch {
+                DebugLog.store("DaemonQueueIngestionProvider.markSourceIngested[\(id.rawValue)] failed: \(error)")
+            }
+        }
+        // The `onUnlock` Darwin notification fired before the stamps; post
+        // once more so attached apps reload the new Ingested state.
+        if !stampIDs.isEmpty {
+            DarwinNotifier.postChange(forWikiID: wikiID.rawValue)
+        }
         // Snapshot the actual post-run citation evidence into the durable job.
         // A snapshot read failure is logged but does not rewrite the successful
         // agent outcome; nil remains distinguishable from a recorded empty set.
@@ -219,7 +238,7 @@ final class DaemonQueueIngestionProvider: QueueIngestionProvider {
 
         DebugLog.ingest("DaemonQueueIngestionProvider.runLint: begin wikiID=\(wikiID.rawValue)")
 
-        let stateMarkdown = daemonStateMarkdown(from: store)
+        let stateMarkdown = try daemonStateMarkdown(from: store)
         let selectedProvider = resolveSelectedProvider()
         let providerLabel = selectedProvider.label
         onReport?(QueueIngestionReporting.launchMutation(providerID: selectedProvider.id))
@@ -276,7 +295,7 @@ final class DaemonQueueIngestionProvider: QueueIngestionProvider {
             requested: pageIDs))
 
         let combinedTitle = pages.map(\.title).joined(separator: ", ")
-        let stateMarkdown = daemonStateMarkdown(from: store)
+        let stateMarkdown = try daemonStateMarkdown(from: store)
         let selectedProvider = resolveSelectedProvider()
         let providerLabel = selectedProvider.label
         onReport?(QueueIngestionReporting.launchMutation(providerID: selectedProvider.id))
@@ -309,7 +328,23 @@ final class DaemonQueueIngestionProvider: QueueIngestionProvider {
 
     private func makeLauncher(wikiID: WikiID) async throws -> AgentLauncher {
         let factory = try await launcherFactoryResolver(wikiID)
-        return await MainActor.run { factory(wikiID: wikiID).launcher }
+        return await MainActor.run {
+            let launcher = factory(wikiID: wikiID).launcher
+            // Wiki strategies phase 4: the shared production LauncherFactory
+            // already wires the store-backed plan-validation resolver; this
+            // backstop guarantees the daemon ingest path resolves titles
+            // through the daemon's own store for THIS wiki even when a test
+            // substitutes the factory. Idempotent with the factory wiring
+            // (both use `resolveTitleToID`). An unresolvable store leaves the
+            // seam as the factory set it — validation never silently selects
+            // a winner.
+            if let store = storeResolver(wikiID) {
+                launcher.planValidationResolveTitle = { title in
+                    try store.resolveTitleToID(title)
+                }
+            }
+            return launcher
+        }
     }
 
     private struct LauncherResults {
@@ -317,7 +352,11 @@ final class DaemonQueueIngestionProvider: QueueIngestionProvider {
         let logURL: URL?
         let debugURL: URL?
         let exitStatus: Int32?
-        let hadTurnFailure: Bool
+        /// #1364: the launcher's stated turn-failure fact
+        /// (`runTurnFailureFact`) — no failure, one recovered by a later
+        /// clean turn end, or one never recovered. NOT the sticky
+        /// `runHadTurnFailure`.
+        let turnFailure: QueueIngestionTurnFailureFact
         let preflightError: String?
     }
 
@@ -328,19 +367,31 @@ final class DaemonQueueIngestionProvider: QueueIngestionProvider {
                 logURL: launcher.logFileURL,
                 debugURL: launcher.debugFolderURL,
                 exitStatus: launcher.exitStatus,
-                hadTurnFailure: launcher.runHadTurnFailure,
+                turnFailure: launcher.runTurnFailureFact,
                 preflightError: launcher.preflightError)
         }
     }
 
     private func validateLauncherResults(_ results: LauncherResults) throws {
-        if let preflightError = results.preflightError {
-            throw QueueIngestionError.spawnFailed(preflightError)
-        }
-        if let status = results.exitStatus, status != 0, results.hadTurnFailure {
-            throw QueueIngestionError.spawnFailed(
-                "The agent turn exceeded the time ceiling or failed unexpectedly (exit status \(status)).")
-        }
+        try Self.validateLauncherOutcome(
+            exitStatus: results.exitStatus,
+            preflightError: results.preflightError,
+            turnFailure: results.turnFailure)
+    }
+
+    /// The daemon host's seam over the shared #1354 contract
+    /// (`QueueIngestionOutcomeValidator`). Static + internal so tests pin
+    /// that THIS host routes through the contract without standing up the
+    /// full provider.
+    static func validateLauncherOutcome(
+        exitStatus: Int32?,
+        preflightError: String?,
+        turnFailure: QueueIngestionTurnFailureFact
+    ) throws {
+        try QueueIngestionOutcomeValidator.validate(
+            exitStatus: exitStatus,
+            preflightError: preflightError,
+            turnFailure: turnFailure)
     }
 
     private func runLintAgent(
@@ -373,8 +424,8 @@ final class DaemonQueueIngestionProvider: QueueIngestionProvider {
         await launcher.awaitProviderRelease()
     }
 
-    private func daemonStateMarkdown(from store: GRDBWikiStore) -> String {
-        DaemonWikiState.stateMarkdown(from: store)
+    private func daemonStateMarkdown(from store: GRDBWikiStore) throws -> String {
+        try DaemonWikiState.stateMarkdown(from: store)
     }
 
     private func ingestSourcePath(for source: SourceSummary) -> String {

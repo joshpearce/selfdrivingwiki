@@ -161,7 +161,16 @@ final class AppQueueIngestionProvider: QueueIngestionProvider {
         // Stage sources — reuse already-extracted markdown for PDFs (the
         // extraction item ran before this ingestion item in the chained path,
         // or the user ran "Extract Markdown" manually).
-        let stateMarkdown = store.currentStateSnapshot().renderStateFile()
+        // A strategy read failure must not launch a run under invented Default
+        // instructions — fail the item instead. `beginIngest` above is paired
+        // with `endIngest` before rethrowing so the edit lock is not left held.
+        let stateMarkdown: String
+        do {
+            stateMarkdown = try store.currentStateSnapshot().renderStateFile()
+        } catch {
+            store.endIngest()
+            throw error
+        }
         var sources: [OperationRequest.StagedSource] = []
         var stagingOutcomes: [(id: SourceID, outcome: QueueIngestionReporting.StagingOutcome)] = []
         stagingOutcomes.reserveCapacity(sourceIDs.count)
@@ -311,7 +320,12 @@ final class AppQueueIngestionProvider: QueueIngestionProvider {
         try Self.validateLauncherOutcome(
             exitStatus: launcher.exitStatus,
             preflightError: launcher.preflightError,
-            runHadTurnFailure: launcher.runHadTurnFailure)
+            turnFailure: launcher.runTurnFailureFact)
+        // #1344: the validated-successful run is the authoritative completion
+        // fact for the sources this job staged. Report truth rules are
+        // separate: report targets still stay `.submitted` (per-source
+        // completion is never inferred from agent exit there).
+        Self.stampIngestedSources(requested: stagingOutcomes, store: store)
         // Snapshot the actual post-run citation evidence. Workspace merging
         // has already completed (or logged its best-effort failure) before
         // `runAgent` returns, so this records only pages visible afterward.
@@ -361,6 +375,10 @@ final class AppQueueIngestionProvider: QueueIngestionProvider {
 
         DebugLog.ingest("AppQueueIngestionProvider.runLint: begin wikiID=\(wikiID)")
 
+        // Capture the state before the running reports: a strategy read
+        // failure fails the item without ever reporting a launch.
+        let stateMarkdown = try store.currentStateSnapshot().renderStateFile()
+
         // The ACTUAL selected provider at launch — never the scheduler's
         // capacity bucket (`default-ingest`).
         let selectedProvider = resolveSelectedProvider()
@@ -368,7 +386,7 @@ final class AppQueueIngestionProvider: QueueIngestionProvider {
         onReport?(QueueIngestionReporting.runningMutation())
 
         await runLintAgent(
-            request: .lint(stateMarkdown: store.currentStateSnapshot().renderStateFile()),
+            request: .lint(stateMarkdown: stateMarkdown),
             launcher: launcher,
             store: store,
             wikiID: wikiID,
@@ -384,7 +402,7 @@ final class AppQueueIngestionProvider: QueueIngestionProvider {
         try Self.validateLauncherOutcome(
             exitStatus: launcher.exitStatus,
             preflightError: launcher.preflightError,
-            runHadTurnFailure: launcher.runHadTurnFailure)
+            turnFailure: launcher.runTurnFailureFact)
         // Whole-wiki scope stays a marker; agent completion carries NO typed
         // page findings — availability is notReported, never zero.
         onReport?(QueueIngestionReporting.agentCompletionMutation(
@@ -431,6 +449,10 @@ final class AppQueueIngestionProvider: QueueIngestionProvider {
             resolved: pages,
             requested: pageIDs))
 
+        // Capture the state before the running reports: a strategy read
+        // failure fails the item without ever reporting a launch.
+        let stateMarkdown = try store.currentStateSnapshot().renderStateFile()
+
         // The ACTUAL selected provider at launch — never the scheduler's
         // capacity bucket (`default-ingest`).
         let selectedProvider = resolveSelectedProvider()
@@ -453,7 +475,7 @@ final class AppQueueIngestionProvider: QueueIngestionProvider {
             request: .lintPage(
                 pageTitle: combinedTitle,
                 brokenLinks: combinedBroken,
-                stateMarkdown: store.currentStateSnapshot().renderStateFile()),
+                stateMarkdown: stateMarkdown),
             launcher: launcher,
             store: store,
             wikiID: wikiID,
@@ -469,7 +491,7 @@ final class AppQueueIngestionProvider: QueueIngestionProvider {
         try Self.validateLauncherOutcome(
             exitStatus: launcher.exitStatus,
             preflightError: launcher.preflightError,
-            runHadTurnFailure: launcher.runHadTurnFailure)
+            turnFailure: launcher.runTurnFailureFact)
         // No typed page findings/checked-page callback exists — completion
         // availability stays notReported (never zero findings).
         onReport?(QueueIngestionReporting.agentCompletionMutation(
@@ -477,18 +499,37 @@ final class AppQueueIngestionProvider: QueueIngestionProvider {
             usage: launcher.runTotalUsage))
     }
 
+    /// The app host's seam over the shared #1354 contract
+    /// (`QueueIngestionOutcomeValidator`): preflight first — a recorded
+    /// launch failure is terminal regardless of the exit status — then a
+    /// strict nonzero-exit rejection. Kept as a host-level static so tests
+    /// pin that THIS host routes through the contract. `turnFailure` is the
+    /// launcher's stated turn-failure fact (#1364, `runTurnFailureFact`):
+    /// no failure, one recovered by a later clean turn end, or one never
+    /// recovered.
     static func validateLauncherOutcome(
         exitStatus: Int32?,
         preflightError: String?,
-        runHadTurnFailure: Bool
+        turnFailure: QueueIngestionTurnFailureFact
     ) throws {
-        guard let exitStatus else {
-            throw QueueIngestionError.spawnFailed(
-                preflightError ?? "The agent did not start.")
-        }
-        if exitStatus != 0, runHadTurnFailure {
-            throw QueueIngestionError.spawnFailed(
-                "The agent turn exceeded the time ceiling or failed unexpectedly (exit status \(exitStatus)).")
+        try QueueIngestionOutcomeValidator.validate(
+            exitStatus: exitStatus,
+            preflightError: preflightError,
+            turnFailure: turnFailure)
+    }
+
+    /// #1344: stamp the staged sources Ingested after a validated-successful
+    /// run. Derives the stamp list from the shared helper so the daemon and
+    /// app hosts stamp identical facts from identical code. Stamp failures
+    /// are logged (in `WikiStoreModel.markSourceIngested`) and never throw —
+    /// the agent work succeeded and the item must still complete; an
+    /// unstamped source stays visibly unmarked, which is honest.
+    static func stampIngestedSources(
+        requested: [(id: SourceID, outcome: QueueIngestionReporting.StagingOutcome)],
+        store: WikiStoreModel
+    ) {
+        for id in QueueIngestionReporting.stampableSourceIDs(requested: requested) {
+            store.markSourceIngested(id: id)
         }
     }
 

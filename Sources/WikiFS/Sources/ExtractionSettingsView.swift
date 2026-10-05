@@ -385,7 +385,7 @@ enum ExtractorRouteRecoveryPresenter {
             category: category,
             failureMessage: safeFailureMessage(
                 failure?.message
-                    ?? facts.connectionFailureMessage
+                    ?? (isDocling ? facts.connectionFailureMessage : nil)
                     ?? status.setupFailureMessage),
             acpProviderID: row.savedSelection == ExtractorRouteHostCatalog.acpReference ? facts.acpProviderID : nil,
             doclingEndpointOrigin: isDocling ? ExtractorRouteDiagnosticReport.endpointOrigin(facts.doclingEndpoint) : nil,
@@ -495,11 +495,16 @@ struct ExtractionSettingsView: View {
     let retryActivation: (@Sendable () async -> Void)?
     /// Injectable clipboard boundary for hosted tests.
     let copyDiagnostics: @MainActor (String) -> Bool
+    /// The package role this instance presents (Extraction vs Fetch tab).
+    /// Presentation only — see `ExtractionSettingsRoleFocus`.
+    private let roleFocus: ExtractionSettingsRoleFocus
 
     // Route table rows built from the PR 2 projection: host descriptors, the
     // package model's registration snapshots, and saved selections. Rebuilt
     // after config writes and package-snapshot refreshes.
     @State private var routeRows: [ExtractorRouteSettingsRow] = []
+    @State private var fetcherRows: [ExtractorRouteTableBuilder.FetcherRouteSettingsRow] = []
+    @State private var fetcherSelections: [String: ExtractionBackendReference] = [:]
     /// One route-scoped, typed selection per table row (`row.id`). The picker
     /// binding writes through `ExtractorRouteSettingsMapping`, which persists
     /// the generic route record.
@@ -562,12 +567,14 @@ struct ExtractionSettingsView: View {
         removePackage: (@Sendable (ExtractorPackageRevisionID) async -> ExtractorPackageMutationOutcome)? = nil,
         /// The pane Settings opens on. The default is `.packages`; hosted
         /// tests pass `.defaults` to mount that pane directly.
-        initialPane: ExtractionSettingsPane = .packages
+        initialPane: ExtractionSettingsPane = .packages,
+        roleFocus: ExtractionSettingsRoleFocus = .extractors
     ) {
         _selectedPane = State(initialValue: initialPane)
         self.containerDirectory = containerDirectory
         self.launcher = launcher
         self.credentials = credentials ?? KeychainCredentialService()
+        self.roleFocus = roleFocus
         // Default action: host-owned privileged resolution (see
         // HostCredentialActions) — the view itself never resolves a value.
         self.verifyDoclingConnection = verifyDoclingConnection
@@ -591,7 +598,14 @@ struct ExtractionSettingsView: View {
         _packageModel = State(initialValue: ExtractorPackageSettingsModel(
             loadSnapshot: packageSnapshot,
             importPackage: importPackage,
-            removePackage: removePackage))
+            removePackage: removePackage,
+            roleFocus: roleFocus))
+    }
+
+    /// The per-focus presentation surface (complete literals; see
+    /// `FocusPresentation`).
+    private var focus: FocusPresentation {
+        roleFocus == .fetchers ? .fetchers : .extractors
     }
 
     var body: some View {
@@ -602,7 +616,7 @@ struct ExtractionSettingsView: View {
             // is the workflow this tab exists for, and defaults pick from what
             // packages provide.
             if packageSnapshot != nil {
-                Picker("Extraction settings section", selection: $selectedPane) {
+                Picker(focus.panePickerLabel, selection: $selectedPane) {
                     ForEach(ExtractionSettingsPane.allCases) { pane in
                         Text(pane.title).tag(pane)
                     }
@@ -611,8 +625,8 @@ struct ExtractionSettingsView: View {
                 .labelsHidden()
                 .frame(maxWidth: Metrics.paneSwitcherWidth)
                 .padding(.top, Metrics.paneSwitcherTopPadding)
-                .accessibilityIdentifier(PaneAccessibility.switcher)
-                .accessibilityLabel("Extraction settings section")
+                .accessibilityIdentifier(focus.paneSwitcherId)
+                .accessibilityLabel(focus.panePickerLabel)
             }
 
             switch selectedPane {
@@ -686,7 +700,7 @@ struct ExtractionSettingsView: View {
             })
         .onChange(of: showingImportPicker) { _, isPresented in
             guard isPresented else { return }
-            let panel = ExtractorSettingsPackagePicker.makePanel()
+            let panel = ExtractorSettingsPackagePicker.makePanel(title: focus.importPanelTitle)
             panel.begin { response in
                 showingImportPicker = false
                 guard response == .OK else { return }
@@ -725,16 +739,23 @@ struct ExtractionSettingsView: View {
 
     // MARK: - Panes
 
-    /// What opens each document type. The pane a user comes here for, so it
-    /// opens first.
+    /// What opens each document type (extractors focus) or acquires each
+    /// byteless source route (fetchers focus). The pane a user comes here
+    /// for, so it opens first.
     private var defaultsPane: some View {
         Form {
             Section {
-                extractorRouteTable
+                if roleFocus == .fetchers {
+                    fetcherRouteTable
+                } else {
+                    extractorRouteTable
+                }
             } header: {
-                Text("Default Extractors")
+                Text(focus.routesHeader)
             } footer: {
-                Text("Reviewed packages run outside the app through the extractor protocol. Installed packages are local additions. Connected services use host-managed providers. Podcast feed transcripts run through the reviewed podcast-transcript package.")
+                Text(roleFocus == .fetchers
+                    ? "Fetcher packages acquire one remote source per request and report either source bytes or finished Markdown. Choose which fetcher acquires each byteless source route."
+                    : "Reviewed packages run outside the app through the extractor protocol. Installed packages are local additions. Connected services use host-managed providers. Podcast feed transcripts run through the reviewed podcast-transcript package.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -762,13 +783,17 @@ struct ExtractionSettingsView: View {
         .formStyle(.grouped)
     }
 
-    /// Whether the ACP provider picker has anything to configure: at least one
-    /// route currently defaults to the ACP connected service.
+    /// The ACP provider picker has anything to configure: at least one
+    /// route currently defaults to the ACP connected service. The Fetch tab
+    /// never shows it — ACP is an extractor-scope choice, and its rows do
+    /// not exist under the fetchers focus even though `routeSelections`
+    /// is populated for both foci.
     private var showsACPProviderPicker: Bool {
-        routeSelections.values.contains { selection in
-            if case .connectedService(.acp) = selection { return true }
-            return false
-        }
+        roleFocus == .extractors
+            && routeSelections.values.contains { selection in
+                if case .connectedService(.acp) = selection { return true }
+                return false
+            }
     }
 
     /// The enabled ACP providers for the contextual picker. Same cache
@@ -793,7 +818,8 @@ struct ExtractionSettingsView: View {
     /// route (Format) and a pop-up of compatible choices (Default extractor).
     /// Status presents beside the package name in the Packages table. The
     /// fixed height keeps the Settings window bounded — the table scrolls
-    /// internally when registrations add routes.
+    /// internally when registrations add routes. Extractor rows only: the
+    /// fetchers focus renders `fetcherRouteTable` instead.
     private var extractorRouteTable: some View {
         Table(defaultsRows) {
             TableColumn("Format") { (row: ExtractionDefaultsTableRow) in
@@ -818,8 +844,84 @@ struct ExtractionSettingsView: View {
         .frame(height: SettingsTableMetrics.height(
             forRowCount: defaultsRows.count,
             rowHeight: SettingsTableMetrics.controlRowHeight))
-        .accessibilityIdentifier(RouteAccessibility.table)
-        .accessibilityLabel("Default extractor routes")
+        .accessibilityIdentifier(focus.routesTableId)
+        .accessibilityLabel(focus.routesTableLabel)
+    }
+
+    /// The fetchers-focus route table: one row per claimed byteless source
+    /// route (the synthetic input MIME) and a pop-up of compatible fetchers.
+    /// Mirrors the extractor table's metrics exactly — the Fetch tab is a
+    /// second instance of the proven layout, not a new visual language.
+    private var fetcherRouteTable: some View {
+        Table(fetcherRows) {
+            TableColumn("Route") { (row: ExtractorRouteTableBuilder.FetcherRouteSettingsRow) in
+                Label(row.route.mimeType.rawValue, systemImage: "arrow.down.circle")
+                    .help("Fetcher route for MIME type \(row.route.mimeType.rawValue)")
+            }
+            .width(min: 110, ideal: 160)
+            TableColumn("Default fetcher") { (row: ExtractorRouteTableBuilder.FetcherRouteSettingsRow) in
+                fetcherPicker(row)
+            }
+            .width(Metrics.defaultExtractorColumnWidth)
+        }
+        // Every cell in this table holds a pop-up, so its rows are taller
+        // than the package table's text rows.
+        .frame(height: SettingsTableMetrics.height(
+            forRowCount: fetcherRows.count,
+            rowHeight: SettingsTableMetrics.controlRowHeight))
+        .accessibilityIdentifier(focus.routesTableId)
+        .accessibilityLabel(focus.routesTableLabel)
+    }
+
+    /// A fetcher route's pop-up. The value shows the effective selection
+    /// (saved record first, then the bundled default); writing persists the
+    /// typed fetcher route record.
+    private func fetcherPicker(_ row: ExtractorRouteTableBuilder.FetcherRouteSettingsRow) -> some View {
+        Picker(selection: fetcherSelectionBinding(row)) {
+            ForEach(row.choices) { choice in
+                Text(choice.displayName).tag(choice.reference)
+            }
+        } label: {
+            EmptyView()
+        }
+        .labelsHidden()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .flexibleButtonSizing()
+        .accessibilityIdentifier("\(focus.routesPickerPrefix).fetch-\(row.route.mimeType.rawValue.replacing("/", with: "-"))")
+        .accessibilityLabel("Default fetcher for \(row.route.mimeType.rawValue)")
+        .accessibilityValue(row.resolvedSelection.map(fetcherSelectionLabel) ?? "None")
+    }
+
+    private func fetcherSelectionBinding(
+        _ row: ExtractorRouteTableBuilder.FetcherRouteSettingsRow
+    ) -> Binding<ExtractionBackendReference> {
+        Binding(
+            get: {
+                fetcherSelections[row.id]
+                    ?? row.resolvedSelection
+                    ?? ExtractionBackendReference.none
+            },
+            set: { writeFetcherSelection($0, for: row) })
+    }
+
+    private func fetcherSelectionLabel(_ reference: ExtractionBackendReference) -> String {
+        switch reference {
+        case .none: "Disabled"
+        case .host(let host): host.adapterID.rawValue
+        case .installed(let logical): "\(logical.packageID.rawValue)/\(logical.registrationID.rawValue)"
+        }
+    }
+
+    private func writeFetcherSelection(
+        _ selection: ExtractionBackendReference,
+        for row: ExtractorRouteTableBuilder.FetcherRouteSettingsRow
+    ) {
+        var config = ExtractionConfig.load(from: containerDirectory)
+        let value: ExtractionBackendReference? =
+            selection == .none ? .none : selection
+        config.setFetcherSelection(value, for: row.route)
+        DebugLog.trying("save extraction config", operation: { try config.save(to: containerDirectory) })
+        rebuildRouteRows()
     }
 
     /// The connected-service and package credential sheets. Both panes can
@@ -864,6 +966,9 @@ struct ExtractionSettingsView: View {
     /// routes. The Apple Podcasts transcript route is a standard package
     /// route row (resolved through the reviewed apple-podcast-transcript
     /// package); the former bespoke Apple TTML backend row is gone.
+    /// Every default the extractor table shows: the registration-driven
+    /// extraction routes. (The fetchers focus renders `fetcherRouteTable`
+    /// directly from `fetcherRows`, not through this mixed enum.)
     private var defaultsRows: [ExtractionDefaultsTableRow] {
         routeRows.map(ExtractionDefaultsTableRow.route)
     }
@@ -1043,6 +1148,17 @@ struct ExtractionSettingsView: View {
                 route: row.route, config: config, row: row)
         }
         routeSelections = selections
+        fetcherRows = ExtractorRouteTableBuilder.buildFetcherRows(.init(
+            configuration: config,
+            registrations: packageModel.snapshot.registrationSnapshots,
+            availableRegistrations: packageModel.snapshot.routeChoiceRegistrationSnapshots,
+            installedRevisionIDs: Set(packageModel.snapshot.rows.map(\.revision)),
+            waitingRevisionIDs: packageModel.snapshot.waitingRevisionIDs))
+        var fetcherSelections: [String: ExtractionBackendReference] = [:]
+        for row in fetcherRows {
+            fetcherSelections[row.id] = row.resolvedSelection
+        }
+        self.fetcherSelections = fetcherSelections
     }
 
     /// Persists one route picker change: the mapping keeps the legacy
@@ -1059,6 +1175,100 @@ struct ExtractionSettingsView: View {
     /// the separator flattened ("pdf-application-pdf", "html-text-html").
     static func accessibilityKey(_ route: ExtractorRouteID) -> String {
         "\(route.kind.rawValue)-\(route.mimeType.rawValue.replacing("/", with: "-"))"
+    }
+
+    /// Per-focus presentation: COMPLETE string literals and accessibility ids,
+    /// one constant per focus. Never noun interpolation — the source-contract
+    /// tests pin the extractor arm's literals byte-for-byte, and this table keeps
+    /// them (single-sourced from the existing accessibility enums) while the
+    /// fetch arm gets its own full literals.
+    @MainActor
+    private struct FocusPresentation {
+        // Pane switcher.
+        let paneSwitcherId: String
+        let panePickerLabel: String
+        // Defaults (routes) pane.
+        let routesHeader: String
+        let routesTableId: String
+        let routesTableLabel: String
+        let routesPickerPrefix: String
+        // Packages pane: header, table, and lifecycle controls.
+        let packagesHeader: String
+        let packagesTableId: String
+        let packagesTableLabel: String
+        let packagesEmptyMessage: String
+        let packagesRefreshLabel: String
+        let packagesRefreshId: String
+        let packagesEmptyId: String
+        let packagesRowPrefix: String
+        let packagesStatusPrefix: String
+        let packagesDigestPrefix: String
+        let packagesRegistrationPrefix: String
+        let packagesImportButtonId: String
+        let packagesConfigurePrefix: String
+        let packagesRemoveButtonId: String
+        let packagesProgressId: String
+        let packagesDiagnosticId: String
+        let packagesErrorId: String
+        let removeSelectedLabel: String
+        let removeReviewedHelp: String
+        let importPanelTitle: String
+
+        static let extractors = FocusPresentation(
+            paneSwitcherId: PaneAccessibility.switcher,
+            panePickerLabel: "Extraction settings section",
+            routesHeader: "Default Extractors",
+            routesTableId: RouteAccessibility.table,
+            routesTableLabel: "Default extractor routes",
+            routesPickerPrefix: RouteAccessibility.pickerPrefix,
+            packagesHeader: "Installed Extractor Packages",
+            packagesTableId: PackageAccessibility.table,
+            packagesTableLabel: "Installed extractor packages",
+            packagesEmptyMessage: "No extractor packages are installed on this Mac.",
+            packagesRefreshLabel: "Refresh installed extractor packages",
+            packagesRefreshId: PackageAccessibility.refreshButton,
+            packagesEmptyId: PackageAccessibility.emptyState,
+            packagesRowPrefix: PackageAccessibility.rowPrefix,
+            packagesStatusPrefix: PackageAccessibility.statusPrefix,
+            packagesDigestPrefix: PackageAccessibility.digestPrefix,
+            packagesRegistrationPrefix: PackageAccessibility.registrationPrefix,
+            packagesImportButtonId: PackageAccessibility.importButton,
+            packagesConfigurePrefix: PackageAccessibility.configurePrefix,
+            packagesRemoveButtonId: PackageAccessibility.removeButton,
+            packagesProgressId: PackageAccessibility.progress,
+            packagesDiagnosticId: PackageAccessibility.diagnostic,
+            packagesErrorId: PackageAccessibility.error,
+            removeSelectedLabel: "Remove the selected extractor package",
+            removeReviewedHelp: "Reviewed packages are bundled with the app and cannot be removed. To turn one off, set its route to no default under Default Extractors.",
+            importPanelTitle: ExtractorSettingsPackagePicker.importButtonTitle)
+
+        static let fetchers = FocusPresentation(
+            paneSwitcherId: "fetch.pane.switcher",
+            panePickerLabel: "Fetch settings section",
+            routesHeader: "Default Fetchers",
+            routesTableId: "fetch.routes.table",
+            routesTableLabel: "Default fetcher routes",
+            routesPickerPrefix: "fetch.routes.picker",
+            packagesHeader: "Installed Fetcher Packages",
+            packagesTableId: "fetch.packages.table",
+            packagesTableLabel: "Installed fetcher packages",
+            packagesEmptyMessage: "No fetcher packages are installed on this Mac.",
+            packagesRefreshLabel: "Refresh installed fetcher packages",
+            packagesRefreshId: "fetch.packages.refresh",
+            packagesEmptyId: "fetch.packages.empty",
+            packagesRowPrefix: "fetch.packages.row",
+            packagesStatusPrefix: "fetch.packages.status",
+            packagesDigestPrefix: "fetch.packages.digest",
+            packagesRegistrationPrefix: "fetch.packages.registration",
+            packagesImportButtonId: "fetch.packages.import.button",
+            packagesConfigurePrefix: "fetch.packages.configure",
+            packagesRemoveButtonId: "fetch.packages.remove",
+            packagesProgressId: "fetch.packages.progress",
+            packagesDiagnosticId: "fetch.packages.diagnostic",
+            packagesErrorId: "fetch.packages.error",
+            removeSelectedLabel: "Remove the selected fetcher package",
+            removeReviewedHelp: "Reviewed packages are bundled with the app and cannot be removed. To turn one off, set its route to no default under Default Fetchers.",
+            importPanelTitle: "Import Fetch Package…")
     }
 
     private enum PaneAccessibility {
@@ -1367,7 +1577,7 @@ struct ExtractionSettingsView: View {
             packageTable
         } header: {
             HStack {
-                Text("Installed Extractor Packages")
+                Text(focus.packagesHeader)
                 Spacer()
                 ExtractorPackageHelpControl(isPresented: $showingPackageHelp)
                     .buttonStyle(.borderless)
@@ -1406,7 +1616,11 @@ struct ExtractionSettingsView: View {
                 }
                 .width(min: 60, ideal: 70)
                 TableColumn("Handles") { (row: ExtractorPackageTableRow) in
-                    Text(row.kind.map(kindDisplayName) ?? "—")
+                    // Fetcher rows state their role instead of a kind — a
+                    // fetcher has no ExtractorKind.
+                    Text(row.role == .fetcher
+                        ? "Fetch"
+                        : row.kind.map(kindDisplayName) ?? "—")
                         .foregroundStyle(.secondary)
                 }
                 .width(min: 80, ideal: 100)
@@ -1422,7 +1636,7 @@ struct ExtractionSettingsView: View {
                         .controlSize(.small)
                         .disabled(packageModel.isBusy)
                         .frame(maxWidth: .infinity, alignment: .center)
-                        .accessibilityIdentifier("\(PackageAccessibility.configurePrefix).\(row.id)")
+                        .accessibilityIdentifier("\(focus.packagesConfigurePrefix).\(row.id)")
                         .accessibilityLabel("Configure \(row.packageID), version \(row.version)")
                     }
                 }
@@ -1430,19 +1644,19 @@ struct ExtractionSettingsView: View {
             }
             .frame(height: SettingsTableMetrics.unconstrainedHeight(
                 forRowCount: packageModel.tableRows.count))
-            .accessibilityIdentifier(PackageAccessibility.table)
-            .accessibilityLabel("Installed extractor packages")
+            .accessibilityIdentifier(focus.packagesTableId)
+            .accessibilityLabel(focus.packagesTableLabel)
             .overlay {
                 if packageModel.tableRows.isEmpty {
                     ContentUnavailableView(
                         packageModel.hasLoaded
-                            ? "No extractor packages are installed on this Mac."
+                            ? focus.packagesEmptyMessage
                             : ExtractorPackageSettingsModel.checkingMessage,
                         systemImage: "shippingbox",
                         description: packageModel.canImport
                             ? Text("Use Add to import a local extractor package folder.")
                             : nil)
-                        .accessibilityIdentifier(PackageAccessibility.emptyState)
+                        .accessibilityIdentifier(focus.packagesEmptyId)
                 }
             }
 
@@ -1451,7 +1665,7 @@ struct ExtractionSettingsView: View {
             if packageModel.isBusy {
                 ProgressView(packageModel.busyMessage ?? ExtractorPackageSettingsModel.checkingMessage)
                     .controlSize(.small)
-                    .accessibilityIdentifier(PackageAccessibility.progress)
+                    .accessibilityIdentifier(focus.packagesProgressId)
                     .accessibilityLabel(packageModel.busyMessage ?? "Working on extractor packages")
                     .accessibilityAddTraits(.updatesFrequently)
             }
@@ -1478,7 +1692,7 @@ struct ExtractionSettingsView: View {
                     showingImportPicker = true
                 }
                 .disabled(packageModel.isBusy)
-                .accessibilityIdentifier(PackageAccessibility.importButton)
+                .accessibilityIdentifier(focus.packagesImportButtonId)
                 .accessibilityLabel("Add a local extractor package folder")
                 .help("\(ExtractorSettingsPackagePicker.filesUnsupportedMessage) \(Self.trustWarningMessage)")
             }
@@ -1495,13 +1709,13 @@ struct ExtractionSettingsView: View {
                 }
                 .disabled(packageModel.isBusy || selectedPackageRow?.installedRow == nil
                           || selectionIsReviewed)
-                .accessibilityIdentifier(PackageAccessibility.removeButton)
+                .accessibilityIdentifier(focus.packagesRemoveButtonId)
                 .accessibilityLabel(selectionIsReviewed
                     ? "Reviewed packages ship with the app and cannot be removed"
-                    : "Remove the selected extractor package")
+                    : focus.removeSelectedLabel)
                 .help(selectionIsReviewed
-                    ? "Reviewed packages are bundled with the app and cannot be removed. To turn one off, set its route to no default under Default Extractors."
-                    : "Remove the selected extractor package")
+                    ? focus.removeReviewedHelp
+                    : focus.removeSelectedLabel)
             }
 
             Spacer()
@@ -1510,8 +1724,8 @@ struct ExtractionSettingsView: View {
                 Task { await packageModel.refresh() }
             }
             .disabled(packageModel.isBusy)
-            .accessibilityIdentifier(PackageAccessibility.refreshButton)
-            .accessibilityLabel("Refresh installed extractor packages")
+            .accessibilityIdentifier(focus.packagesRefreshId)
+            .accessibilityLabel(focus.packagesRefreshLabel)
         }
         .controlSize(.small)
     }
@@ -1533,7 +1747,7 @@ struct ExtractionSettingsView: View {
                     .foregroundStyle(row.status.tint)
             }
             .buttonStyle(.plain)
-            .accessibilityIdentifier("\(PackageAccessibility.statusPrefix).\(row.id)")
+            .accessibilityIdentifier("\(focus.packagesStatusPrefix).\(row.id)")
             .accessibilityLabel("\(row.packageID), version \(row.version). \(row.status.label). \(row.status.explanation)")
             .accessibilityHint("Show status details")
         }
@@ -1548,20 +1762,23 @@ struct ExtractionSettingsView: View {
             Label(row.status.explanation, systemImage: row.status.systemImage)
                 .foregroundStyle(row.status.tint)
                 .textSelection(.enabled)
-                .accessibilityIdentifier("\(PackageAccessibility.statusPrefix).\(row.id)")
+                .accessibilityIdentifier("\(focus.packagesStatusPrefix).\(row.id)")
                 .accessibilityLabel("\(row.packageID), version \(row.version). \(row.status.label). \(row.status.explanation)")
 
             if let kind = row.kind {
                 LabeledContent("Kind", value: kindDisplayName(kind))
                     .font(.caption)
+            } else if row.role == .fetcher {
+                LabeledContent("Role", value: "Fetcher (acquires one source per request)")
+                    .font(.caption)
             }
             LabeledContent("Digest", value: row.digestPrefix)
                 .font(.caption)
-                .accessibilityIdentifier("\(PackageAccessibility.digestPrefix).\(row.id)")
+                .accessibilityIdentifier("\(focus.packagesDigestPrefix).\(row.id)")
             if let registrationID = row.registrationID {
                 LabeledContent("Registration", value: registrationID)
                     .font(.caption)
-                    .accessibilityIdentifier("\(PackageAccessibility.registrationPrefix).\(row.id)")
+                    .accessibilityIdentifier("\(focus.packagesRegistrationPrefix).\(row.id)")
             }
 
             if let notice = packageModel.notice(for: row) {
@@ -1571,7 +1788,7 @@ struct ExtractionSettingsView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("\(PackageAccessibility.rowPrefix).\(row.id)")
+        .accessibilityIdentifier("\(focus.packagesRowPrefix).\(row.id)")
         .accessibilityLabel("Diagnostics for \(row.packageID), version \(row.version)")
         .accessibilityValue(row.status.label)
     }
@@ -1586,8 +1803,8 @@ struct ExtractionSettingsView: View {
                 : AnyShapeStyle(HierarchicalShapeStyle.secondary))
             .textSelection(.enabled)
             .accessibilityIdentifier(notice.severity == .failure
-                ? PackageAccessibility.error
-                : PackageAccessibility.diagnostic)
+                ? focus.packagesErrorId
+                : focus.packagesDiagnosticId)
     }
 
     private var selectedPackageRow: ExtractorPackageTableRow? {
@@ -2716,6 +2933,13 @@ struct ExtractorPackageTableRow: Identifiable, Hashable, Sendable {
         }
     }
 
+    /// The registration's declared role. A failed revision reports
+    /// `.extractor` — it registered nothing, so no fetcher surface applies.
+    var role: ExtractorPackageRole {
+        guard case .installed(let row) = subject else { return .extractor }
+        return row.role
+    }
+
     /// Only an active registration has one. A failed revision resolved to no
     /// backend, so it registered nothing.
     var registrationID: String? {
@@ -2905,6 +3129,21 @@ enum ExtractorPackageMutationMessage {
     }
 }
 
+/// The package role this settings surface presents: the Extraction tab shows
+/// extractors (converters); the Fetch tab shows fetchers (acquirers). The
+/// focus selects row sets and presentation strings ONLY — behavior and
+/// acquisition eligibility already come from package data
+/// (`FetchRouteDecision`), never from this value.
+enum ExtractionSettingsRoleFocus: Hashable, Sendable {
+    case extractors
+    case fetchers
+
+    /// The registration role whose rows this focus lists.
+    var listRole: ExtractorPackageRole {
+        self == .fetchers ? .fetcher : .extractor
+    }
+}
+
 /// The local-only package-directory contract used by Extraction settings,
 /// mirroring `RendererSettingsPackagePicker`. AppKit's panel configuration is
 /// only the first safeguard: every accepted selection is revalidated at this
@@ -2916,14 +3155,14 @@ enum ExtractorSettingsPackagePicker {
     static let filesUnsupportedMessage = "Files and archives are not supported."
     static let selectionErrorMessage = "Select one local extractor package folder as an import source. Self Driving Wiki validates and copies it. Files and archives are not supported."
 
-    static func makePanel() -> NSOpenPanel {
+    static func makePanel(title: String = importButtonTitle) -> NSOpenPanel {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.canCreateDirectories = false
-        panel.prompt = importButtonTitle
-        panel.title = importButtonTitle
+        panel.prompt = title
+        panel.title = title
         panel.message = selectionErrorMessage
         return panel
     }
@@ -2975,6 +3214,9 @@ enum ExtractorSettingsPackagePicker {
 @Observable
 final class ExtractorPackageSettingsModel {
     private let loadSnapshot: (@Sendable () async -> ExtractorPackageSettingsSnapshot)?
+    /// The registration role whose installed rows this model lists
+    /// (presentation filtering only — see `ExtractionSettingsRoleFocus`).
+    private let roleFocus: ExtractionSettingsRoleFocus
     private let importAction: (@Sendable (URL) async -> ExtractorPackageMutationOutcome)?
     private let removeAction: (@Sendable (ExtractorPackageRevisionID) async -> ExtractorPackageMutationOutcome)?
 
@@ -2999,7 +3241,9 @@ final class ExtractorPackageSettingsModel {
 
     /// Every installed revision the snapshot holds, active and failed alike,
     /// each carrying the status that explains it.
-    var tableRows: [ExtractorPackageTableRow] { Self.tableRows(from: snapshot) }
+    var tableRows: [ExtractorPackageTableRow] {
+        Self.tableRows(from: snapshot, roleFocus: roleFocus)
+    }
 
     func notice(for row: ExtractorPackageTableRow) -> ExtractorPackageNotice? {
         guard let notice, notice.scope == .package(row.id) else { return nil }
@@ -3019,18 +3263,26 @@ final class ExtractorPackageSettingsModel {
 
     /// Folds the snapshot's active registrations and failed revisions into one
     /// ordered list. Failed revisions sort first: they are the rows a user
-    /// opened this pane to understand.
+    /// opened this pane to understand. Installed rows filter on the focus
+    /// role; FAILED subjects bypass the filter and appear in both foci — a
+    /// failed revision resolved to no registration, so no role exists to
+    /// filter on, and a failed fetcher package is exactly what a user opens
+    /// the Fetch tab to understand (it still shows in the Extraction tab
+    /// with "Handles: —").
     static func tableRows(
-        from snapshot: ExtractorPackageSettingsSnapshot
+        from snapshot: ExtractorPackageSettingsSnapshot,
+        roleFocus: ExtractionSettingsRoleFocus = .extractors
     ) -> [ExtractorPackageTableRow] {
         let failed = snapshot.failedPackages.map { failure in
             ExtractorPackageTableRow(subject: .failed(failure), status: .notReady(failure.message))
         }
-        let installed = snapshot.rows.map { row in
-            ExtractorPackageTableRow(
-                subject: .installed(row),
-                status: status(for: row, in: snapshot))
-        }
+        let installed = snapshot.rows
+            .filter { $0.role == roleFocus.listRole }
+            .map { row in
+                ExtractorPackageTableRow(
+                    subject: .installed(row),
+                    status: status(for: row, in: snapshot))
+            }
         return failed + installed
     }
 
@@ -3058,11 +3310,13 @@ final class ExtractorPackageSettingsModel {
     init(
         loadSnapshot: (@Sendable () async -> ExtractorPackageSettingsSnapshot)?,
         importPackage: (@Sendable (URL) async -> ExtractorPackageMutationOutcome)? = nil,
-        removePackage: (@Sendable (ExtractorPackageRevisionID) async -> ExtractorPackageMutationOutcome)? = nil
+        removePackage: (@Sendable (ExtractorPackageRevisionID) async -> ExtractorPackageMutationOutcome)? = nil,
+        roleFocus: ExtractionSettingsRoleFocus = .extractors
     ) {
         self.loadSnapshot = loadSnapshot
         self.importAction = importPackage
         self.removeAction = removePackage
+        self.roleFocus = roleFocus
     }
 
     /// Import/removal are read-only-hidden when the app wiring did not supply

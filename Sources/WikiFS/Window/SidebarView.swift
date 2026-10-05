@@ -68,6 +68,13 @@ struct SidebarView: View {
                 .padding(.top, 8)
             Divider()
             bookmarksOrList
+            Divider()
+            wikiSwitcherRow
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            strategyFooterRow
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
         }
         .navigationTitle(activeWikiName)
         .navigationSplitViewColumnWidth(min: PageEditorMetrics.sidebarMinWidth,
@@ -109,8 +116,15 @@ struct SidebarView: View {
                    !store.sourceSearchResults.contains(where: { $0.id == id }) {
                     store.sourceSearchQuery = ""
                 }
-            case .chat:
+            case .chat(let id):
                 selectedSection = .chats
+                // Same search-drop as pages/sources: a hidden row can't be
+                // revealed. (The date filter is AgentToolsView state; that
+                // view resets it on its own reveal observation.)
+                if !store.chatSearchQuery.isEmpty,
+                   !store.chatSearchResults.contains(where: { $0.id == id }) {
+                    store.chatSearchQuery = ""
+                }
             default:
                 break
             }
@@ -180,6 +194,61 @@ struct SidebarView: View {
     /// name when no wiki is selected yet).
     private var activeWikiName: String {
         session.descriptor.displayName
+    }
+
+    /// The wiki switcher pill — the top-level container switch (each wiki is
+    /// its own DB + File Provider domain). Sits directly above the Strategy
+    /// row so the sidebar footer reads as one cluster: which wiki you are in,
+    /// then that wiki's editorial strategy.
+    private var wikiSwitcherRow: some View {
+        WikiSwitcher(registry: registry, currentWikiID: session.wikiID)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The wiki-scoped Strategy entry: a pinned footer row below the section
+    /// lists. The row names the ACTIVE wiki — it edits that wiki's strategy,
+    /// not a global setting — and shows an "Edited" marker while a strategy
+    /// draft has unsaved changes, so the draft is visible from anywhere in
+    /// the sidebar. Opens (or focuses) the Strategy tab through the normal
+    /// `openTab` dedup.
+    private var strategyFooterRow: some View {
+        let isSelected = store.selection == .strategy
+        return Button {
+            store.openTab(.strategy)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "text.book.closed")
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Strategy")
+                        .font(.callout.weight(.medium))
+                    Text(activeWikiName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer()
+                if store.isStrategyDraftDirty {
+                    Text("Edited")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, WikiStrategyEditorMetrics.editedCapsuleHorizontalPadding)
+                        .padding(.vertical, WikiStrategyEditorMetrics.editedCapsuleVerticalPadding)
+                        .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+            .background(
+                isSelected ? Color.accentColor.opacity(0.12) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Strategy for \(activeWikiName)")
+        .help("Edit the editorial strategy for \(activeWikiName)")
     }
 }
 

@@ -68,6 +68,11 @@ final class WikiChangeBridge {
             removeObserver(forWikiID: removed)
         }
         observedWikiIDs = current
+        // Observability: the receive path is otherwise silent, and a bridge
+        // that never observed anything looks exactly like "writers stopped
+        // posting". One line per observation-set change.
+        DebugLog.store(
+            "WikiChangeBridge: observing \(current.count) wiki(s) for Darwin change notifications")
     }
 
     /// Update the explicitly observed machine scopes. App wiring owns the
@@ -98,7 +103,17 @@ final class WikiChangeBridge {
                 guard let observer, let name else { return }
                 let bridge = Unmanaged<WikiChangeBridge>.fromOpaque(observer).takeUnretainedValue()
                 let posted = name.rawValue as String
-                Task { @MainActor in bridge.didReceiveDarwinNotification(named: posted) }
+                Task { @MainActor in
+                    // Observability: raw CF-level receipt, BEFORE any name
+                    // matching. If a post never produces this line, the
+                    // observer itself is dead (bridge deallocated and its
+                    // deinit removed every registration, or the registration
+                    // landed on a run loop that never runs) — silence here is
+                    // a delivery failure, not a filtering failure.
+                    DebugLog.store(
+                        "WikiChangeBridge: CF callback fired — name=\(posted)")
+                    bridge.didReceiveDarwinNotification(named: posted)
+                }
             },
             name.rawValue,
             nil,
@@ -140,6 +155,24 @@ final class WikiChangeBridge {
         )
     }
 
+    /// Feed an in-process hint about a suspected external write — e.g. an
+    /// agent chat tool call that just stopped, and whose shell command may
+    /// have committed to the wiki database (a CLI run) — through the SAME
+    /// coalesced path a cross-process change notification takes: reload the
+    /// on-screen session(s) + signal the File Provider after the ~250 ms
+    /// quiet window.
+    ///
+    /// This is the deterministic in-process companion to the Darwin
+    /// notification channel: when that channel delivers, both paths collapse
+    /// into the same coalesced reload; when it does not, this hint still
+    /// refreshes after chat-driven writes. The hint is heuristic (a tool call
+    /// MIGHT have written), so it costs at most one idempotent reload.
+    func noteSuspectedExternalWrite(forWikiID wikiID: WikiID) {
+        DebugLog.store(
+            "WikiChangeBridge: chat tool activity → wiki \(wikiID.rawValue.prefix(8)) (coalesced reload)")
+        coalescer?.noteChange(forWikiID: wikiID)
+    }
+
     /// Map a posted Darwin name back to its wiki id and feed the coalescer. The
     /// id is the suffix after the base name; we match against the wikis we observe
     /// rather than string-splitting, so a malformed name is simply ignored.
@@ -151,6 +184,11 @@ final class WikiChangeBridge {
         guard let wikiID = observedWikiIDs.first(where: {
             posted == WikiChangeNotification.name(forWikiID: $0.rawValue)
         }) else { return }
+        // Observability: one line per received post. A wikictl/daemon write
+        // burst logs a handful of these; silence here means the post never
+        // arrived or the bridge was never observing.
+        DebugLog.store(
+            "WikiChangeBridge: Darwin change notification → wiki \(wikiID.rawValue.prefix(8))")
         coalescer?.noteChange(forWikiID: wikiID)
     }
 
@@ -199,13 +237,26 @@ final class WikiChangeBridge {
 
         // Poke ALL sessions whose wikiID matches — a wikictl write to wiki A
         // must update every window showing wiki A.
-        for session in sessionLookup(wikiID) {
+        let sessions = sessionLookup(wikiID)
+        // Observability: "poked 0 session(s)" is the smoking-gun signature of
+        // a post that arrived but matched no live session (window closed
+        // before the write, or a session-manager wiring regression).
+        DebugLog.store(
+            "WikiChangeBridge: flush wiki \(wikiID.rawValue.prefix(8)) — poked \(sessions.count) session(s)")
+        for session in sessions {
             session.store.eventBus?.emit(ResourceChangeEvent(
                 wikiID: wikiID, kind: nil, id: "", change: .updated))
         }
     }
 
     deinit {
+        // Observability: a deallocated bridge silently unregisters every
+        // Darwin observer (below), and from the outside that looks exactly
+        // like "writers stopped posting" — the app never reloads again. This
+        // line makes the death visible in Console.app. (No property reads
+        // here: deinit is nonisolated and the bridge is @MainActor.)
+        DebugLog.store(
+            "WikiChangeBridge: deinit — dropping all Darwin wiki observers")
         // Drop every Darwin observer this bridge registered. `CFNotification…`
         // observers are keyed by the observer pointer; removing with a nil name
         // unregisters them all for this observer.

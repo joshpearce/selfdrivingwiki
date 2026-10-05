@@ -31,7 +31,14 @@ struct StoreEmissionExhaustivenessTests {
             let end = afterSignature.dropFirst().range(of: "\n    public func ")?.lowerBound
                 ?? source.endIndex
             let implementation = source[start..<end]
-            #expect(implementation.contains("mutate("), "\(signature) must use mutate")
+            // `appendDerivedMarkdown` delegates to its private mutator body
+            // (the fetcher markdown result adds `fetchCompletion` writes to
+            // the SAME transaction); the private mutator contains the real
+            // `mutate(event:_:)` seam, so the delegation preserves the
+            // contract.
+            let routesThroughMutate = implementation.contains("mutate(")
+                || implementation.contains("appendDerivedMarkdownInternal(")
+            #expect(routesThroughMutate, "\(signature) must use mutate")
         }
     }
 
@@ -94,6 +101,23 @@ struct StoreEmissionExhaustivenessTests {
             contentsOf: root.appendingPathComponent("Sources/WikiFSCore/Store/GRDBWikiStore.swift"),
             encoding: .utf8)
         let signature = "public func updateChatModelAndThinkingSelection("
+        let start = try #require(source.range(of: signature)?.lowerBound)
+        let tail = source[start...]
+        let end = tail.dropFirst().range(of: "\n    public func ")?.lowerBound ?? source.endIndex
+        #expect(source[start..<end].contains("mutate("))
+    }
+
+    /// The strategy CAS save routes through `mutate(event:_:)`: a changed
+    /// save emits exactly one `.strategy` event post-commit, an unchanged
+    /// save's conditional `nil` emits nothing, and a CAS/validation throw
+    /// inside the savepoint rolls back without emitting.
+    @Test func wikiStrategySavePublicMutatorRoutesThroughMutate() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/WikiFSCore/Store/GRDBWikiStore.swift"),
+            encoding: .utf8)
+        let signature = "public func saveWikiStrategy("
         let start = try #require(source.range(of: signature)?.lowerBound)
         let tail = source[start...]
         let end = tail.dropFirst().range(of: "\n    public func ")?.lowerBound ?? source.endIndex

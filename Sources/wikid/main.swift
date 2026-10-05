@@ -370,6 +370,8 @@ final class WikiDaemonExporter: NSObject, WikiDaemonProtocol, @unchecked Sendabl
                 sendableReply.reply(Self.encodeQueueEnvelope(
                     .success(result.value, epoch: result.epoch, hostState: result.hostState)))
             } catch {
+                // Record the underlying daemon error before converting it to a wire response.
+                DebugLog.store("wikid: queue operation failed: \(error)")
                 let status = await daemon.queueHostStatus()
                 let envelope = QueueRPCEnvelope<Payload>.failure(
                     Self.queueRPCError(from: error),
@@ -707,6 +709,13 @@ do {
     let extractorLayout = try ExtractorPackageStoreLayout(
         appGroupContainerRoot: containerDirectory,
         processRole: .daemon)
+    // #1330: a daemon generation that died mid-operation leaves its `uv
+    // run` wrapper processes behind. Kill the orphans whose owning pid is
+    // dead BEFORE the stale-session cleanup deletes the operation
+    // directories they reference. The sweep covers every process role.
+    ExtractorOrphanWrapperSweeper.reapOrphanWrappers(
+        operationsRoot: extractorLayout.operationsRoot,
+        currentSessionID: extractorLayout.processSessionID)
     try ExtractorDirectoryValidator.cleanupOperationSessions(
         layout: extractorLayout,
         scope: .staleSessions)
@@ -725,6 +734,13 @@ let processLifetime = DaemonProcessLifetimeCoordinator(
         await daemon.shutdown()
     },
     didShutdown: {
+        // #1330: the last synchronous act of a clean quit is to kill every
+        // process group this daemon still owns. Worker-task cancellation
+        // kills groups through the cooperative pool, and the process may
+        // exit before those jobs run. kill() delivery does not depend on
+        // the caller staying alive, so the signals land anyway. When the
+        // normal settlement ran, the registry is empty and this is a no-op.
+        OwnedProcessGroupRegistry.terminateAllOwnedGroups()
         Darwin.exit(EXIT_SUCCESS)
     })
 processLifetime.installSignalHandlers()
@@ -825,6 +841,11 @@ do {
     let extractorLayout = try ExtractorPackageStoreLayout(
         appGroupContainerRoot: containerDirectory,
         processRole: .daemon)
+    // #1330: same startup orphan sweep as the XPC transport. On Linux the
+    // sweep logs that it is unavailable and reaps nothing.
+    ExtractorOrphanWrapperSweeper.reapOrphanWrappers(
+        operationsRoot: extractorLayout.operationsRoot,
+        currentSessionID: extractorLayout.processSessionID)
     try ExtractorDirectoryValidator.cleanupOperationSessions(
         layout: extractorLayout,
         scope: .staleSessions)

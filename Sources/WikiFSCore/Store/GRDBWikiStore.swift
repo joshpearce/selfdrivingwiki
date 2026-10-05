@@ -154,11 +154,11 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
 
     /// The latest schema version stamped by `createFreshSchema()` (for a fresh
     /// DB) and by `migrateIfNeeded(_:in:)` after running the ladder (for an
-    /// existing DB). MUST match `SQLiteWikiStore.currentSchemaVersion`: existing
-    /// databases produced by that store carry `PRAGMA user_version` up to 37, and
-    /// this store must recognize them as already-current so the ladder is a no-op
-    /// on re-open (the proven `if version < N`)
-    private static let currentSchemaVersion = 54
+    /// existing DB). Databases produced by the removed `SQLiteWikiStore` carry
+    /// `PRAGMA user_version` up to 37, and this store must recognize them as
+    /// already-migratable so the ladder is a no-op on re-open (the proven
+    /// `if version < N`)
+    private static let currentSchemaVersion = 56
     /// The current schema version (mirrors the former
     /// `SQLiteWikiStore.currentSchemaVersion`). Public so tests can assert the
     /// migration ladder landed at the expected `user_version`.
@@ -475,13 +475,19 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     /// - (d) No event on throw — `dbWriter.write` rethrows; the emit code
     ///   after it is unreachable on throw.
     ///
-    /// **Nesting (c):** `dbWriter.write` is NOT reentrant — calling
-    /// `dbWriter.write` from inside `dbWriter.write` deadlocks. Public methods
-    /// that compose (call other public mutating methods) must pass the
-    /// `Database` handle to internal helpers rather than re-entering `mutate`.
-    /// This matches design doc Approach A for composing methods; Approach B's
-    /// `pendingEvent` buffer is used for the non-composing case (the common
-    /// case). For this pilot, all implemented methods are non-composing.
+    /// **Nesting (c):** `mutate` IS reentrant — implemented with
+    /// `unsafeReentrantWrite` + `db.inSavepoint` (see the implementation
+    /// comment below), so a call from inside another `mutate` body nests as a
+    /// SAVEPOINT instead of deadlocking. BUT composing public mutators this
+    /// way is still FORBIDDEN for event correctness: a nested `mutate` emits
+    /// its event as soon as ITS write returns — while the OUTER savepoint has
+    /// not committed yet — so an outer rollback cannot suppress the already
+    /// emitted inner event, and each nested mutator adds a duplicate event.
+    /// Public methods that compose MUST run one top-level `mutate` whose body
+    /// uses the non-emitting `*Locked` helpers (they take the in-transaction
+    /// `Database` and never wrap `mutate`); the outer `mutate` is then the
+    /// single emit site, and its event is emitted only after the one
+    /// transaction commits (design doc Approach A).
     private final class MutationResultBox<Value> {
         var value: Value?
     }
@@ -1587,6 +1593,69 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 return .commit
             }
             version = 54
+        }
+
+        // v54→v55: fetcher packages. Two changes, both metadata-preserving:
+        //   1. The retained Zotero-named provenance columns on `sources`
+        //      become the provider-neutral `external_item_key` /
+        //      `external_item_title` (a fetcher package is not a Zotero
+        //      concept; the values move with the rename, nothing drops).
+        //   2. The fetch lifecycle rides on the source: a nullable
+        //      `fetch_state` (`pending` → `formatJobPending` → `complete`)
+        //      plus the exact fetch producer (`fetch_producer` JSON). NULL
+        //      means "never a fetch source". Byteless `application/zotero`
+        //      rows the sync created before this schema are backfilled to
+        //      `pending` so they remain fetchable; no old package/selection
+        //      execution is implied.
+        //
+        // Chat-only fixtures (some tests build a DB with only the chat
+        // tables) have no `sources` table at all: every step is guarded on
+        // table existence, not just column existence.
+        if version < 55 {
+            try db.inTransaction(.immediate) {
+                let hasSources = try Self.tableExists("sources", in: db)
+                if hasSources, try Self.hasColumn("zotero_item_key", on: "sources", in: db) {
+                    try db.execute(sql: "ALTER TABLE sources RENAME COLUMN zotero_item_key TO external_item_key;")
+                }
+                if hasSources, try Self.hasColumn("zotero_item_title", on: "sources", in: db) {
+                    try db.execute(sql: "ALTER TABLE sources RENAME COLUMN zotero_item_title TO external_item_title;")
+                }
+                if hasSources, try Self.hasColumn("fetch_state", on: "sources", in: db) == false {
+                    try db.execute(sql: "ALTER TABLE sources ADD COLUMN fetch_state TEXT;")
+                }
+                if hasSources, try Self.hasColumn("fetch_producer", on: "sources", in: db) == false {
+                    try db.execute(sql: "ALTER TABLE sources ADD COLUMN fetch_producer TEXT;")
+                }
+                if hasSources {
+                    try db.execute(sql: """
+                    UPDATE sources SET fetch_state = 'pending'
+                    WHERE fetch_state IS NULL AND byte_size = 0 AND content_hash IS NULL
+                      AND mime_type = 'application/zotero';
+                    """)
+                }
+                try db.execute(sql: "PRAGMA user_version = 55;")
+                return .commit
+            }
+            version = 55
+        }
+
+        // v55→v56: the per-wiki strategy document (`wiki_strategy`) — the
+        // wiki-specific editorial instructions singleton. Modeled on the
+        // historical `system_prompt`/`wiki_index` singletons (one row pinned
+        // to `id = 1` by a CHECK), with two deliberate differences:
+        //   1. NO seed row — **absence of a row is the Default strategy**.
+        //      The first save (or first reset) creates the row at revision 1.
+        //   2. A reset never deletes the row: it writes a tombstone
+        //      (`name`/`instructions` NULL) so the revision stays monotonic
+        //      across reset. Reads treat a tombstone exactly like absence.
+        // The revision column doubles as the change-token fold input.
+        if version < 56 {
+            try db.inTransaction(.immediate) {
+                try Self.createWikiStrategyTableV56(in: db)
+                try db.execute(sql: "PRAGMA user_version = 56;")
+                return .commit
+            }
+            version = 56
         }
 
         // Catch-all fallback: any DB older than `currentSchemaVersion` whose
@@ -3377,8 +3446,12 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         );
         """)
 
-        // Sources — final shape (v2 + v6 + v9 + v10 + v19 + v20).
+        // Sources — final shape (v2 + v6 + v9 + v10 + v19 + v20 + v55).
         // v20: the `content` column is GONE — bytes live in immutable `blobs`.
+        // v55: the Zotero-named provenance columns are the provider-neutral
+        // `external_item_key`/`external_item_title`, and the fetcher
+        // lifecycle (`fetch_state` + its exact `fetch_producer`) rides on
+        // the source row.
         try db.execute(sql: """
         CREATE TABLE IF NOT EXISTS sources (
             id TEXT PRIMARY KEY,
@@ -3390,11 +3463,13 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             updated_at REAL NOT NULL,
             version INTEGER NOT NULL DEFAULT 1,
             ingested_at REAL,
-            zotero_item_key TEXT,
-            zotero_item_title TEXT,
+            external_item_key TEXT,
+            external_item_title TEXT,
             display_name TEXT,
             content_hash TEXT,
-            role TEXT NOT NULL DEFAULT 'primary'
+            role TEXT NOT NULL DEFAULT 'primary',
+            fetch_state TEXT,
+            fetch_producer TEXT
         );
         """)
         try db.execute(sql: "CREATE INDEX IF NOT EXISTS ingested_files_created ON sources(created_at);")
@@ -3462,6 +3537,10 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         INSERT OR IGNORE INTO wiki_index (id, body_markdown, updated_at, version)
         VALUES (1, ?, ?, 1);
         """, arguments: [WikiIndex.defaultBody, now])
+
+        // Wiki strategy (v56) — the per-wiki editorial instructions singleton.
+        // Deliberately NOT seeded: absence of a row is the Default strategy.
+        try Self.createWikiStrategyTableV56(in: db)
 
         // Per-chunk embeddings (v14).
         try db.execute(sql: """
@@ -3948,6 +4027,187 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         }
     }
 
+    // MARK: - Wiki strategy (per-wiki editorial document, v56)
+
+    /// The `ResourceChangeEvent.id` for the strategy singleton. The strategy
+    /// is one row per wiki, so a stable constant name — not an id from any
+    /// other namespace — identifies it in event payloads.
+    private static let wikiStrategyEventID = "wiki_strategy"
+
+    /// v56 DDL, shared by the migration step and `createFreshSchema` so a
+    /// migrated DB and a fresh DB are byte-identical. `IF NOT EXISTS`-guarded
+    /// like every other fresh-schema table.
+    static func createWikiStrategyTableV56(in db: Database) throws {
+        try db.execute(sql: """
+        CREATE TABLE IF NOT EXISTS wiki_strategy (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            name TEXT,
+            instructions TEXT,
+            revision INTEGER NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        """)
+    }
+
+    /// The stored row, exactly as persisted. `instructions == nil` is a
+    /// Default tombstone (or, with `row == nil`, the wiki was never written).
+    private struct WikiStrategyRow {
+        var name: String?
+        var instructions: String?
+        var revision: WikiStrategyRevision
+        var updatedAt: Date
+
+        var strategy: WikiStrategy? {
+            guard let instructions else { return nil }
+            return WikiStrategy(
+                name: name ?? "",
+                instructions: instructions,
+                revision: revision,
+                updatedAt: updatedAt
+            )
+        }
+    }
+
+    private func wikiStrategyRow(on db: Database) throws -> WikiStrategyRow? {
+        try Row.fetchOne(
+            db,
+            sql: "SELECT name, instructions, revision, updated_at FROM wiki_strategy WHERE id = 1;"
+        ).map { row in
+            WikiStrategyRow(
+                name: row["name"],
+                instructions: row["instructions"],
+                revision: WikiStrategyRevision(rawValue: row["revision"]),
+                updatedAt: Date(timeIntervalSince1970: row["updated_at"])
+            )
+        }
+    }
+
+    public func getWikiStrategy() throws -> WikiStrategy? {
+        try dbWriter.read { db in
+            try wikiStrategyRow(on: db)?.strategy
+        }
+    }
+
+    /// Both values from ONE committed row (`dbWriter.read` serializes reads
+    /// against writes), so the strategy body and the revision can never be
+    /// observed from different commits.
+    public func getWikiStrategyState() throws -> WikiStrategyState {
+        try dbWriter.read { db in
+            let row = try wikiStrategyRow(on: db)
+            return WikiStrategyState(strategy: row?.strategy, revision: row?.revision)
+        }
+    }
+
+    public func wikiStrategyRevision() throws -> WikiStrategyRevision? {
+        try dbWriter.read { db in
+            try wikiStrategyRow(on: db)?.revision
+        }
+    }
+
+    /// What one save actually did, for the event seam: the protocol outcome
+    /// plus the `ChangeKind` a changed write emits (`nil` when nothing was
+    /// written, so `mutate` skips the emit).
+    private struct WikiStrategyWriteResult {
+        var outcome: WikiStrategySaveOutcome
+        var change: ChangeKind?
+    }
+
+    @discardableResult
+    public func saveWikiStrategy(
+        name: String,
+        instructions: String,
+        expectedRevision: WikiStrategyRevision?
+    ) throws -> WikiStrategySaveOutcome {
+        // Validate + normalize BEFORE opening the write: limits are rejected
+        // visibly and never truncate; whitespace-only instructions normalize
+        // to a reset request (nil).
+        let input = try WikiStrategy.validatedInput(name: name, instructions: instructions)
+        let result: WikiStrategyWriteResult = try mutate(event: { result in
+            guard let change = result.change else { return nil }
+            return self.localEvent(.strategy, id: Self.wikiStrategyEventID, change: change)
+        }) { db in
+            let row = try wikiStrategyRow(on: db)
+            let rowRevision = row?.revision
+
+            // CAS — compare the editor's expected revision (including
+            // absence as nil) against the committed row, inside the same
+            // transaction as the write. A mismatch leaves no trace.
+            guard rowRevision == expectedRevision else {
+                throw WikiStrategyConflictError(
+                    expectedRevision: expectedRevision,
+                    currentRevision: rowRevision,
+                    currentStrategy: row?.strategy
+                )
+            }
+
+            let currentStrategy = row?.strategy
+
+            if let newInstructions = input.instructions {
+                // A live strategy request. Unchanged (same normalized name
+                // and instructions) is a no-op: no write, no revision
+                // advance, no event.
+                if let currentStrategy,
+                   currentStrategy.name == input.name,
+                   currentStrategy.instructions == newInstructions {
+                    return WikiStrategyWriteResult(outcome: .unchanged, change: nil)
+                }
+                let newRevision = (rowRevision ?? .absent).next
+                // Return the same timestamp representation that the persisted
+                // Unix-epoch value decodes to on the next read.
+                let now = Date(timeIntervalSince1970: Date().timeIntervalSince1970)
+                let strategy = WikiStrategy(
+                    name: input.name,
+                    instructions: newInstructions,
+                    revision: newRevision,
+                    updatedAt: now
+                )
+                try db.execute(sql: """
+                INSERT INTO wiki_strategy (id, name, instructions, revision, updated_at)
+                VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    instructions = excluded.instructions,
+                    revision = excluded.revision,
+                    updated_at = excluded.updated_at;
+                """, arguments: [
+                    input.name,
+                    newInstructions,
+                    newRevision.rawValue,
+                    now.timeIntervalSince1970,
+                ])
+                return WikiStrategyWriteResult(
+                    outcome: .saved(revision: newRevision, strategy: strategy),
+                    change: currentStrategy == nil ? .created : .updated
+                )
+            }
+
+            // A reset request (whitespace-only instructions). Resetting a
+            // wiki already at Default is a no-op; resetting a live strategy
+            // writes a tombstone so the revision stays monotonic.
+            guard currentStrategy != nil else {
+                return WikiStrategyWriteResult(outcome: .unchanged, change: nil)
+            }
+            let newRevision = (rowRevision ?? .absent).next
+            // Epoch round-trip, matching the save path above. Both write
+            // paths keep one representation for the updated_at column.
+            let now = Date(timeIntervalSince1970: Date().timeIntervalSince1970)
+            try db.execute(sql: """
+            INSERT INTO wiki_strategy (id, name, instructions, revision, updated_at)
+            VALUES (1, NULL, NULL, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = NULL,
+                instructions = NULL,
+                revision = excluded.revision,
+                updated_at = excluded.updated_at;
+            """, arguments: [newRevision.rawValue, now.timeIntervalSince1970])
+            return WikiStrategyWriteResult(
+                outcome: .saved(revision: newRevision, strategy: nil),
+                change: .deleted
+            )
+        }
+        return result.outcome
+    }
+
     private func mutateRendererSettings(
         event: RendererSettingsChangeEvent,
         _ body: (Database, RFC3339Timestamp) throws -> Void
@@ -4157,6 +4417,9 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
           + COALESCE((SELECT SUM(projection_revision) FROM source_markdown_okf_metadata), 0);
         """, on: db)
     }
+    internal func wikiStrategyRevisionValue(on db: Database) -> Int64 {
+        resilientScalar("SELECT COALESCE((SELECT revision FROM wiki_strategy WHERE id = 1), 0);", on: db)
+    }
 
     // MARK: - changeToken contributors (slice 2b)
 
@@ -4178,6 +4441,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         BookmarkTokenContributor(),
         ChatTokenContributor(),
         OKFMetadataTokenContributor(),
+        StrategyTokenContributor(),
     ]
 
     internal struct PagesTokenContributor: ChangeTokenContributor {
@@ -4267,6 +4531,17 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         }
     }
 
+    /// The strategy fold (v56, appended last): the `wiki_strategy` row's
+    /// revision, `0` when no row exists. The revision advances on every
+    /// changed save — including a reset, whose tombstone keeps it — so any
+    /// strategy change moves the whole-wiki token.
+    internal struct StrategyTokenContributor: ChangeTokenContributor {
+        let kind: ResourceKind = .strategy
+        func fold(in store: GRDBWikiStore, on db: Database) throws -> ChangeTokenFold {
+            .strategy(revision: store.wikiStrategyRevisionValue(on: db))
+        }
+    }
+
     // MARK: - WikiStore protocol: Pages
 
     public func listPages(sortBy: PageSortOrder) throws -> [WikiPageSummary] {
@@ -4330,35 +4605,48 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         try mutate(event: { page in
             self.localEvent(.page, id: page.id.rawValue, change: .created)
         }) { db in
-            let title = WikiNameRules.sanitized(title)
-            let id = PageID(rawValue: ULID.generate())
-            let slug = try self.uniqueSlug(from: title, id: id, on: db)
-            let now = Date()
-            let nowTS = now.timeIntervalSince1970
-            let normalizedProvenance = try self.normalizedPageVersionProvenance(provenance, on: db)
-
-            try db.execute(sql: """
-            INSERT INTO pages (id, title, slug, body_markdown, created_at, updated_at, version, created_by, last_edited_by)
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?);
-            """, arguments: [id.rawValue, title, slug, body, nowTS, nowTS,
-                            createdBy, createdBy])
-
-            let bodyData = Data(body.utf8)
-            let hash = portableSHA256( bodyData)
-                .map { String(format: "%02x", $0) }.joined()
-            _ = try self.createPageVersionWithProvenance(on: db, request: .init(
-                pageID: id, head: nil, mergeParentID: nil, title: title, body: body,
-                bodyData: bodyData, hash: hash, activityAgent: .pageAuthor(createdBy),
-                activityKind: "import", now: now, nowTS: nowTS,
-                provenance: normalizedProvenance,
-                publication: .main(slug: slug, mirrorMutation: .seed)))
-
-            return WikiPage(
-                id: id, title: title, slug: slug, bodyMarkdown: body,
-                createdAt: now, updatedAt: now, version: 1,
-                createdBy: createdBy, lastEditedBy: createdBy
-            )
+            try self.createPageLocked(title: title, body: body, createdBy: createdBy, provenance: provenance, on: db)
         }
+    }
+
+    /// The db-handle core of `createPage(title:body:createdBy:provenance:)`:
+    /// page-row insert + first immutable version (with provenance) + slug
+    /// mirror seed. NOT a `mutate(event:)` wrapper — no transaction of its
+    /// own, no event. `createPage` (public creator) and the composed
+    /// `upsertPage(id:title:rawBody:expectation:author:provenance:)` wrap
+    /// their own `mutate` around this so each emits exactly one event.
+    private func createPageLocked(
+        title: String, body: String, createdBy: String?,
+        provenance: [PageVersionSourceInput], on db: Database
+    ) throws -> WikiPage {
+        let title = WikiNameRules.sanitized(title)
+        let id = PageID(rawValue: ULID.generate())
+        let slug = try self.uniqueSlug(from: title, id: id, on: db)
+        let now = Date()
+        let nowTS = now.timeIntervalSince1970
+        let normalizedProvenance = try self.normalizedPageVersionProvenance(provenance, on: db)
+
+        try db.execute(sql: """
+        INSERT INTO pages (id, title, slug, body_markdown, created_at, updated_at, version, created_by, last_edited_by)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?);
+        """, arguments: [id.rawValue, title, slug, body, nowTS, nowTS,
+                        createdBy, createdBy])
+
+        let bodyData = Data(body.utf8)
+        let hash = portableSHA256( bodyData)
+            .map { String(format: "%02x", $0) }.joined()
+        _ = try self.createPageVersionWithProvenance(on: db, request: .init(
+            pageID: id, head: nil, mergeParentID: nil, title: title, body: body,
+            bodyData: bodyData, hash: hash, activityAgent: .pageAuthor(createdBy),
+            activityKind: "import", now: now, nowTS: nowTS,
+            provenance: normalizedProvenance,
+            publication: .main(slug: slug, mirrorMutation: .seed)))
+
+        return WikiPage(
+            id: id, title: title, slug: slug, bodyMarkdown: body,
+            createdAt: now, updatedAt: now, version: 1,
+            createdBy: createdBy, lastEditedBy: createdBy
+        )
     }
 
     public func createPage(
@@ -4473,10 +4761,181 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     }
 
     public func replaceLinks(from pageID: PageID, parsedLinks: [ParsedLink]) throws {
-        try mutate(event: { _ in
+        // The locked helper now reports whether rows changed (the composed
+        // upsert's didWrite needs it); this public mutator keeps its own
+        // unconditional `.updated` event, so the Bool is discarded here.
+        _ = try mutate(event: { _ in
             self.localEvent(.page, id: pageID.rawValue, change: .updated)
         }) { db in
             try self.replaceLinksLocked(from: pageID, parsedLinks: parsedLinks, on: db)
+        }
+    }
+
+    // MARK: - Composed page upsert (cumulative ingestion, plan phase 4 §9)
+
+    /// Result payload for the composed upsert: the caller-facing outcome plus
+    /// whether the write changed anything — the version write OR the link
+    /// rows (a link-graph change alone, e.g. a stale row swept by a no-op
+    /// body save, still emits; an unchanged save emits nothing).
+    private struct ComposedUpsertResult {
+        let outcome: PageUpsert.Outcome
+        let didWrite: Bool
+    }
+
+    /// The composed page write: title/id resolution, the
+    /// `PageWriteExpectation` check, body canonicalization, the
+    /// version/provenance write, and link-graph replacement — ONE
+    /// `mutate(event:)` transaction, ONE event.
+    ///
+    /// Event contract (plan phase 4 §9): a changed commit (content OR link
+    /// rows) emits exactly one `ResourceChangeEvent` — `.created` for a new
+    /// page, `.updated` otherwise — after the transaction commits; a CAS
+    /// conflict (`PageConflictError`), a create-only conflict
+    /// (`PageCreateConflictError`), a missing expected target
+    /// (`PageExpectedTargetMissingError`), a link-write failure, or any other
+    /// throw rolls back every content-bearing row (the savepoint) and emits
+    /// NOTHING. The body calls only non-emitting `*Locked` helpers — never a
+    /// nested public mutator, which would emit before this transaction
+    /// commits and could not be suppressed on rollback (see the `mutate()`
+    /// seam doc).
+    @discardableResult
+    public func upsertPage(
+        id: PageID?, title: String, rawBody: String,
+        expectation: PageWriteExpectation,
+        author: String? = nil,
+        provenance: [PageVersionSourceInput] = []
+    ) throws -> PageUpsert.Outcome {
+        let result = try mutate(event: { (result: ComposedUpsertResult) in
+            guard result.didWrite else { return nil }
+            return self.localEvent(
+                .page, id: result.outcome.id.rawValue,
+                change: result.outcome.didCreate ? .created : .updated)
+        }) { db in
+            try self.upsertPageLocked(
+                id: id, title: title, rawBody: rawBody, expectation: expectation,
+                author: author, provenance: provenance, on: db)
+        }
+        return result.outcome
+    }
+
+    /// The db-handle core of `upsertPage`. Runs entirely inside the caller's
+    /// `mutate` savepoint via non-emitting helpers; never opens a
+    /// transaction, never emits.
+    private func upsertPageLocked(
+        id: PageID?, title: String, rawBody: String,
+        expectation: PageWriteExpectation,
+        author: String?, provenance: [PageVersionSourceInput],
+        on db: Database
+    ) throws -> ComposedUpsertResult {
+        // 1. Sanitize BEFORE resolving (the same rule as the sequential seam):
+        //    the raw title would never match a sanitized stored title, so an
+        //    unsanitized upsert of the same unlinkable title would otherwise
+        //    create a duplicate page on every save.
+        let title = WikiNameRules.sanitized(title)
+
+        // 2. Canonicalize the body's `[[…]]` spans with IN-TRANSACTION
+        //    resolvers, so the canonical form agrees with the title graph as
+        //    of THIS write (a title that resolves here cannot be un-resolved
+        //    by a concurrent write before the commit). Same rewriter and
+        //    resolution rules as the sequential seam; the PUBLIC resolvers
+        //    would re-enter the writer queue (see `replaceLinksLocked`).
+        let canonicalBody = (try WikiLinkRewriter.canonicalize(
+            in: rawBody,
+            resolvePage: { try self.resolveTitleToIDLocked($0, in: db) },
+            resolveSource: { try self.resolveSourceByNameLocked($0, in: db) },
+            resolveChat: { try self.resolveChatByTitleLocked($0, in: db) })) ?? rawBody
+
+        // 3. Resolve the target INSIDE the transaction: an explicit id wins
+        //    (existence-checked); otherwise the title resolves against
+        //    committed pages (lowest ULID on a duplicate-title collision).
+        let targetID: PageID?
+        if let id {
+            let exists = try Int.fetchOne(
+                db,
+                sql: "SELECT 1 FROM pages WHERE id = ?;",
+                arguments: [id.rawValue]
+            ) ?? 0
+            guard exists == 1 else {
+                // Legacy unrestricted updates threw `.notFound` (and still
+                // do). An expected-head write is different: the caller PINNED
+                // this page by id, so its absence since the read is an
+                // expected-state conflict (exit 3), never a notFound and
+                // never a silent create.
+                if case .expectedHead(let expected) = expectation {
+                    throw PageExpectedTargetMissingError(
+                        pageID: id, expectedHead: expected, title: title)
+                }
+                throw WikiStoreError.notFound(id)
+            }
+            targetID = id
+        } else {
+            targetID = try resolveTitleToIDLocked(title, in: db)
+        }
+
+        // Shared tail for both create paths: page row + first version, then
+        // the canonical body's links, all in this savepoint.
+        func createAndLink() throws -> ComposedUpsertResult {
+            let page = try self.createPageLocked(
+                title: title, body: canonicalBody, createdBy: author,
+                provenance: provenance, on: db)
+            _ = try self.replaceLinksLocked(
+                from: page.id, parsedLinks: WikiLinkParser.parse(canonicalBody), on: db)
+            return ComposedUpsertResult(
+                outcome: PageUpsert.Outcome(id: page.id, didCreate: true), didWrite: true)
+        }
+
+        // 4. Expected-state gate + content write.
+        var expectedHead: PageVersionID?
+        if case .expectedHead(let expected) = expectation { expectedHead = expected }
+        switch expectation {
+        case .expectedAbsence:
+            if let id {
+                throw WikiStoreError.unexpected(
+                    "create-only write (expectedAbsence) cannot target an explicit page id: \(id.rawValue)")
+            }
+            if let targetID {
+                // The create-only race lost: a page appeared under this title
+                // since the caller's missing-page read. Report the conflict
+                // carrying the existing page's current head so the agent can
+                // re-read and reconcile; the savepoint rolls back (nothing
+                // content-bearing was written yet on this path).
+                let head = try Self.pageHeadVersionIDLocked(pageID: targetID, on: db)
+                throw PageCreateConflictError(pageID: targetID, title: title, actualVersionID: head)
+            }
+            return try createAndLink()
+        case .expectedHead, .unrestricted:
+            guard let targetID else {
+                if let expectedHead {
+                    // The title the caller read no longer resolves to ANY
+                    // page — deleted or renamed away since the read. Conflict,
+                    // never a silent create: an expected-head write pins an
+                    // existing page, and only `.unrestricted` keeps the
+                    // legacy create-if-missing behavior.
+                    throw PageExpectedTargetMissingError(
+                        pageID: nil, expectedHead: expectedHead, title: title)
+                }
+                // Unrestricted + no target: the legacy create.
+                return try createAndLink()
+            }
+            // Existing page: append a version — CAS for `.expectedHead`,
+            // blind legacy write for `.unrestricted`. Both route through
+            // `appendPageVersionLocked`, whose body IS `updatePage`'s locked
+            // body (slug/hash → CAS check → amend-coalescing → append), so
+            // unrestricted semantics — including the autosave amendment —
+            // are preserved verbatim; only the transaction scope changed.
+            // Then replace the canonical body's links in the SAME savepoint
+            // so a link failure rolls the version write back. `didWrite`
+            // includes the link delta: a link-graph change alone (a stale
+            // row swept, a target that stopped resolving) still emits.
+            let version = try appendPageVersionLocked(
+                pageID: targetID, title: title, body: canonicalBody,
+                expectedHeadVersionID: expectedHead,
+                lastEditedBy: author, provenance: provenance, on: db)
+            let linksChanged = try replaceLinksLocked(
+                from: targetID, parsedLinks: WikiLinkParser.parse(canonicalBody), on: db)
+            return ComposedUpsertResult(
+                outcome: PageUpsert.Outcome(id: targetID, didCreate: false),
+                didWrite: version.didWrite || linksChanged)
         }
     }
 
@@ -4484,9 +4943,16 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     /// transaction, no event. Callers already inside a write transaction (the
     /// protected deletion's unlink rewrites) route through this instead of the
     /// public mutator, which would re-enter the writer queue and deadlock.
+    ///
+    /// Returns whether the persisted link rows CHANGED (the resolved row set
+    /// after the rewrite differs from the set before it). The composed upsert
+    /// ORs this into its `didWrite` so a link-graph change alone — a stale
+    /// row swept away, a target that stopped resolving — still emits exactly
+    /// one event even though the version write was a no-op.
+    @discardableResult
     private func replaceLinksLocked(
         from pageID: PageID, parsedLinks: [ParsedLink], on db: Database
-    ) throws {
+    ) throws -> Bool {
         // Delete all existing outgoing page + source links, then insert the
         // resolved subset. Faithful port of `SQLiteWikiStore.replaceLinks`:
         // canonical-ULID targets validate by id (direct row fetch); legacy
@@ -4496,6 +4962,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         // `resolveSourceByName` open their own `dbWriter.read`, which would
         // re-enter the DatabasePool's serial queue and hit GRDB's fatal
         // "Database methods are not reentrant".
+        let before = try Self.outgoingLinkRowsLocked(pageID, on: db)
         try db.execute(sql: "DELETE FROM page_links WHERE from_page_id = ?;",
                        arguments: [pageID.rawValue])
         try db.execute(sql: "DELETE FROM source_links WHERE from_page_id = ?;",
@@ -4545,6 +5012,29 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 continue
             }
         }
+        return try Self.outgoingLinkRowsLocked(pageID, on: db) != before
+    }
+
+    /// Ordered, comparable dump of a page's outgoing `page_links` +
+    /// `source_links` rows (every persisted column) — the change fingerprint
+    /// `replaceLinksLocked` compares so a composed upsert can emit when the
+    /// LINK GRAPH changed even though the body (and therefore the version
+    /// write) did not.
+    private static func outgoingLinkRowsLocked(
+        _ pageID: PageID, on db: Database
+    ) throws -> [String] {
+        var rows = try String.fetchAll(db, sql: """
+            SELECT from_page_id || ':' || to_page_id || ':' || link_text
+            FROM page_links WHERE from_page_id = ?
+            ORDER BY to_page_id, link_text
+            """, arguments: [pageID.rawValue])
+        rows += try String.fetchAll(db, sql: """
+            SELECT from_page_id || ':' || to_source_id || ':' || link_text
+                   || ':' || role || ':' || COALESCE(pinned_version_id, '')
+            FROM source_links WHERE from_page_id = ?
+            ORDER BY to_source_id, link_text, role
+            """, arguments: [pageID.rawValue])
+        return rows
     }
 
     // MARK: - WikiStore protocol: Sources
@@ -4655,8 +5145,8 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         return try addSource(
             filename: filename,
             data: data,
-            zoteroItemKey: ingestMetadata?.externalItemID,
-            zoteroItemTitle: ingestMetadata?.externalItemTitle,
+            externalItemKey: ingestMetadata?.externalItemID,
+            externalItemTitle: ingestMetadata?.externalItemTitle,
             mimeType: detected.normalizedMIMEType,
             provenance: provenance,
             role: role,
@@ -4667,7 +5157,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
 
     public func addSource(
         filename: String, data: Data,
-        zoteroItemKey: String? = nil, zoteroItemTitle: String? = nil,
+        externalItemKey: String? = nil, externalItemTitle: String? = nil,
         mimeType: String? = nil, provenance: SourceProvenance? = nil,
         role: SourceRole = .primary, originalPath: String? = nil,
         activityID: String? = nil, resolvedDisplayName: String?? = nil
@@ -4701,7 +5191,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         let displayName: String?
         if let resolved = resolvedDisplayName ?? DisplayNameResolver.resolve(
             filename: filename, data: data, mimeType: mime,
-            zoteroItemTitle: zoteroItemTitle) {
+            externalItemTitle: externalItemTitle) {
             displayName = WikiNameRules.sanitized(resolved)
         } else if !WikiNameRules.isLinkable(filename) {
             displayName = WikiNameRules.sanitized(filename)
@@ -4724,7 +5214,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 db,
                 sql: """
                 SELECT id, filename, ext, mime_type, byte_size, created_at, updated_at, version,
-                       zotero_item_key, zotero_item_title, display_name, role
+                       external_item_key, external_item_title, display_name, role
                 FROM sources WHERE content_hash = ? LIMIT 1;
                 """,
                 arguments: [contentHash]
@@ -4743,11 +5233,11 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             try db.execute(sql: """
             INSERT INTO sources
               (id, filename, ext, mime_type, byte_size, created_at, updated_at, version,
-               zotero_item_key, zotero_item_title, display_name, content_hash, role)
+               external_item_key, external_item_title, display_name, content_hash, role)
             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?);
             """, arguments: [sourceID, filename, ext, mime, Int64(data.count),
                             nowTS, nowTS,
-                            zoteroItemKey, zoteroItemTitle, displayName,
+                            externalItemKey, externalItemTitle, displayName,
                             contentHash, role.rawValue])
 
             // 1. Blob (identical bytes = one row, ever).
@@ -4806,7 +5296,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             return SourceSummary(
                 id: id, filename: filename, ext: ext, mimeType: mime,
                 byteSize: data.count, createdAt: now, updatedAt: now, version: 1,
-                zoteroItemKey: zoteroItemKey, zoteroItemTitle: zoteroItemTitle,
+                externalItemKey: externalItemKey, externalItemTitle: externalItemTitle,
                 displayName: displayName, role: role
             )
         }
@@ -4819,7 +5309,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     public func addSource(filename: String, data: Data) throws -> SourceSummary {
         try addSource(
             filename: filename, data: data,
-            zoteroItemKey: nil, zoteroItemTitle: nil, mimeType: nil,
+            externalItemKey: nil, externalItemTitle: nil, mimeType: nil,
             provenance: nil, role: .primary, originalPath: nil,
             activityID: nil, resolvedDisplayName: nil)
     }
@@ -4840,7 +5330,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                     sql: """
                     SELECT s.id, s.filename, s.ext, s.mime_type, s.byte_size,
                            s.created_at, s.updated_at, s.version,
-                           s.zotero_item_key, s.zotero_item_title, s.display_name, s.role
+                           s.external_item_key, s.external_item_title, s.display_name, s.role
                     FROM sources s
                     JOIN source_versions sv ON sv.source_id = s.id
                     WHERE sv.external_identity = ? AND sv.blob_hash IS NULL
@@ -4868,7 +5358,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             let displayName: String?
             if let resolved = DisplayNameResolver.resolve(
                 filename: filename, data: Data(), mimeType: mime,
-                zoteroItemTitle: nil) {
+                externalItemTitle: nil) {
                 displayName = WikiNameRules.sanitized(resolved)
             } else if !WikiNameRules.isLinkable(filename) {
                 displayName = WikiNameRules.sanitized(filename)
@@ -4879,13 +5369,15 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             let sourceID = id.rawValue
 
             // 0. The sources identity row FIRST (byte_size = 0, content_hash NULL).
+            //    A byteless sync source starts in the fetcher lifecycle as
+            //    `pending`: it is exactly the shape an active fetcher claims.
             try db.execute(sql: """
             INSERT INTO sources
               (id, filename, ext, mime_type, byte_size, created_at, updated_at, version,
-               zotero_item_key, zotero_item_title, display_name, content_hash, role)
-            VALUES (?, ?, ?, ?, 0, ?, ?, 1, NULL, NULL, ?, NULL, ?);
+               external_item_key, external_item_title, display_name, content_hash, role, fetch_state)
+            VALUES (?, ?, ?, ?, 0, ?, ?, 1, NULL, NULL, ?, NULL, ?, ?);
             """, arguments: [sourceID, filename, ext, mime, nowTS, nowTS,
-                            displayName, role.rawValue])
+                            displayName, role.rawValue, SourceFetchState.pending.rawValue])
 
             // 1. Fetch/import activity + real provider agent (provenance is
             //    required for byteless sources).
@@ -4921,7 +5413,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             return SourceSummary(
                 id: id, filename: filename, ext: ext, mimeType: mime,
                 byteSize: 0, createdAt: now, updatedAt: now, version: 1,
-                zoteroItemKey: nil, zoteroItemTitle: nil,
+                externalItemKey: nil, externalItemTitle: nil,
                 displayName: displayName, role: role
             )
         }
@@ -4932,7 +5424,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         try dbWriter.read { db in
             let rows = try Row.fetchAll(db, sql: """
             SELECT id, filename, ext, mime_type, byte_size, created_at, updated_at,
-                   version, ingested_at, zotero_item_key, zotero_item_title,
+                   version, ingested_at, external_item_key, external_item_title,
                    display_name, content_hash, role
             FROM sources ORDER BY updated_at DESC;
             """)
@@ -5618,7 +6110,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             let rows = try Row.fetchAll(db, sql: """
             SELECT s.id, s.filename, s.ext, s.mime_type, s.byte_size,
                    s.created_at, s.updated_at, s.version,
-                   s.zotero_item_key, s.zotero_item_title, s.display_name, s.role,
+                   s.external_item_key, s.external_item_title, s.display_name, s.role,
                    a.plan, a.external_ref, sv.external_identity
             FROM sources s
             JOIN refs r ON r.kind = 'source-content' AND r.owner_id = s.id
@@ -5729,13 +6221,24 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         }
     }
 
+    /// Marks the source Ingested by stamping `ingested_at`. The FIRST
+    /// completed ingest wins: the UPDATE only touches rows that are not yet
+    /// stamped, so re-stamps — a host re-drain, or an agent following the
+    /// chat prompt's `wikictl log append --source` ritual after the host
+    /// already stamped (#1344) — are no-ops that never rewrite the timestamp.
+    ///
+    /// The unconditional `mutate()` emission is deliberate: a no-op UPDATE
+    /// still emits one `sourceUpdated`, which is a harmless reload. A no-op
+    /// means the row was already stamped, or the source row is gone (the
+    /// CLI path validates existence first; the host path does not need to —
+    /// there is nothing to stamp on a deleted row).
     public func markSourceIngested(id: SourceID) throws {
         try mutate(event: { _ in
             self.localEvent(.source, id: id.rawValue, change: .updated)
         }) { db in
             try db.execute(sql: """
             UPDATE sources SET ingested_at = ?, updated_at = ?
-            WHERE id = ?;
+            WHERE id = ? AND ingested_at IS NULL;
             """, arguments: [Date().timeIntervalSince1970,
                             Date().timeIntervalSince1970, id.rawValue])
         }
@@ -5873,17 +6376,33 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         }
     }
 
-    /// The `attachAcquiredBytes` implementation: same single-`mutate()`
-    /// transaction as before the acquisition-neutral rename — blob, hash-diff
-    /// version, mirror refresh, retained external-provenance columns.
+    /// The `attachAcquiredBytes` implementation: one single-`mutate()`
+    /// transaction — blob, hash-diff version, mirror refresh (real MIME, ext,
+    /// byte size, validated display filename), the neutral external
+    /// provenance columns, and the typed fetch lifecycle advance to
+    /// `formatJobPending` with its exact fetch producer. Writing the marker
+    /// in THIS transaction is what makes a crash after the blob lands
+    /// recoverable: the queue startup scan can always find the stranded
+    /// format job.
     public func attachAcquiredBytes(
         sourceID: SourceID,
         bytes: Data,
         mimeType: String,
+        originalFilename: String?,
         externalItemKey: String?,
         externalItemTitle: String?,
-        displayName: String?
+        producer: ExtractionInstalledPackageProducer?
     ) throws -> SourceVersion {
+        // A returned display filename is DATA, never a path. Validation
+        // matches the wire contract (bounded, separator-free); it may become
+        // `sources.filename` so the source row names the acquired file.
+        let validatedFilename: String?
+        if let originalFilename {
+            try ExtractorFetchRequest.validateFilename(originalFilename)
+            validatedFilename = originalFilename
+        } else {
+            validatedFilename = nil
+        }
         // The declared MIME is authoritative data from the result frame; the
         // file extension derives from it. Detection stays out of this path:
         // the reviewed package reported the true content type.
@@ -5894,13 +6413,25 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             return nil
             #endif
         }() ?? ""
-        let sanitizedDisplayName = displayName.map { WikiNameRules.sanitized($0) }
+        let sanitizedDisplayName = externalItemTitle.map { WikiNameRules.sanitized($0) }
+        let producerJSON: Data?
+        if let producer {
+            producerJSON = try JSONEncoder().encode(producer)
+        } else {
+            producerJSON = nil
+        }
         return try mutate(event: { _ in
             self.localEvent(.source, id: sourceID.rawValue, change: .updated)
         }) { db in
             guard bytes.count <= Self.ingestByteCap else {
                 throw WikiStoreError.unexpected(
                     "source \(bytes.count) bytes exceeds cap \(Self.ingestByteCap)")
+            }
+            guard bytes.isEmpty == false else {
+                // An empty acquisition can never become a source blob: it
+                // would re-enter the fetch route and loop forever.
+                throw WikiStoreError.unexpected(
+                    "attachAcquiredBytes refuses empty bytes for \(sourceID.rawValue)")
             }
             let contentHash = portableSHA256( bytes)
                 .map { String(format: "%02x", $0) }.joined()
@@ -5938,10 +6469,9 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 try db.execute(sql: """
                 INSERT INTO source_versions (id, source_id, parent_id, blob_hash,
                                              mime_type, activity_id, external_identity, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, ?, NULL, ?);
                 """, arguments: [newVersionID.rawValue, sourceID.rawValue, parent?.id.rawValue,
-                                contentHash, mimeType, activityID,
-                                externalItemKey, nowTS])
+                                contentHash, mimeType, activityID, nowTS])
                 // 3. UPSERT the active ref (generation + 1).
                 let nextGeneration = (prevGeneration ?? 0) + 1
                 try db.execute(sql: """
@@ -5957,22 +6487,30 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             }
 
             // 4. Refresh the denormalized mirror: real MIME, ext from MIME,
-            //    byte size, hash, and the retained external-provenance
-            //    columns. The display name is replaced only when provided.
+            //    byte size, hash, the neutral external-provenance columns,
+            //    the validated display filename (when the fetcher supplied
+            //    one), and the format-job marker with its exact producer —
+            //    all in this one transaction.
             try db.execute(sql: """
             UPDATE sources SET
                 mime_type = ?,
                 ext = ?,
                 byte_size = ?,
                 content_hash = ?,
-                zotero_item_key = COALESCE(?, zotero_item_key),
-                zotero_item_title = COALESCE(?, zotero_item_title),
+                filename = COALESCE(?, filename),
+                external_item_key = COALESCE(?, external_item_key),
+                external_item_title = COALESCE(?, external_item_title),
                 display_name = COALESCE(?, display_name),
+                fetch_state = ?,
+                fetch_producer = ?,
                 updated_at = ?,
                 version = version + 1
             WHERE id = ?;
             """, arguments: [mimeType, ext, Int64(bytes.count), contentHash,
+                            validatedFilename,
                             externalItemKey, externalItemTitle, sanitizedDisplayName,
+                            SourceFetchState.formatJobPending.rawValue,
+                            producerJSON.map { String(decoding: $0, as: UTF8.self) },
                             nowTS, sourceID.rawValue])
 
             return SourceVersion(
@@ -5981,7 +6519,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 blobHash: contentHash,
                 mimeType: mimeType,
                 activityID: parent?.activityID,
-                externalIdentity: externalItemKey, fetchedAt: now
+                externalIdentity: nil, fetchedAt: now
             )
         }
     }
@@ -5998,13 +6536,78 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         }) { db in
             try db.execute(sql: """
             UPDATE sources SET
-                zotero_item_key = COALESCE(?, zotero_item_key),
-                zotero_item_title = COALESCE(?, zotero_item_title),
+                external_item_key = COALESCE(?, external_item_key),
+                external_item_title = COALESCE(?, external_item_title),
                 display_name = COALESCE(?, display_name),
                 updated_at = ?
             WHERE id = ?;
             """, arguments: [externalItemKey, externalItemTitle, sanitizedDisplayName,
                             Date().timeIntervalSince1970, sourceID.rawValue])
+        }
+    }
+
+    /// Marks one fetch source `complete` — the acquisition pipeline is done
+    /// (Markdown derived, or the follow-on format job has finished). Idempotent.
+    public func markFetchComplete(sourceID: SourceID) throws {
+        try mutate(event: { _ in
+            self.localEvent(.source, id: sourceID.rawValue, change: .updated)
+        }) { db in
+            try db.execute(sql: """
+            UPDATE sources SET fetch_state = ?, updated_at = ? WHERE id = ?;
+            """, arguments: [SourceFetchState.complete.rawValue,
+                            Date().timeIntervalSince1970, sourceID.rawValue])
+        }
+    }
+
+    /// The recovery-scan variant: settles `formatJobPending` → `complete`
+    /// ONLY while the source's active content version is still the one the
+    /// completed format job was enqueued for. A concurrent re-fetch that
+    /// commits a NEWER version (re-marking `formatJobPending` for itself) is
+    /// never clobbered by a stale scan's settle — the method returns `false`
+    /// without writing, leaving the newer marker for its own scan.
+    @discardableResult
+    public func markFetchComplete(
+        sourceID: SourceID,
+        expectedContentVersionID: SourceVersionID
+    ) throws -> Bool {
+        try mutate(event: { _ in
+            self.localEvent(.source, id: sourceID.rawValue, change: .updated)
+        }) { db in
+            guard let active = try self.activeContentVersion(
+                sourceID: sourceID, on: db),
+                active.id == expectedContentVersionID else {
+                return false
+            }
+            try db.execute(sql: """
+            UPDATE sources SET fetch_state = ?, updated_at = ? WHERE id = ?;
+            """, arguments: [SourceFetchState.complete.rawValue,
+                            Date().timeIntervalSince1970, sourceID.rawValue])
+            return true
+        }
+    }
+
+    /// The typed fetch lifecycle state of one source. `nil` = never a fetch
+    /// source.
+    public func fetchState(sourceID: SourceID) throws -> SourceFetchState? {
+        try dbWriter.read { db in
+            let raw = try String.fetchOne(
+                db,
+                sql: "SELECT fetch_state FROM sources WHERE id = ?;",
+                arguments: [sourceID.rawValue])
+            return raw.flatMap(SourceFetchState.init(rawValue:))
+        }
+    }
+
+    /// Every source still holding a `formatJobPending` marker — the recovery
+    /// scan set. The queue startup path runs this per opened wiki and
+    /// re-derives the deduped follow-on item (or settles the marker when the
+    /// deduped item already completed).
+    public func sourcesWithPendingFormatJobs() throws -> [SourceID] {
+        try dbWriter.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+            SELECT id FROM sources WHERE fetch_state = ? ORDER BY updated_at ASC;
+            """, arguments: [SourceFetchState.formatJobPending.rawValue])
+            return rows.map { SourceID(rawValue: $0["id"] ?? "") }
         }
     }
 
@@ -6212,7 +6815,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         Self.logContentTypeConflicts(detection, filename: filename)
         let displayName: String?
         if let resolved = DisplayNameResolver.resolve(
-            filename: filename, data: data, mimeType: mime, zoteroItemTitle: nil) {
+            filename: filename, data: data, mimeType: mime, externalItemTitle: nil) {
             displayName = WikiNameRules.sanitized(resolved)
         } else if !WikiNameRules.isLinkable(filename) {
             displayName = WikiNameRules.sanitized(filename)
@@ -6238,7 +6841,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             try db.execute(sql: """
             INSERT INTO sources
               (id, filename, ext, mime_type, byte_size, created_at, updated_at, version,
-               zotero_item_key, zotero_item_title, display_name, content_hash, role)
+               external_item_key, external_item_title, display_name, content_hash, role)
             VALUES (?, ?, ?, ?, ?, ?, ?, 1, NULL, NULL, ?, ?, ?);
             """, arguments: [sourceID, filename, ext, mime, Int64(data.count),
                             nowTS, nowTS,
@@ -6272,7 +6875,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             return SourceSummary(
                 id: id, filename: filename, ext: ext, mimeType: mime,
                 byteSize: data.count, createdAt: now, updatedAt: now, version: 1,
-                zoteroItemKey: nil, zoteroItemTitle: nil,
+                externalItemKey: nil, externalItemTitle: nil,
                 displayName: displayName, role: role
             )
         }
@@ -6543,6 +7146,37 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         producer: ExtractionProducer?, providerID: ProviderID? = nil, modelID: ModelID? = nil,
         toolVersion: String? = nil, sourceVersionID: SourceVersionID? = nil, note: String? = nil
     ) throws -> SourceMarkdownVersion {
+        try appendDerivedMarkdownInternal(
+            sourceID: sourceID, content: content, origin: origin,
+            producer: producer, providerID: providerID, modelID: modelID,
+            toolVersion: toolVersion, sourceVersionID: sourceVersionID, note: note,
+            fetchCompletion: nil)
+    }
+
+    /// The fetcher markdown result's single-transaction write: the derived
+    /// Markdown version, the neutral external provenance, and the
+    /// `complete` fetch-state advance commit together, so a crash can never
+    /// leave the source `pending` beside a finished product (which would
+    /// make a controlled retry append a second Markdown version).
+    public func appendFetchMarkdown(
+        sourceID: SourceID, content: String,
+        package: ExtractionInstalledPackageProducer,
+        externalItemKey: String?, externalItemTitle: String?,
+        sourceVersionID: SourceVersionID
+    ) throws -> SourceMarkdownVersion {
+        try appendDerivedMarkdownInternal(
+            sourceID: sourceID, content: content, origin: .extraction,
+            producer: .installedPackage(package), providerID: nil, modelID: nil,
+            toolVersion: nil, sourceVersionID: sourceVersionID, note: nil,
+            fetchCompletion: (externalItemKey, externalItemTitle))
+    }
+
+    private func appendDerivedMarkdownInternal(
+        sourceID: SourceID, content: String, origin: SourceMarkdownOrigin,
+        producer: ExtractionProducer?, providerID: ProviderID?, modelID: ModelID?,
+        toolVersion: String?, sourceVersionID: SourceVersionID?, note: String?,
+        fetchCompletion: (externalItemKey: String?, externalItemTitle: String?)?
+    ) throws -> SourceMarkdownVersion {
         try Self.validateDerivedMarkdownRequest(
             origin: origin, producer: producer, providerID: providerID, modelID: modelID,
             toolVersion: toolVersion)
@@ -6608,6 +7242,29 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             """, arguments: [sourceVersionID?.rawValue, blobHash, id.rawValue])
             try self.upsertMarkdownDerivedRef(sourceID: sourceID, versionID: id, now: nowTS, on: db)
             self.upsertSourceSearch(sourceID: sourceID, body: content, on: db)
+
+            // Fetcher markdown results (fetchCompletion non-nil): the provenance
+            // columns and the `complete` fetch-state advance ride the SAME
+            // transaction as the derived version, so a crash can never leave
+            // the source `pending` beside a finished product (which would make
+            // a controlled retry append a second Markdown version).
+            if let fetchCompletion {
+                let sanitizedTitle = fetchCompletion.externalItemTitle
+                    .map { WikiNameRules.sanitized($0) }
+                try db.execute(sql: """
+                UPDATE sources SET
+                    external_item_key = COALESCE(?, external_item_key),
+                    external_item_title = COALESCE(?, external_item_title),
+                    display_name = COALESCE(?, display_name),
+                    fetch_state = ?,
+                    updated_at = ?
+                WHERE id = ?;
+                """, arguments: [
+                    fetchCompletion.externalItemKey, fetchCompletion.externalItemTitle,
+                    sanitizedTitle, SourceFetchState.complete.rawValue, nowTS,
+                    sourceID.rawValue,
+                ])
+            }
 
             return SourceMarkdownVersion(
                 id: id, sourceID: sourceID, parentID: parentID, content: content,
@@ -6784,48 +7441,80 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         let result = try mutate(event: { result in
             result.didWrite ? self.localEvent(.page, id: pageID.rawValue, change: .updated) : nil
         }) { db in
-            let title = WikiNameRules.sanitized(title)
-            let slug = try self.uniqueSlug(from: title, id: pageID, on: db)
-            let bodyData = Data(body.utf8)
-            let hash = portableSHA256( bodyData)
-                .map { String(format: "%02x", $0) }.joined()
-            let now = Date()
-            let nowTS = now.timeIntervalSince1970
-            let normalizedProvenance = try self.normalizedPageVersionProvenance(provenance, on: db)
-
-            // 1. CAS check: resolve current head (ref → version_id, or MAX(id)).
-            let head = try Self.pageHeadVersionIDLocked(pageID: pageID, on: db)
-            if let expected = expectedHeadVersionID, expected != head {
-                throw PageConflictError(
-                    pageID: pageID, expectedVersionID: expected, actualVersionID: head)
-            }
-
-            // 1b. Amend check (autosave coalescing). Same-actor saves within a
-            //     short coalescing window amend the head version in place.
-            if let amendVersionID = try self.tryAmendPageVersion(
-                db: db, pageID: pageID, head: head, title: title, slug: slug,
-                body: body, bodyData: bodyData, hash: hash,
-                lastEditedBy: lastEditedBy, provenance: normalizedProvenance, now: now, nowTS: nowTS)
-            {
-                return PageVersionProvenanceResult(versionID: amendVersionID, didWrite: true)
-            }
-
-            // 2–6. Append the new version row (blob + activity + version +
-            //      mirror + ref). Extracted to `appendPageVersionLocked` so
-            //      `updatePage` (CAS-off) can share the same write seam
-            //      WITHOUT re-entering `mutate(event:)` (the HIGH hazard
-            //      called out in `plans/page-provenance.md` §5.3 — public
-            //      mutators that compose must pass the `Database` to internal
-            //      helpers, not re-call `mutate`). This helper does NOT emit;
-            //      this method's `mutate` wrapper is the single emit site.
-            return try self.createPageVersionWithProvenance(on: db, request: .init(
-                pageID: pageID, head: head, mergeParentID: nil, title: title, body: body,
-                bodyData: bodyData, hash: hash, activityAgent: .pageAuthor(lastEditedBy),
-                activityKind: "edit", now: now, nowTS: nowTS,
-                provenance: normalizedProvenance,
-                publication: .main(slug: slug, mirrorMutation: .append)))
+            try self.appendPageVersionLocked(
+                pageID: pageID, title: title, body: body,
+                expectedHeadVersionID: expectedHeadVersionID,
+                lastEditedBy: lastEditedBy, provenance: provenance, on: db)
         }
         return result.versionID
+    }
+
+    /// The db-handle core of `appendPageVersion` — CAS check, amend
+    /// (autosave-coalescing) check, and the six-step version append.
+    /// NOT a `mutate(event:)` wrapper — no transaction of its own, no event.
+    /// `appendPageVersion` (public CAS append) and the composed
+    /// `upsertPage(id:title:rawBody:expectation:author:provenance:)` wrap
+    /// their own `mutate` around this so each emits exactly one event
+    /// (Approach-A composition — see the `mutate()` seam doc above).
+    private func appendPageVersionLocked(
+        pageID: PageID, title: String, body: String,
+        expectedHeadVersionID: PageVersionID?,
+        lastEditedBy: String?, provenance: [PageVersionSourceInput],
+        on db: Database
+    ) throws -> PageVersionProvenanceResult {
+        let title = WikiNameRules.sanitized(title)
+        let slug = try self.uniqueSlug(from: title, id: pageID, on: db)
+        let bodyData = Data(body.utf8)
+        let hash = portableSHA256( bodyData)
+            .map { String(format: "%02x", $0) }.joined()
+        let now = Date()
+        let nowTS = now.timeIntervalSince1970
+        let normalizedProvenance = try self.normalizedPageVersionProvenance(provenance, on: db)
+
+        // 1. CAS check: resolve current head (ref → version_id, or MAX(id)).
+        let head = try Self.pageHeadVersionIDLocked(pageID: pageID, on: db)
+        if let expected = expectedHeadVersionID, expected != head {
+            throw PageConflictError(
+                pageID: pageID, expectedVersionID: expected, actualVersionID: head)
+        }
+
+        // An identical same-author write must not enter autosave amendment:
+        // that path updates the mirror and ref even when the content is unchanged.
+        if let head,
+           let row = try Row.fetchOne(db, sql: """
+               SELECT pv.blob_hash, pv.title, p.last_edited_by, p.body_markdown
+               FROM page_versions pv JOIN pages p ON p.id = pv.page_id
+               WHERE pv.id = ?;
+               """, arguments: [head.rawValue]) {
+            let headHash: String = row["blob_hash"]
+            let headTitle: String = row["title"]
+            let actor: String? = row["last_edited_by"]
+            let mirrorBody: String = row["body_markdown"]
+            if headHash == hash, headTitle == title, actor == lastEditedBy,
+               mirrorBody == body,
+               try self.pageVersionSourceInputs(versionID: head, on: db) == normalizedProvenance {
+                return PageVersionProvenanceResult(versionID: head, didWrite: false)
+            }
+        }
+
+        // 1b. Amend check (autosave coalescing). Same-actor saves within a
+        //     short coalescing window amend the head version in place.
+        if let amendVersionID = try self.tryAmendPageVersion(
+            db: db, pageID: pageID, head: head, title: title, slug: slug,
+            body: body, bodyData: bodyData, hash: hash,
+            lastEditedBy: lastEditedBy, provenance: normalizedProvenance, now: now, nowTS: nowTS)
+        {
+            return PageVersionProvenanceResult(versionID: amendVersionID, didWrite: true)
+        }
+
+        // 2–6. Append the new version row (blob + activity + version +
+        //      mirror + ref) via the shared non-emitting helper.
+        return try self.createPageVersionWithProvenance(on: db, request: .init(
+            pageID: pageID, head: head, mergeParentID: nil, title: title, body: body,
+            bodyData: bodyData, hash: hash, activityAgent: .pageAuthor(lastEditedBy),
+            activityKind: "edit", now: now, nowTS: nowTS,
+            provenance: normalizedProvenance,
+            publication: .main(slug: slug, mirrorMutation: .append)))
     }
 
     /// Shared version-append logic for `appendPageVersion` (CAS path) and
@@ -8943,7 +9632,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 // from `searchSimilarSourcesNeverSelectsStar`.
                 let rows = try Row.fetchAll(db, sql: """
                     SELECT s.id, s.filename, s.ext, s.mime_type, s.byte_size, s.created_at, s.updated_at,
-                           s.version, s.zotero_item_key, s.zotero_item_title, s.display_name, s.role,
+                           s.version, s.external_item_key, s.external_item_title, s.display_name, s.role,
                            sc.embedding
                     FROM source_chunks sc
                     JOIN sources s ON s.id = sc.source_id;
@@ -10946,8 +11635,8 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         let createdAt: Double = row["created_at"]
         let updatedAt: Double = row["updated_at"]
         let version: Int = row["version"]
-        let zoteroKey: String? = row["zotero_item_key"]
-        let zoteroTitle: String? = row["zotero_item_title"]
+        let zoteroKey: String? = row["external_item_key"]
+        let zoteroTitle: String? = row["external_item_title"]
         let displayName: String? = row["display_name"]
         let roleRaw: String = row["role"]
 
@@ -10960,8 +11649,8 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             createdAt: Date(timeIntervalSince1970: createdAt),
             updatedAt: Date(timeIntervalSince1970: updatedAt),
             version: version,
-            zoteroItemKey: zoteroKey,
-            zoteroItemTitle: zoteroTitle,
+            externalItemKey: zoteroKey,
+            externalItemTitle: zoteroTitle,
             displayName: displayName,
             role: SourceRole(rawValue: roleRaw) ?? .primary
         )
@@ -11874,7 +12563,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             db,
             sql: """
             SELECT id, filename, ext, mime_type, byte_size, created_at, updated_at, version,
-                   zotero_item_key, zotero_item_title, display_name, role
+                   external_item_key, external_item_title, display_name, role
             FROM sources WHERE id = ?;
             """,
             arguments: [id.rawValue]

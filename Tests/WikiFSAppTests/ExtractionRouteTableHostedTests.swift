@@ -199,8 +199,9 @@ struct ExtractionRouteTableHostedTests {
         // clip view — the scrollable, window-bounded layout.
         let content = try #require(window.contentView)
         #expect(containsDescendant(content) { $0 is NSClipView })
-        // Six canonical routes plus the registration-derived EPUB route.
-        // The packages pane is not mounted on the default tab.
+        // Six canonical extractor routes plus the registration-derived EPUB
+        // route. Fetcher routes live in the Fetch tab's own table; the
+        // packages pane is not mounted on the default tab.
         #expect(tableViewRowCounts(window) == [7])
         // Under the metrics ceiling every row has to be visible, not merely
         // present. The transcript row is last, so a table sized one row short
@@ -218,6 +219,7 @@ struct ExtractionRouteTableHostedTests {
         var loaded = snapshot(failedPackageIDs: ["org.example.broken"])
         loaded.rows = [
             ExtractorPackageSettingsRow(
+                role: .extractor,
                 kind: .pdf,
                 packageID: "org.example.pdf",
                 version: "1.0.0",
@@ -261,6 +263,7 @@ struct ExtractionRouteTableHostedTests {
         loaded.rows = try (0..<20).map { index in
             let raw = "org.example.pkg\(String(format: "%02d", index))"
             return ExtractorPackageSettingsRow(
+                role: .extractor,
                 kind: .pdf,
                 packageID: raw,
                 version: "1.0.0",
@@ -432,7 +435,8 @@ struct ExtractionRouteTableHostedTests {
         #expect(source.contains("Choose Another Extractor…"))
         #expect(source.contains("Copy Diagnostics"))
         #expect(source.contains("retryActivation?()"))
-        #expect(source.contains("focusedRoutePicker = route"))
+        // The focus-restore flow is gone with the status column (asserted
+        // above); no focusedRoutePicker may return.
         #expect(source.contains("copyDiagnostics(presentation.diagnosticReport)"))
         #expect(source.contains("extraction.status.action"))
         #expect(source.contains("extraction.status.technical-details"))
@@ -448,8 +452,9 @@ struct ExtractionRouteTableHostedTests {
         // ACP and Docling configuration is package-level now: the Packages
         // table's status symbol opens the recovery sheet, which presents the
         // shared service dialogs above the pane switcher (macos-design
-        // progressive disclosure) rather than inline sections.
-        #expect(source.contains("switch routeSelections[row.id]") == false)
+        // progressive disclosure) rather than inline sections. The recovery
+        // row legitimately switches on the per-route selection map to map a
+        // typed selection onto its reviewed lineage.
         #expect(source.contains("TableColumn(\"Configuration\")") == false)
         #expect(source.contains("Button(\"Configure…\")"))
         #expect(source.contains(".sheet(item: $serviceConfigurationDialog)"))
@@ -489,6 +494,71 @@ struct ExtractionRouteTableHostedTests {
         // Both panes can raise the service configuration sheet, so it is
         // presented above the switcher rather than inside one pane.
         #expect(source.contains(".sheet(item: $serviceConfigurationDialog) { dialog in\n            serviceConfigurationSheet(dialog)"))
+    }
+
+    /// AC.5 source contract: the Fetch tab's identifier families are
+    /// complete literals with their own `fetch.*` namespace, the extractor
+    /// arm's `extraction.*` literals stay byte-identical, and the fetchers
+    /// focus renders its own route table (never the extractor table).
+    @Test("fetch focus keeps its own ids and the extractor ids stay pinned")
+    func fetchFocusIdFamiliesArePinned() throws {
+        let source = try sourceView()
+
+        // The fetch namespace: full literals, no interpolation with them.
+        let fetchLiterals = [
+            "fetch.pane.switcher",
+            "fetch.routes.table",
+            "fetch.routes.picker",
+            "fetch.packages.table",
+            "fetch.packages.refresh",
+            "fetch.packages.empty",
+            "fetch.packages.row",
+            "fetch.packages.status",
+            "fetch.packages.digest",
+            "fetch.packages.registration",
+            "fetch.packages.import.button",
+            "fetch.packages.configure",
+            "fetch.packages.remove",
+            "fetch.packages.progress",
+            "fetch.packages.diagnostic",
+            "fetch.packages.error",
+        ]
+        for literal in fetchLiterals {
+            #expect(source.contains(literal), "missing fetch id literal \(literal)")
+        }
+
+        // The extractor arm's literals stay exactly as the hosted contracts
+        // pin them (single-sourced in the FocusPresentation constant).
+        let extractorLiterals = [
+            "extraction.pane.switcher",
+            "extraction.routes.table",
+            "extraction.routes.picker",
+            "extraction.packages.table",
+            "extraction.packages.refresh",
+            "extraction.packages.empty",
+            "extraction.packages.row",
+            "extraction.packages.status",
+            "extraction.packages.digest",
+            "extraction.packages.registration",
+            "extraction.packages.import.button",
+            "extraction.packages.configure",
+            "extraction.packages.remove",
+            "extraction.packages.progress",
+            "extraction.packages.diagnostic",
+            "extraction.packages.error",
+        ]
+        for literal in extractorLiterals {
+            #expect(source.contains(literal), "lost extractor id literal \(literal)")
+        }
+
+        // The fetchers focus renders its own route table; the extractor
+        // table's pinned call sites stay byte-identical.
+        #expect(source.contains("private var fetcherRouteTable: some View"))
+        #expect(source.contains("TableColumn(\"Default fetcher\")"))
+        #expect(source.contains("TableColumn(\"Default extractor\")"))
+        #expect(source.contains("Table(defaultsRows)"))
+        // The ACP section is extractor-scope only.
+        #expect(source.contains("roleFocus == .extractors"))
     }
 
     @Test("table row identifiers are unique")
@@ -715,6 +785,55 @@ struct ExtractorRouteRecoveryPresenterTests {
             row: docling, extractorName: "Docling Serve", facts: doclingFacts)
         #expect(failedTest.status == .needsSetup(.doclingConnectionFailed))
         #expect(failedTest.primaryAction == .testConnection)
+    }
+
+    @Test func connectionFailureMessageStaysScopedToDoclingRoutes() throws {
+        // A generic package route must not carry the view-global Docling
+        // connection-test message into its own diagnostics (#1306): the
+        // `Failure:` line reports this route's setup reason instead.
+        let package = try logical()
+        var packageFacts = ExtractorRouteRecoveryFacts()
+        packageFacts.credentialRequirements = [requirement(
+            logical: package,
+            configured: true,
+            authorization: .needsAuthorization)]
+        packageFacts.connectionTest = .failed
+        packageFacts.connectionFailureMessage = "Docling test canary: connection refused"
+        let unauthorized = ExtractorRouteRecoveryPresenter.present(
+            row: row(selection: .installed(package), status: .ready),
+            extractorName: "Example",
+            facts: packageFacts)
+        #expect(unauthorized.status == .needsSetup(.unauthorizedCredential))
+        #expect(unauthorized.diagnosticReport.contains("Failure: The package is not authorized to use the credential."))
+        #expect(unauthorized.diagnosticReport.contains("Docling test canary") == false)
+        #expect(unauthorized.diagnosticReport.contains("Connection test:") == false)
+
+        // The same connection state on the Docling route still surfaces the
+        // detailed failure message, unredacted.
+        let doclingLogical = ProcessExtractionServices.reviewedDoclingLogical
+        var doclingFacts = ExtractorRouteRecoveryFacts()
+        doclingFacts.doclingEndpoint = "https://docling.example.test/convert"
+        doclingFacts.doclingCredentialConfigured = true
+        doclingFacts.credentialRequirements = []
+        doclingFacts.connectionTest = .failed
+        doclingFacts.connectionFailureMessage = "Connection refused while contacting Docling"
+        let doclingRow = row(selection: .installed(doclingLogical), status: .ready)
+        let connectionFailed = ExtractorRouteRecoveryPresenter.present(
+            row: doclingRow, extractorName: "Docling Serve", facts: doclingFacts)
+        #expect(connectionFailed.status == .needsSetup(.doclingConnectionFailed))
+        #expect(connectionFailed.diagnosticReport.contains("Failure: Connection refused while contacting Docling"))
+
+        // A retained activation failure still outranks the connection message.
+        doclingFacts.retainedFailures = [ExtractorPackageFailureSummary(
+            packageID: doclingLogical.packageID.rawValue,
+            version: "1.0.0",
+            digestPrefix: "111111111111",
+            message: "activation failed canary")]
+        let activationFailed = ExtractorRouteRecoveryPresenter.present(
+            row: doclingRow, extractorName: "Docling Serve", facts: doclingFacts)
+        #expect(activationFailed.status == .activationFailed(message: "activation failed canary"))
+        #expect(activationFailed.diagnosticReport.contains("Failure: activation failed canary"))
+        #expect(activationFailed.diagnosticReport.contains("Connection refused while contacting Docling") == false)
     }
 
     @Test func packageLifecycleMatrixUsesNewestApplicableFailure() throws {

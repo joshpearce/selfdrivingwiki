@@ -44,10 +44,94 @@ import WikiFSTypes
             try AppQueueIngestionProvider.validateLauncherOutcome(
                 exitStatus: nil,
                 preflightError: "Select a model before starting ingestion.",
-                runHadTurnFailure: false)
+                turnFailure: .none)
             Issue.record("Expected preflight refusal")
         } catch QueueIngestionError.spawnFailed(let message) {
             #expect(message == "Select a model before starting ingestion.")
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    /// #1354: the observed failure shape — the multi-phase orchestrator's
+    /// abort paths call `finish(status: -1)` AFTER recording the launch
+    /// diagnostic, so the outcome carries an exit status, a preflight error,
+    /// and zero agent turns. The old validator only rejected a nonzero exit
+    /// when a turn had failed, so this tuple sailed through as success and
+    /// stamped sources ingested.
+    @MainActor
+    @Test("launch failure with exit status -1 and zero turns cannot complete (#1354)")
+    func launchFailureWithExitStatusCannotComplete() {
+        do {
+            try AppQueueIngestionProvider.validateLauncherOutcome(
+                exitStatus: -1,
+                preflightError: "Failed to launch codex-acp. stderr: env: node: No such file or directory",
+                turnFailure: .none)
+            Issue.record("Expected launch-failure rejection")
+        } catch QueueIngestionError.spawnFailed(let message) {
+            // The launch diagnostic must survive into the queue error so the
+            // job view shows the actionable stderr, not a generic message.
+            #expect(message.contains("env: node: No such file or directory"))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    /// #1354: belt-and-suspenders — an abort that reaches `finish(status:-1)`
+    /// WITHOUT a recorded preflight diagnostic (safety-net teardown, user
+    /// stop, a future abort path that forgets to set `preflightError`) must
+    /// still fail. Every successful completion path finishes with status 0.
+    /// #1364: the validator states the abort; it never claims a process
+    /// death — every negative status is synthesized by the launcher, so a
+    /// death is a fact the validator cannot know.
+    @MainActor
+    @Test("no turn failure with negative exit reports an abort, not a death (#1364)")
+    func nonzeroExitWithoutTurnFailureStillFails() {
+        do {
+            try AppQueueIngestionProvider.validateLauncherOutcome(
+                exitStatus: -1,
+                preflightError: nil,
+                turnFailure: .none)
+            Issue.record("Expected abort rejection")
+        } catch QueueIngestionError.spawnFailed(let message) {
+            #expect(message == "The agent run aborted before completing (exit status -1).")
+            #expect(!message.contains("died"))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    @MainActor
+    @Test("nonzero positive exit without turn failure reports an abort (#1364)")
+    func positiveExitWithoutTurnFailureReportsAbort() {
+        do {
+            try AppQueueIngestionProvider.validateLauncherOutcome(
+                exitStatus: 1,
+                preflightError: nil,
+                turnFailure: .none)
+            Issue.record("Expected abort rejection")
+        } catch QueueIngestionError.spawnFailed(let message) {
+            #expect(message == "The agent run aborted before completing (exit status 1).")
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    /// #1364: a turn failure that a later clean turn end recovered from is
+    /// not the run's terminal cause — when the run then still fails, the
+    /// message names the recovery, not the long-gone ceiling.
+    @MainActor
+    @Test("run failing after a recovered turn failure names the recovery (#1364)")
+    func recoveredTurnFailureNamesTheRecovery() {
+        do {
+            try AppQueueIngestionProvider.validateLauncherOutcome(
+                exitStatus: -1,
+                preflightError: nil,
+                turnFailure: .recovered)
+            Issue.record("Expected rejection")
+        } catch QueueIngestionError.spawnFailed(let message) {
+            #expect(message ==
+                "The agent run failed after recovering from an earlier turn failure (exit status -1).")
         } catch {
             Issue.record("Unexpected error: \(error)")
         }
@@ -59,7 +143,7 @@ import WikiFSTypes
         try AppQueueIngestionProvider.validateLauncherOutcome(
             exitStatus: 0,
             preflightError: nil,
-            runHadTurnFailure: false)
+            turnFailure: .none)
     }
 
     @MainActor
@@ -69,7 +153,7 @@ import WikiFSTypes
             try AppQueueIngestionProvider.validateLauncherOutcome(
                 exitStatus: -1,
                 preflightError: nil,
-                runHadTurnFailure: true)
+                turnFailure: .unrecovered)
             Issue.record("Expected turn failure")
         } catch QueueIngestionError.spawnFailed(let message) {
             #expect(message ==
@@ -77,6 +161,34 @@ import WikiFSTypes
         } catch {
             Issue.record("Unexpected error: \(error)")
         }
+    }
+
+    // MARK: - Host-stamped ingest state (#1344)
+
+    /// The validated-successful pipeline run stamps exactly the staged
+    /// sources. Placed beside the `validateLauncherOutcome` throw tests
+    /// above: both halves of the ordering contract (validate throws → stamp
+    /// unreachable; validate passes → stamp lands) live in one reviewed
+    /// file.
+    @MainActor
+    @Test("stampIngestedSources stamps only the staged sources (#1344)")
+    func stampIngestedSourcesStampsOnlyStagedSources() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wikifs-app-provider-stamp-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let store = try GRDBWikiStore(databaseURL: dir.appendingPathComponent("WikiFS.sqlite"))
+        let staged = try store.addSource(filename: "staged.pdf", data: Data("%PDF staged".utf8))
+        let bytesUnavailable = try store.addSource(filename: "gone.pdf", data: Data("%PDF gone".utf8))
+        let model = WikiStoreModel(store: store)
+
+        AppQueueIngestionProvider.stampIngestedSources(
+            requested: [
+                (id: staged.id, outcome: .staged(name: "staged.pdf")),
+                (id: bytesUnavailable.id, outcome: .bytesUnavailable),
+            ],
+            store: model)
+
+        #expect(try store.markedSourceIDs() == [staged.id.rawValue])
     }
 
     // MARK: - Fixtures

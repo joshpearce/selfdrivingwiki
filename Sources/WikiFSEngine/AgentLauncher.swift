@@ -147,6 +147,27 @@ public final class AgentLauncher {
     /// and the provider throws so the queue item transitions to `.failed`
     /// instead of `.completed`. Cleared in `resetRunArtifacts()`.
     @ObservationIgnored public var runHadTurnFailure = false
+    /// #1364: a successful turn end was observed AFTER the most recent
+    /// `.turnFailed` in the same run (e.g. turn 1 hit the ceiling, turn 2
+    /// completed). Set when a clean turn end follows the most recent
+    /// `.turnFailed`; reset by each new `.turnFailed` — the latch describes
+    /// only the LAST failure, so fail→clean→fail reads unrecovered. Cleared
+    /// wherever `runHadTurnFailure` is cleared (`resetRunArtifacts()`).
+    @ObservationIgnored public private(set) var runRecoveredAfterTurnFailure = false
+    /// #1364 derived signal: the run's last observed turn failure was never
+    /// recovered from — no clean turn end followed it. `runHadTurnFailure`
+    /// stays sticky for pass/fail (#765); tests pin this boolean directly.
+    public var runTerminalTurnFailure: Bool {
+        runHadTurnFailure && !runRecoveredAfterTurnFailure
+    }
+    /// #1364: the validator-facing form of the turn-failure fact — the
+    /// launcher's one-word statement of what it observed (`none` /
+    /// `recovered` / `unrecovered`). The queue validator's message selection
+    /// reads this; it never infers a cause from the exit-status sign.
+    public var runTurnFailureFact: QueueIngestionTurnFailureFact {
+        if !runHadTurnFailure { return .none }
+        return runRecoveredAfterTurnFailure ? .recovered : .unrecovered
+    }
     /// Ceiling-kill forensic context inherited from the most recent prior run
     /// of this queue item. Nil for first attempts and non-queue runs.
     @ObservationIgnored private var retryCeilingKillContext: CeilingKillContext?
@@ -155,6 +176,17 @@ public final class AgentLauncher {
     /// successful run. Settable from `AgentOperationRunner` for silent-failure
     /// paths where no agent process is spawned.
     public var preflightError: String?
+    /// #1354: the last non-quota phase failure diagnostic — ANY error
+    /// `runPhase`'s catch observes, not just launch failures (e.g.
+    /// `ACPBackendError.launchFailed`'s stderr payload, or a turn/spawn
+    /// error from a later phase). Copied into `preflightError` at the
+    /// terminal abort point (`runACPIngestFallback`'s failure branch) so
+    /// the queue error carries an actual phase diagnostic instead of a
+    /// generic "did not start" message. Never read by validators directly
+    /// — only the abort-point copy is load-bearing — so a phase failure
+    /// followed by a successful fallback or later phase cannot poison a
+    /// good run. Cleared per run in `resetRunArtifacts()`.
+    @ObservationIgnored public private(set) var lastPhaseFailureMessage: String?
     /// The kind of the operation currently running (drives the UI title / spinner).
     ///
     /// Exposed without `private(set)` so tests can simulate "a non-query run is
@@ -243,8 +275,14 @@ public final class AgentLauncher {
     /// #609: third parameter is the turn ceiling — `TurnLivenessPolicy.ceiling(for:)`
     /// decides per kind: `.chat` → 1800s (interactive default), `.ingest`/`.lint`
     /// → 600s (unattended pipelines must not burn 30 minutes on a stall).
-    @ObservationIgnored var resolveBackend: (PermissionPolicy, Duration?, TimeInterval) -> AgentBackend = {
-        AgentBackendFactory.makeBackend(policy: $0, budget: $1, turnCeilingTimeout: $2)
+    ///
+    /// #1364: fourth parameter is the idle-stall bound —
+    /// `TurnLivenessPolicy.idleStallTimeout(for:)` decides per kind:
+    /// `.chat` → nil (idle monitoring disabled — a user is attending and the
+    /// UI chip is the release valve), `.ingest`/`.lint` → 300s (a queued
+    /// phase silent for 5 minutes is dead or wedged).
+    @ObservationIgnored var resolveBackend: (PermissionPolicy, Duration?, TimeInterval, TimeInterval?) -> AgentBackend = {
+        AgentBackendFactory.makeBackend(policy: $0, budget: $1, turnCeilingTimeout: $2, idleStallTimeout: $3)
     }
 
     /// The permission policy, resolved per operation kind. #607: previously one
@@ -295,8 +333,10 @@ public final class AgentLauncher {
 
     /// Constructs the per-run quota fallback coordinator. Production retains
     /// durable App Group quota state; tests inject a fixture-local state file
-    /// so an integration run never reads or writes developer state.
-    @ObservationIgnored var makeQuotaFallbackCoordinator: () -> QuotaFallbackCoordinator = {
+    /// so an integration run never reads or writes developer state. The live
+    /// semantic evaluation harness injects a disposable state file under its
+    /// own output directory for the same reason.
+    @ObservationIgnored public var makeQuotaFallbackCoordinator: () -> QuotaFallbackCoordinator = {
         QuotaFallbackCoordinator()
     }
 
@@ -307,6 +347,21 @@ public final class AgentLauncher {
     /// time; tests/the daemon default to nil (no deny rule emitted).
     @ObservationIgnored public var pdf2mdScriptPathResolver: () -> String? = { nil }
 
+    /// Wiki strategies phase 4 — title resolver for pre-launch plan
+    /// validation (`ACPIngestPlanValidation`). Resolves a SANITIZED page
+    /// title to an existing page id using the store's `resolveTitleToID`
+    /// semantics. The launcher NEVER derives a wiki database path itself:
+    /// the host that owns a store injects the closure — the shared
+    /// production LauncherFactory wires the wiki's own store (app and
+    /// daemon), and the daemon provider re-wires its store as a backstop;
+    /// the pipeline tests inject an in-memory store and the live evaluation
+    /// harness its disposable database. The default `nil` (an uninjected
+    /// test harness) limits duplicate detection to new-title ASCII folding
+    /// inside the validator. An INJECTED resolver that throws is an
+    /// actionable plan-validation failure, never a silent degrade;
+    /// staged-source reference checks always run.
+    @ObservationIgnored public var planValidationResolveTitle: ((String) throws -> PageID?)?
+
     /// The user-environment `PATH` for run contexts, resolved through the
     /// account's configured login shell (shell-NEUTRAL — `$SHELL`/passwd
     /// record, never a hard-coded zsh). Falls back to the inherited process
@@ -316,6 +371,40 @@ public final class AgentLauncher {
         await UserEnvironmentPath.userPATH()
             ?? ProcessInfo.processInfo.environment["PATH"]
             ?? "/usr/bin:/bin"
+    }
+
+    /// The EXPLICIT wiki database this launcher's runs read and write, when a
+    /// run targets a database outside the standard App Group container layout.
+    /// nil (every production launch today) keeps the default: the container
+    /// layout `<container>/<wikiID>.sqlite`.
+    ///
+    /// The live semantic evaluation harness sets this to a disposable fixture
+    /// database under project `tmp/` (see
+    /// `plans/wiki-strategy-evaluation-harness.md`). EVERY place the launcher
+    /// derives a wiki database URL from a wiki id MUST go through
+    /// ``wikiDatabaseURL(for:container:)`` — run contexts (trusted prompts +
+    /// child env), the seatbelt write fence, and in-plan title validation —
+    /// so all of them target the same database.
+    ///
+    /// Safety: an explicit value must point OUTSIDE the App Group container
+    /// (mirroring `WikiResolver`'s boundary guard); the eval harness
+    /// constructs it under a disposable `tmp/` directory by construction.
+    @ObservationIgnored public var wikiDatabaseOverride: URL?
+
+    /// The single wiki-database derivation for this launcher: the explicit
+    /// override when set, else the container layout
+    /// `<containerDirectory>/<wikiID>.sqlite` (mirrors
+    /// `WikiResolver.databaseURL(for:)`). MainActor like every caller (run
+    /// context, seatbelt fence, in-plan title validation).
+    public func wikiDatabaseURL(
+        for wikiID: WikiID,
+        container containerDirectory: URL
+    ) -> URL {
+        if let wikiDatabaseOverride {
+            return wikiDatabaseOverride
+        }
+        return containerDirectory
+            .appendingPathComponent("\(wikiID.rawValue).sqlite", isDirectory: false)
     }
 
     /// Build the run context for one spawn: resolves the user environment
@@ -336,7 +425,8 @@ public final class AgentLauncher {
             wikictlDirectory: wikictlDirectory,
             userPATH: userPath,
             stateFilePath: operation?.stateFilePath,
-            stagedSourcePaths: operation?.stagedSourcePaths ?? [])
+            stagedSourcePaths: operation?.stagedSourcePaths ?? [],
+            databasePath: wikiDatabaseOverride)
         context.createTempDirectories()
         return context
     }
@@ -1247,7 +1337,8 @@ public final class AgentLauncher {
         for operation: AgentProviderOperationKind,
         providerOverride: ProviderID? = nil,
         modelOverride: ModelID? = nil,
-        thinkingOverride: String? = nil
+        thinkingOverride: String? = nil,
+        queuedWorkUnits: Int? = nil
     ) async throws -> (AgentOperationPreparation, AgentProviderPreparedBackend)? {
         await awaitProviderRelease()
         guard let services = privateProviderServices else { return nil }
@@ -1255,7 +1346,8 @@ public final class AgentLauncher {
             operation,
             providerOverride: providerOverride,
             modelOverride: modelOverride,
-            thinkingOverride: thinkingOverride)
+            thinkingOverride: thinkingOverride,
+            queuedWorkUnits: queuedWorkUnits)
         providerOperationToken = preparation.selection.token
         let prepared = try await services.preparedBackend(
             from: preparation.selection.token,
@@ -1483,9 +1575,16 @@ public final class AgentLauncher {
         case .lint, .lintPage: .lint
         case .query: .interactive
         }
+        // Batch-aware queued ceiling (2026-10-04, job 01M44Q63RG…): a
+        // 61-source ingest legitimately needs more than one flat 600s turn,
+        // so the queued turn ceiling scales with the batch (10 units flat,
+        // +20s per unit, capped at 1h —
+        // `TurnLivenessPolicy.queuedCeiling(workUnits:)`). Lint and query
+        // keep the flat per-kind ceiling.
+        let queuedWorkUnits: Int? = if case .ingest(let sources, _) = request { sources.count } else { nil }
         let servicePreparation: (AgentOperationPreparation, AgentProviderPreparedBackend)?
         do {
-            servicePreparation = try await preparedProvider(for: operationKind)
+            servicePreparation = try await preparedProvider(for: operationKind, queuedWorkUnits: queuedWorkUnits)
         } catch {
             preflightError = error.localizedDescription
             isRunning = false
@@ -1502,12 +1601,14 @@ public final class AgentLauncher {
         let policy: PermissionPolicy
         let permissionBudget: Duration?
         let turnCeiling: TimeInterval
+        let idleStall: TimeInterval?
         let provider: AgentProvider
         let resolvedStageModelId: ModelID?
         if let (preparation, prepared) = servicePreparation {
             policy = preparation.policy.permissionPolicy
             permissionBudget = preparation.policy.permissionBudget
             turnCeiling = preparation.policy.turnCeiling
+            idleStall = preparation.policy.idleStallTimeout
             provider = prepared.provider
             resolvedStageModelId = preparation.selection.model
             self.backend = prepared.backend
@@ -1517,10 +1618,11 @@ public final class AgentLauncher {
             policy = resolvePermissionMode(permissionKind)
             permissionBudget = (permissionKind == .chat) ? nil : .seconds(60)
             turnCeiling = TurnLivenessPolicy.ceiling(for: permissionKind)
+            idleStall = TurnLivenessPolicy.idleStallTimeout(for: permissionKind)
             let config = providersConfig()
             provider = config.provider(forStage: stageKey)
             resolvedStageModelId = config.modelId(forStage: stageKey, fallbackProvider: provider.id)
-            self.backend = resolveBackend(policy, permissionBudget, turnCeiling)
+            self.backend = resolveBackend(policy, permissionBudget, turnCeiling, idleStall)
         }
         // SpawnModelGuard for the shared one-shot path (small-source ingest,
         // one-shot query, lint). Previously only the large-source ingest
@@ -1610,7 +1712,7 @@ public final class AgentLauncher {
            let item = DebugLog.trying("queueStore.getItem", operation: { try queueStore.getItem(queueItemID) }),
            let sessionId = item.payload.acpSessionId {
             // Create a temporary backend to attempt resume
-            let tempBackend = resolveBackend(policy, permissionBudget, turnCeiling)
+            let tempBackend = resolveBackend(policy, permissionBudget, turnCeiling, idleStall)
             if let acpBackend = tempBackend as? ACPBackend {
                 DebugLog.agent("run: attempting to resume ACP session \(sessionId.rawValue) for queue item \(queueItemID.rawValue)")
                 do {
@@ -1720,17 +1822,26 @@ public final class AgentLauncher {
         if let workspaceID {
             providerHints[HintKey.env("WIKI_WORKSPACE")] = workspaceID.rawValue
         }
+        // Page provenance is built from the ordered queue payload, not merely
+        // from an executor remembering to spell `--source`. The CLI decodes
+        // this external-format boundary into typed PageVersionSourceInput values.
+        // #397: for ingest runs this seam ALSO stamps WIKI_AUTHOR
+        // (`agent:ingest`) — the SAME seam the large-source
+        // planner/executor/finalizer phases compose through — so the value
+        // cannot drift between the two spawn paths and the #1367 stamp gate
+        // refuses the Ingested stamp on every phase shape. Non-ingest one-shot
+        // kinds (lint, query) set the author below instead.
+        providerHints = Self.ingestProvenanceProviderHints(
+            for: request,
+            addingTo: providerHints)
         // #397: inject the author provenance into the child env so agent-written
         // pages carry created_by/last_edited_by "for free" — no agent action needed.
         // The launcher resolves it from the operation kind (one-shot runs) or the
         // chatID (interactive runs). An explicit `--author` on wikictl still wins.
-        providerHints[HintKey.env("WIKI_AUTHOR")] = Self.authorForRun(kind: operation.kind, chatID: nil)
-        // Page provenance is built from the ordered queue payload, not merely
-        // from an executor remembering to spell `--source`. The CLI decodes
-        // this external-format boundary into typed PageVersionSourceInput values.
-        providerHints = Self.ingestProvenanceProviderHints(
-            for: request,
-            addingTo: providerHints)
+        if providerHints[HintKey.env(Self.wikiAuthorEnvironmentKey)] == nil {
+            providerHints[HintKey.env(Self.wikiAuthorEnvironmentKey)] =
+                Self.authorForRun(kind: operation.kind, chatID: nil)
+        }
         let profile = BackendProfile(
             providerHints: providerHints,
             scratchDirectory: scratch,
@@ -2177,6 +2288,29 @@ public final class AgentLauncher {
             return
         }
         DebugLog.agent("runACPIngest: plan loaded — \(plan.pages.count) pages across \(plan.distinctSourceFiles.count) source file(s)")
+
+        // Wiki strategies phase 4: validate the planner's assignments BEFORE
+        // any executor session launches. Unknown source references (primary
+        // or supporting) and duplicate resolved page targets fail the run
+        // with an actionable message — never a silently chosen winner, never
+        // two executors told to write the same page. Duplicate detection
+        // resolves titles through the injected `planValidationResolveTitle`
+        // seam (production wires the wiki's store in the LauncherFactory); a
+        // resolver FAILURE is itself an actionable problem inside
+        // `ACPIngestPlanValidation`, never a silent degrade.
+        let validationProblems = ACPIngestPlanValidation.problems(
+            in: plan,
+            stagedSourceFiles: sourceFileNames,
+            resolveTitleToPageID: planValidationResolveTitle ?? { _ in nil })
+        guard validationProblems.isEmpty else {
+            let details = validationProblems.map(\.description).joined(separator: "\n")
+            DebugLog.agent("runACPIngest: plan rejected by validation — launching no executors:\n\(details)")
+            events.append(.result(
+                isError: true,
+                text: "Ingest plan rejected before executor launch — no pages were written. Fix the plan:\n\(details)"))
+            finish(status: -1)
+            return
+        }
 
         // --- Phase 2: Executors (one per source file) ---
         // All executors share the SAME `.executor` stage model id — no per-file
@@ -2728,7 +2862,8 @@ public final class AgentLauncher {
                     backend = resolveBackend(
                         policy,
                         .seconds(60),
-                        TurnLivenessPolicy.ceiling(for: .ingest))
+                        TurnLivenessPolicy.ceiling(for: .ingest),
+                        TurnLivenessPolicy.idleStallTimeout(for: .ingest))
                 }
             }
             if let stageModelId, !stageModelId.isEmpty {
@@ -2983,6 +3118,11 @@ public final class AgentLauncher {
                 return .quotaExhausted(signal)
             }
             DebugLog.agent("runACPIngest[\(phaseName)]: FAILED: \(error.localizedDescription)")
+            // #1354: retain the diagnostic so the abort points (e.g.
+            // `runACPIngestFallback`'s failure branch) can surface it as the
+            // run's `preflightError` — the queue error then shows the actual
+            // launch failure (stderr included) instead of a generic message.
+            lastPhaseFailureMessage = error.localizedDescription
             return .failed
         }
     }
@@ -3034,6 +3174,15 @@ public final class AgentLauncher {
             // #765: respect turn-ceiling failures from the fallback session.
             finish(status: runHadTurnFailure ? -1 : 0)
         } else {
+            // #1354: both the planner phase AND the single-session fallback
+            // failed to launch. Record the captured phase diagnostic (e.g.
+            // `launchFailed`'s stderr: "env: node: No such file or directory")
+            // BEFORE finish() so the queue validator sees a preflight failure
+            // with an actionable message — not a bare exit status -1 that the
+            // old nonzero+turn-failure conjunction silently accepted as
+            // success.
+            preflightError = lastPhaseFailureMessage
+                ?? "The agent failed to launch. Check the run log for details."
             finish(status: -1)
         }
     }
@@ -3350,8 +3499,11 @@ public final class AgentLauncher {
     ///
     /// Routes through `PageAuthor` (#797) — the single source of truth for the
     /// `agents.name` convention — so the builder and the parse sites
-    /// (`GRDBWikiStore.authorKind`, `ProvenancePanel`) can't drift.
-    static func authorForRun(kind: WikiOperation.Kind, chatID: ChatID?) -> String {
+    /// (`GRDBWikiStore.authorKind`, `ProvenancePanel`) can't drift. PURE +
+    /// `nonisolated` (like the other provenance helpers below) so the ingest
+    /// env seam can call it from any isolation and tests can call it without
+    /// the main actor.
+    nonisolated static func authorForRun(kind: WikiOperation.Kind, chatID: ChatID?) -> String {
         if let chatID { return PageAuthor.chat(chatID.rawValue).rawValue }
         return PageAuthor.agent(kind.rawValue).rawValue
     }
@@ -3373,14 +3525,33 @@ public final class AgentLauncher {
         }
     }
 
-    /// Serializes the ordered ingest queue payload for the `wikictl` process.
-    /// This is the sole raw-ID environment boundary; the CLI immediately
-    /// converts it into typed primary/supporting provenance inputs.
+    /// The child-env key carrying the resolved run author (a `PageAuthor`
+    /// raw value: `chat:<id>`, `agent:<kind>`, or a plain name) into the
+    /// agent subprocess. `wikictl` reads the same key at its own process
+    /// boundary (`ArgumentParser.applyEnv`), so each side keeps its own
+    /// constant. One name for every injector site — one-shot runs, the
+    /// ingest pipeline phases, interactive chats — so the literal lives in
+    /// exactly one place. `nonisolated` (a Sendable immutable) so the
+    /// `nonisolated` ingest env seam below can reference it.
+    nonisolated static let wikiAuthorEnvironmentKey = "WIKI_AUTHOR"
+
+    /// Serializes the ordered ingest queue payload — and the run author —
+    /// into the raw child environment for the `wikictl` process. This is the
+    /// sole raw-ID environment boundary; the CLI immediately converts the
+    /// source ids into typed primary/supporting provenance inputs. The author
+    /// rides the same boundary so EVERY ingest spawn shape — the
+    /// single-session run, the planner/executor/finalizer orchestrator
+    /// (including quota-fallback attempts and the parallel-executor profile)
+    /// — stamps the same `agent:ingest` identity (#397), and the #1367 stamp
+    /// gate in `wikictl log append` sees it on each phase.
     nonisolated static func ingestProvenanceEnvironment(
         for request: OperationRequest
     ) -> [String: String] {
         guard case .ingest(let sources, _) = request else { return [:] }
-        return ["WIKI_INGEST_SOURCE_IDS": sources.map(\.sourceID.rawValue).joined(separator: ",")]
+        return [
+            "WIKI_INGEST_SOURCE_IDS": sources.map(\.sourceID.rawValue).joined(separator: ","),
+            wikiAuthorEnvironmentKey: authorForRun(kind: .ingest, chatID: nil)
+        ]
     }
 
     /// Converts the queue-derived provenance environment into the `env.`-prefixed
@@ -3429,6 +3600,14 @@ public final class AgentLauncher {
         firstMessage: String,
         firstMessageDisplay: String? = nil,
         stateMarkdown: String,
+        /// Per-turn strategy authority for a RESUMED provider session (nil on
+        /// fresh sessions, whose authority is the staged `WIKI_STATE.md`). The
+        /// resumed conversation may retain an earlier strategy revision —
+        /// including a custom strategy since reset to Default — so the host
+        /// passes the CURRENT committed revision's rendered document here and
+        /// only an explicit document supersedes the stale one. Nil keeps the
+        /// composed message byte-identical to the pre-strategy behavior.
+        turnStrategyMarkdown: String? = nil,
         wikiID: WikiID,
         wikiRoot: String,
         systemPrompt: String,
@@ -3506,14 +3685,19 @@ public final class AgentLauncher {
         let policy: PermissionPolicy
         let permissionBudget: Duration?
         let turnCeiling: TimeInterval
+        let idleStall: TimeInterval?
         if let (preparation, _) = servicePreparation {
             policy = preparation.policy.permissionPolicy
             permissionBudget = preparation.policy.permissionBudget
             turnCeiling = preparation.policy.turnCeiling
+            idleStall = preparation.policy.idleStallTimeout
         } else {
             policy = resolvePermissionMode(.chat)
             permissionBudget = nil
             turnCeiling = TurnLivenessPolicy.ceiling(for: .chat)
+            // #1364: interactive chat keeps idle monitoring DISABLED — long
+            // silent reasoning is legitimate while a user is attending.
+            idleStall = TurnLivenessPolicy.idleStallTimeout(for: .chat)
         }
         DebugLog.agent("startInteractiveQuery: permissionPolicy=\(policy) budget=nil (interactive) ceiling=\(turnCeiling)s")
 
@@ -3543,7 +3727,7 @@ public final class AgentLauncher {
                 forStage: "chat",
                 chatOverrideProviderId: chatOverrideProviderId,
                 chatOverrideModelId: chatOverrideModelId)
-            self.backend = resolveBackend(policy, permissionBudget, turnCeiling)
+            self.backend = resolveBackend(policy, permissionBudget, turnCeiling, idleStall)
         }
         DebugLog.agent("startInteractiveQuery: provider=\(provider.id) selectedModel=\(resolvedSelectedModel?.rawValue ?? "nil")")
 
@@ -3704,7 +3888,7 @@ public final class AgentLauncher {
                 // prefix can't drift from the `ResourceKind.chat.linkPrefix`
                 // value the link resolver honours.
                 if let chatID {
-                    hints[HintKey.env("WIKI_AUTHOR")] = PageAuthor.chat(chatID.rawValue).rawValue
+                    hints[HintKey.env(Self.wikiAuthorEnvironmentKey)] = PageAuthor.chat(chatID.rawValue).rawValue
                 }
                 return hints
             }(),
@@ -3821,13 +4005,35 @@ public final class AgentLauncher {
                 // authoritative paths. Prepend a RUN ENVIRONMENT refresh so the
                 // model's scratch/state/tool paths match THIS run's context and
                 // sandbox; the displayed text stays the raw user message.
+                //
+                // Per-turn strategy authority (`turnStrategyMarkdown`) rides
+                // here too: the resumed session's context can carry an earlier
+                // strategy revision, and only an explicit current-revision
+                // document — custom or Default — supersedes it.
+                let turnStrategySection: String
+                if let turnStrategyMarkdown {
+                    let document = turnStrategyMarkdown
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    turnStrategySection = """
+
+                    \(document)
+
+                    (The strategy above is the CURRENT committed revision for this turn. \
+                    It supersedes any strategy text from earlier sessions in this conversation.)
+
+                    """
+                } else {
+                    // Byte-identical to the pre-strategy composition: the
+                    // original had exactly one blank line before the user
+                    // message header.
+                    turnStrategySection = "\n"
+                }
                 composedFirstMessage = """
                 \(runContext.promptContextSection())
 
                 (This RUN ENVIRONMENT block is CURRENT and supersedes any paths \
                 from earlier sessions in this conversation.)
-
-                # USER MESSAGE
+                \(turnStrategySection)# USER MESSAGE
                 \(firstMessageDisplay ?? firstMessage)
                 """
             } else {
@@ -4048,8 +4254,11 @@ public final class AgentLauncher {
     /// Terminate EVERYTHING — extraction + agent process. Convenience for the
     /// few surfaces that don't distinguish (e.g. app termination cleanup).
     /// Extraction is now managed by `QueueActivityTracker` + `QueueEngine` —
-    /// `stop()` only needs to stop the agent.
-    func stop() {
+    /// `stop()` only needs to stop the agent. Public so the live semantic
+    /// evaluation harness can force-stop the agent when a run's time budget
+    /// expires and cooperative cancellation alone would leave the drain
+    /// waiting on an unresponsive subprocess.
+    public func stop() {
         stopAgent()
     }
 
@@ -4219,6 +4428,26 @@ public final class AgentLauncher {
     /// instead of only ever appending (issue #121).
     private func mergeOrAppend(_ event: AgentEvent) {
         let now = Date()
+        // #1364: recovery detection runs BEFORE the switch mutates `events`,
+        // while `events.last` is still the event that preceded this one. A
+        // clean turn end is a `.messageStop` that is NOT the tail of the
+        // backend's failed-turn sequence — `turnEndEvents(error:)` yields
+        // `[.turnFailed, .messageStop]` on failure and `[.messageStop]` on
+        // success (ACP has no `.result` event; the translator never emits
+        // one), so "preceded by `.turnFailed`" is exactly the failing tail.
+        // A clean end after a `.turnFailed` (turn 1 ceiling-kill, turn 2
+        // completed) marks the run recovered.
+        if case .messageStop = event {
+            let previousEventWasTurnFailure: Bool
+            if case .turnFailed? = events.last {
+                previousEventWasTurnFailure = true
+            } else {
+                previousEventWasTurnFailure = false
+            }
+            if !previousEventWasTurnFailure && runHadTurnFailure {
+                runRecoveredAfterTurnFailure = true
+            }
+        }
         switch event {
         case .assistantTextDelta(let delta):
             if isStreamingAssistantRow, case .assistantText(let existing) = events.last {
@@ -4295,6 +4524,9 @@ public final class AgentLauncher {
         // orphans the queue item in .running/.completed instead of .failed).
         if case .turnFailed = event {
             runHadTurnFailure = true
+            // A new turn failure un-recovers the run — the latch describes
+            // only the LAST failure (#1364: fail→clean→fail is unrecovered).
+            runRecoveredAfterTurnFailure = false
         }
 
         // The live pending-permission row clears during terminal teardown. Keep
@@ -4498,6 +4730,13 @@ public final class AgentLauncher {
         stderr = ""
         exitStatus = nil
         runHadTurnFailure = false
+        // #1364: recovery state is per-run, like the sticky flag it derives
+        // from — a prior run's recovery must not clear a new run's terminal
+        // turn failure.
+        runRecoveredAfterTurnFailure = false
+        // #1354: a stale prior-run phase diagnostic must never leak into the
+        // next run's abort-point copy.
+        lastPhaseFailureMessage = nil
         isInteractiveSession = false
         setGenerating(false)
         runningKind = nil
@@ -4721,12 +4960,19 @@ public final class AgentLauncher {
         // and debugging; the current whitelist profile does not reference it.
         let homePath = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
 
-        // The active wiki's SQLite DB path mirrors `WikiResolver.databaseURL(for:)`:
-        // `<container>/<ulid>.sqlite`. `dir` is the App Group container the DB lives in.
+        // The active wiki's SQLite DB path — the launcher's single derivation
+        // (`wikiDatabaseURL`): the explicit override when set (isolated
+        // fixture database), else `<container>/<ulid>.sqlite`.
         // Symlink resolution is performed inside `SandboxProfile.invocation` (the
         // tested core layer) so the canonical path reaches the seatbelt profile.
-        let dbPath = dir.appendingPathComponent("\(wikiID.rawValue).sqlite", isDirectory: false).path
-        let queueDBPath = dir.appendingPathComponent("queue.sqlite", isDirectory: false).path
+        let dbPath = wikiDatabaseURL(for: wikiID, container: dir).path
+        // The central queue database is a container artifact; an isolated
+        // fixture run has no queue store, so its fence targets the (absent,
+        // harmless) sibling file next to the fixture database.
+        let queueDBPath = wikiDatabaseOverride.map {
+            $0.deletingLastPathComponent()
+                .appendingPathComponent("queue.sqlite", isDirectory: false).path
+        } ?? dir.appendingPathComponent("queue.sqlite", isDirectory: false).path
 
         // Fail-open if any required path is empty/relative (misconfiguration).
         guard !scratch.path.isEmpty, scratch.path.hasPrefix("/"),

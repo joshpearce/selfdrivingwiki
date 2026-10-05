@@ -253,11 +253,40 @@ struct MediaEmbedPlayerTests {
 
     @Test func sizeClassDistinguishesAudioFromVideo() {
         #expect(MediaEmbedPlayerHTML.sizeClass(for: "https://open.spotify.com/embed/track/x")
-               == "wiki-embed-audio")
+               == .audio)
         #expect(MediaEmbedPlayerHTML.sizeClass(for: "https://www.youtube-nocookie.com/embed/x")
-               == "wiki-embed-video")
+               == .video)
         #expect(MediaEmbedPlayerHTML.sizeClass(for: "https://player.vimeo.com/video/123")
-               == "wiki-embed-video")
+               == .video)
+    }
+
+    @Test func videoIframeFillsContainerInsteadOfLetterboxing() throws {
+        // The native view is sized to 16:9, so the iframe must fill it (height
+        // 100%) rather than re-imposing its own aspect ratio, which letterboxed
+        // the player inside the container.
+        let target = EmbedTarget(
+            kind: .iframe, url: "https://www.youtube-nocookie.com/embed/x")
+        let html = MediaEmbedPlayerHTML.document(for: target)
+        #expect(html.contains("iframe.wiki-embed-video { height: 100%; }"))
+        #expect(!html.contains("aspect-ratio"))
+    }
+
+    @Test func audioIframeFillsContainer() throws {
+        // Spotify/SoundCloud/Apple Podcasts widgets use the extra height for
+        // artwork, descriptions, and episode lists — they fill the pane instead
+        // of a centered compact band.
+        let target = EmbedTarget(
+            kind: .iframe, url: "https://open.spotify.com/embed/track/x")
+        let html = MediaEmbedPlayerHTML.document(for: target)
+        #expect(html.contains("iframe.wiki-embed-audio { height: 100%; }"))
+    }
+
+    @Test func nativeVideoElementFillsContainerWithContain() throws {
+        // Direct-remote <video>: the element fills the pane and letterboxes the
+        // content to the video's own ratio, instead of sitting in a fixed-height box.
+        let target = EmbedTarget(kind: .video, url: "https://x.example/v.mp4")
+        let html = MediaEmbedPlayerHTML.document(for: target)
+        #expect(html.contains("video.wiki-embed { height: 100%; object-fit: contain; }"))
     }
 
     @Test func audioAndVideoTargetsUseNativeTags() {

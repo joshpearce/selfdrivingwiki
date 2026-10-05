@@ -14,6 +14,10 @@ struct SourcesContainerView: View {
     /// The per-active-wiki session (store + launchers + descriptor).
     var session: any WikiSessionProtocol
     @Environment(QueueActivityTracker.self) private var tracker
+    /// Opens the Activity window for a queue kind — the same environment
+    /// closure the detail views use (#745/#842). Backs the sidebar context
+    /// menu's "View in … Queue…" items.
+    @Environment(\.openActivityWindow) private var openActivityWindow
     let launcher: AgentLauncher
     let queueEngine: any QueueEngineClient
     let extractionProvider: any QueueExtractionProvider
@@ -28,9 +32,10 @@ struct SourcesContainerView: View {
     @State private var sourceSort: SourceSortOrder = .lastUpdated
     @State private var renameTarget: SourceSummary?
     @State private var renameText = ""
-    @State private var showBatchReingestConfirmation = false
-    @State private var pendingBatchIngestIDs: [SourceID] = []
-    @State private var pendingReingestNames: [String] = []
+    /// Non-nil while the re-ingest confirmation sheet is up for a batch that
+    /// contains already-ingested sources (their names render in the sheet's
+    /// bounded, self-scrolling table — see `ReingestConfirmationSheet`).
+    @State private var reingestConfirmation: ReingestConfirmation?
     /// Non-nil while the bookmark-target picker is open for a source selection.
     @State private var addToBookmarksContext: BookmarkTargetPickerContext?
     /// Non-nil while a delete-confirmation surface is on screen (issue #219
@@ -131,24 +136,22 @@ struct SourcesContainerView: View {
             Button("Cancel", role: .cancel) { renameTarget = nil }
             Button("Rename") { commitRename() }
         }
-        .confirmationDialog(
-            "Ingest Again?",
-            isPresented: $showBatchReingestConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Ingest Again", role: .destructive) {
-                Task {
-                    store.flushPendingSaves()
-                    await enqueueIngestion(
-                        sourceIDs: pendingBatchIngestIDs,
-                        store: store,
-                        wikiID: session.wikiID,
-                        queueEngine: queueEngine)
-                }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("The following sources have already been ingested:\n\(pendingReingestNames.joined(separator: "\n"))\n\nRunning ingest again may create duplicate pages.")
+        .sheet(item: $reingestConfirmation) { pending in
+            ReingestConfirmationSheet(
+                confirmation: pending,
+                onConfirm: {
+                    let sourceIDs = pending.sourceIDs
+                    reingestConfirmation = nil
+                    Task {
+                        store.flushPendingSaves()
+                        await enqueueIngestion(
+                            sourceIDs: sourceIDs,
+                            store: store,
+                            wikiID: session.wikiID,
+                            queueEngine: queueEngine)
+                    }
+                },
+                onCancel: { reingestConfirmation = nil })
         }
         .sheet(item: $addToBookmarksContext) { ctx in
             BookmarkTargetPickerSheet(
@@ -323,9 +326,9 @@ struct SourcesContainerView: View {
                 }
             },
             onIngestNeedsConfirmation: { ids, names in
-                pendingBatchIngestIDs = ids
-                pendingReingestNames = names
-                showBatchReingestConfirmation = true
+                reingestConfirmation = ReingestConfirmation(
+                    sourceIDs: ids,
+                    alreadyIngestedNames: names)
             },
             onExtract: { items in
                 Task {
@@ -342,6 +345,14 @@ struct SourcesContainerView: View {
                         }
                     }
                 }
+            },
+            onShowRunningJob: { sourceID, queue in
+                if tracker.stagePendingSelectionForRunningJob(of: sourceID, queue: queue) != nil {
+                    DebugLog.ingest("Sources context menu: navigating to running \(queue.rawValue) job for source \(sourceID.rawValue)")
+                } else {
+                    DebugLog.ingest("Sources context menu: no running \(queue.rawValue) job for source \(sourceID.rawValue); opening Activity window")
+                }
+                openActivityWindow?(queue)
             },
             onRename: { source in beginRename(source) },
             onDelete: { ids in

@@ -17,24 +17,49 @@ import WikiFSCore
 struct MediaEmbedPlayerView: View {
     let target: EmbedTarget
 
-    var body: some View {
-        EmbedWebViewRep(target: target)
-            .frame(maxWidth: .infinity)
-            .frame(height: target.kind == .iframe ? playerHeight : 220)
-            .background(.regularMaterial)
-    }
+    /// Landscape aspect ratio shared by provider video iframes (YouTube/Vimeo).
+    /// The native container is sized to this ratio so the iframe can fill it
+    /// exactly; `MediaEmbedPlayerHTML`'s video CSS fills the container in turn.
+    private static let videoAspect: CGFloat = 16.0 / 9.0
 
-    /// Use the embed URL host to select a video or audio-player height.
-    private var playerHeight: CGFloat {
-        let url = target.url
-        if url.contains("open.spotify.com")
-            || url.contains("w.soundcloud.com")
-            || url.contains("embed.podcasts.apple.com") {
-            return 152
+    /// Height for native `<audio>` elements (direct-remote audio).
+    private static let nativeAudioHeight: CGFloat = 220
+
+    var body: some View {
+        switch target.kind {
+        case .iframe where MediaEmbedPlayerHTML.sizeClass(for: target.url) == .video:
+            // Provider video iframes fill the pane with the largest box at the
+            // video aspect ratio, so resizing the window grows the player
+            // instead of centering a fixed-height band with empty gaps above
+            // and below it.
+            EmbedWebViewRep(target: target)
+                .aspectRatio(Self.videoAspect, contentMode: .fit)
+                .background(.regularMaterial)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .iframe:
+            // Audio/podcast player iframes (Spotify, SoundCloud, Apple
+            // Podcasts) fill the pane too: their widgets use the extra height
+            // for artwork, descriptions, and episode lists instead of a
+            // centered compact band with empty gaps around it.
+            EmbedWebViewRep(target: target)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.regularMaterial)
+        case .video:
+            // Native <video> elements (direct-remote media) fill the pane; the
+            // element letterboxes the content to the video's own ratio
+            // (object-fit: contain), so any aspect ratio — not just 16:9 —
+            // renders as large as the window allows.
+            EmbedWebViewRep(target: target)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.regularMaterial)
+        case .audio:
+            // A native <audio> element is a bare controls bar — it stays
+            // compact instead of stretching empty space to the window height.
+            EmbedWebViewRep(target: target)
+                .frame(maxWidth: .infinity)
+                .frame(height: Self.nativeAudioHeight)
+                .background(.regularMaterial)
         }
-        // A 16:9 aspect at a 760pt readable width is ~427pt; clamp so it stays
-        // comfortable at narrow widths and never crowds the transcript.
-        return 360
     }
 }
 
@@ -91,8 +116,9 @@ enum MediaEmbedPlayerHTML {
         <style>
           html, body { margin: 0; padding: 0; height: 100%; background: transparent; }
           .wiki-embed { width: 100%; border: none; border-radius: 8px; display: block; }
-          iframe.wiki-embed-video { aspect-ratio: 16/9; height: auto; }
-          iframe.wiki-embed-audio { height: 152px; }
+          iframe.wiki-embed-video { height: 100%; }
+          iframe.wiki-embed-audio { height: 100%; }
+          video.wiki-embed { height: 100%; object-fit: contain; }
           .wiki-embed-fallback { padding: 16px; font: -apple-system-body; color: -apple-system-secondary-label; }
         </style></head>
         <body>\(body)</body></html>
@@ -101,7 +127,7 @@ enum MediaEmbedPlayerHTML {
 
     /// The HTML element for the embed target. This function is pure.
     static func element(for target: EmbedTarget) -> String {
-        let sizeClass = sizeClass(for: target.url)
+        let sizeClass = sizeClass(for: target.url).rawValue
         func esc(_ s: String) -> String {
             s.replacingOccurrences(of: "&", with: "&amp;")
              .replacingOccurrences(of: "\"", with: "&quot;")
@@ -122,13 +148,21 @@ enum MediaEmbedPlayerHTML {
         }
     }
 
-    /// Video iframes use a 16:9 ratio. Audio-player iframes use a fixed height.
-    static func sizeClass(for url: String) -> String {
+    /// Player shape for an embed URL: video iframes are sized by the native
+    /// view to the video aspect ratio (16:9); audio-player iframes fill the
+    /// pane at full height. Selects the iframe's CSS class and the native
+    /// sizing branch.
+    enum SizeClass: String {
+        case video = "wiki-embed-video"
+        case audio = "wiki-embed-audio"
+    }
+
+    static func sizeClass(for url: String) -> SizeClass {
         if url.contains("open.spotify.com")
             || url.contains("w.soundcloud.com")
             || url.contains("embed.podcasts.apple.com") {
-            return "wiki-embed-audio"
+            return .audio
         }
-        return "wiki-embed-video"
+        return .video
     }
 }

@@ -19,6 +19,15 @@ import WikiFSCore
 /// subcommand recognition and option validation (#1224).
 ///
 /// `--wiki` may be omitted when the `WIKI_DB` env var supplies the selector.
+///
+/// An EXPLICIT database file may replace the registry selector:
+/// `wikictl --database-path /abs/<ulid>.sqlite page list`. The flag and the
+/// `WIKI_DB_PATH` env var are mutually exclusive with `--wiki`/`WIKI_DB`
+/// (mixed forms are a usage error), the path must be an absolute `.sqlite`
+/// file outside the App Group container, and the two raw strings are typed
+/// into a `WikiSelection` at the runner boundary — never inside the parser.
+/// This form exists for disposable fixture databases (the live semantic
+/// evaluation harness); ordinary invocations are unchanged.
 public enum ArgumentParser {
 
     /// A fully-parsed invocation: which wiki, what to do, and — for `page add`
@@ -27,10 +36,15 @@ public enum ArgumentParser {
     /// reads it.
     public struct Invocation: Equatable {
         public var wikiSelector: String
+        /// Raw `--database-path`/`WIKI_DB_PATH` value, empty when the ordinary
+        /// `--wiki` selector form was used. Exactly one of `wikiSelector` /
+        /// `databasePath` is non-empty once parsing succeeds.
+        public var databasePath: String
         public var command: Command
 
-        public init(wikiSelector: String, command: Command) {
+        public init(wikiSelector: String, databasePath: String = "", command: Command) {
             self.wikiSelector = wikiSelector
+            self.databasePath = databasePath
             self.command = command
         }
     }
@@ -43,7 +57,12 @@ public enum ArgumentParser {
         /// Phase B: append one dated log row. Carries its values directly (no
         /// deferred I/O) — the note is optional. `source` is the ingested-file
         /// id to stamp as ingested (only meaningful with `--kind ingest`).
-        case logAppend(kind: LogEntry.Kind, title: String, note: String?, source: SourceID?)
+        /// `author` is the run's resolved identity in its raw stored form
+        /// (`agent:<kind>` / `chat:<id>` / a plain name): nil from the parser
+        /// (`log append` takes no `--author` flag), filled from `WIKI_AUTHOR`
+        /// by ``applyEnv(_:env:)`` so `LogIndexCommand` can refuse
+        /// agent-authored `--source` stamps (#1367).
+        case logAppend(kind: LogEntry.Kind, title: String, note: String?, source: SourceID?, author: String? = nil)
         /// Phase B: rewrite the singleton wiki-index body. The body source is
         /// `-` for stdin or a file path; `main` reads it.
         case indexSet(bodyFile: String, workspace: String? = nil)
@@ -68,6 +87,10 @@ public enum ArgumentParser {
         case queue(QueueCommand.Action)
         /// Workspace commands (W1, PR #312): create, status, abandon, merge.
         case workspace(WorkspaceCommand.Action)
+        /// Strategy commands: read, save, reset for the per-wiki editorial
+        /// strategy singleton. Save/reset carry the REQUIRED CAS expectation
+        /// (`.absent` = no strategy row has ever been written).
+        case strategy(StrategyCommand.Action)
         /// Print scoped command usage (`wikictl [source [add]] --help`).
         /// Does not require a wiki selection (#1224).
         case help(CLIHelpScope)
@@ -144,9 +167,22 @@ public enum ArgumentParser {
             if first == "wiki" {
                 return Invocation(wikiSelector: "", command: try parseWikiCommand(Array(args.dropFirst())))
             }
+            // `extractor list` is read-only discovery over the machine
+            // catalog (App Group container): it never needs a wiki, so it
+            // bypasses the selector requirement too. `extractor sync`
+            // still requires one.
+            if first == "extractor", args.dropFirst().first == "list" {
+                return Invocation(
+                    wikiSelector: "",
+                    command: try parseExtractorCommand(Array(args.dropFirst())))
+            }
         }
 
-        // A leading `--wiki <id>` or `--wiki=<id>` is optional; otherwise fall back to WIKI_DB.
+        // A leading `--wiki <id>`/`--wiki=<id>`, `--database-path <file>`/
+        // `--database-path=<file>`, or their `WIKI_DB`/`WIKI_DB_PATH` env
+        // fallbacks. The parser records the raw winning form(s); typed
+        // conversion and mutual-exclusion checks live in
+        // `WikiResolver.selection(wikiSelector:databasePath:)`.
         var wikiSelector: String?
         if args.first == "--wiki" {
             guard args.count >= 2 else { throw Failure.usage("--wiki requires a value") }
@@ -160,8 +196,27 @@ public enum ArgumentParser {
         } else if let envValue = env("WIKI_DB"), !envValue.isEmpty {
             wikiSelector = envValue
         }
-        guard let selector = wikiSelector else {
-            throw Failure.usage("no wiki selected — pass --wiki <id> (or --wiki=<id>) or set WIKI_DB")
+        var databasePath: String?
+        if args.first == "--database-path" {
+            guard args.count >= 2 else { throw Failure.usage("--database-path requires a value") }
+            databasePath = args[1]
+            args.removeFirst(2)
+        } else if let first = args.first, first.hasPrefix("--database-path=") {
+            let value = String(first.dropFirst("--database-path=".count))
+            guard !value.isEmpty else { throw Failure.usage("--database-path requires a value") }
+            databasePath = value
+            args.removeFirst()
+        } else if databasePath == nil, let envValue = env("WIKI_DB_PATH"), !envValue.isEmpty {
+            // Env fallback only when no --database-path FLAG was given. Both
+            // env vars set, or flag+env mixing, reaches the typed conflict
+            // check in `WikiResolver.selection` — never a silent winner.
+            databasePath = envValue
+        }
+        let selectedWikiSelector = wikiSelector ?? ""
+        let selectedDatabasePath = databasePath ?? ""
+        guard !selectedWikiSelector.isEmpty || !selectedDatabasePath.isEmpty else {
+            throw Failure.usage(
+                "no wiki selected — pass --wiki <id> (or --wiki=<id>), --database-path <file>, or set WIKI_DB/WIKI_DB_PATH")
         }
 
         let command: Command
@@ -188,10 +243,15 @@ public enum ArgumentParser {
             command = try parseQueueCommand(Array(args.dropFirst()))
         case "workspace":
             command = try parseWorkspaceCommand(Array(args.dropFirst()))
+        case "strategy":
+            command = try parseStrategyCommand(Array(args.dropFirst()))
         default:
             throw Failure.usage("unknown command \((args.first ?? "").debugDescription)")
         }
-        return Invocation(wikiSelector: selector, command: command)
+        return Invocation(
+            wikiSelector: selectedWikiSelector,
+            databasePath: selectedDatabasePath,
+            command: command)
     }
 
     private static func parsePageCommand(_ args: [String]) throws -> Command {
@@ -226,10 +286,37 @@ public enum ArgumentParser {
             }
             let id = options.value("--id").map { PageID(rawValue: $0) }
             let expectHead = options.value("--expect-head").map(PageVersionID.init(rawValue:))
+            let createOnly = options.flag("--create-only")
             let workspace = options.value("--workspace")
+            // Expected-state gate (cumulative ingestion, plan phase 4 §4):
+            // `--create-only` and `--expect-head` state contradictory
+            // preconditions (page must NOT exist vs. page must exist at the
+            // given head), so combining them is a usage error, not a
+            // resolution order question. `--create-only` also cannot target
+            // an explicit id (an id IS an existing-page target) or stage into
+            // a workspace (staging resolves absence itself).
+            if createOnly, expectHead != nil {
+                throw Failure.usage(
+                    "page add: --create-only and --expect-head are mutually exclusive — "
+                    + "--create-only writes a page that must NOT exist, --expect-head "
+                    + "writes a page that must. Pick one."
+                )
+            }
+            if createOnly, id != nil {
+                throw Failure.usage(
+                    "page add: --create-only cannot be combined with --id — an explicit "
+                    + "id targets an existing page; drop --create-only or --id."
+                )
+            }
+            if createOnly, workspace != nil {
+                throw Failure.usage(
+                    "page add: --create-only cannot be combined with --workspace — "
+                    + "workspace staging resolves page absence itself."
+                )
+            }
             let author = options.value("--author")
             let provenance = try decodePageVersionSources(options.values("--source"))
-            return .page(.add(id: id, title: title, body: .file(bodyFile), expectHead: expectHead, workspace: workspace, author: author, provenance: provenance))
+            return .page(.add(id: id, title: title, body: .file(bodyFile), expectHead: expectHead, createOnly: createOnly, workspace: workspace, author: author, provenance: provenance))
 
         case "delete":
             guard let id = options.value("--id") else {
@@ -413,6 +500,18 @@ public enum ArgumentParser {
             throw Failure.usage("log append: --title is required")
         }
         let source = options.value("--source").map { SourceID(rawValue: $0) }
+        // `--source` is the agent-asserted "this ingest completed" switch: it
+        // stamps the file Ingested in the UI. It is only meaningful for an
+        // ingest, so reject it up front on other kinds instead of silently
+        // ignoring a flag the caller believed had an effect. An empty value
+        // fails the same way — the caller meant to name a file and did not.
+        if let rawSource = options.value("--source"), rawSource.isEmpty {
+            throw Failure.usage("log append: --source requires a file id")
+        }
+        if source != nil, kind != .ingest {
+            throw Failure.usage(
+                "log append: --source is only valid with --kind ingest — it marks that file Ingested. A \(kind.rawValue) entry names sources in its title/note instead.")
+        }
         return .logAppend(kind: kind, title: title, note: options.value("--note"), source: source)
     }
 
@@ -577,19 +676,40 @@ public enum ArgumentParser {
             throw Failure.usage(CLIReference.unknownSubcommandMessage(familyName: "extractor", given: sub))
         }
         let rest = Array(args.dropFirst())
-        // The leaf's positional argument: the acquisition package name. It
-        // stays a RAW string here — which names are valid is catalog data
-        // (the sync declarations the machine has installed), resolved at
-        // execution time after wiki selection, never a compiled set. The
-        // remainder is flags; `--force` re-enqueues extraction for
-        // already-synced acquisition URLs.
-        let packageName = rest.first
-        guard let packageName, !packageName.hasPrefix("-") else {
-            throw Failure.usage("extractor sync: name the acquisition package to sync (see 'wikictl help extractor' for the grammar; syncable packages are the ones the catalog declares)")
-        }
-        let options = try Options(Array(rest.dropFirst()), options: CLIReference.options(forFamily: "extractor"))
         switch sub {
+        case "list":
+            // Discovery leaf: no positional, no wiki, no writes — it only
+            // reads the machine catalog and describes credentials.
+            let options = try Options(rest, options: CLIReference.options(forFamily: "extractor"))
+            return .extractor(.list(json: options.flag("--json")))
+        case "fetch":
+            // Ad-hoc acquisition: one item key now. Same positional package
+            // name contract as `sync`; `--item` names the key to acquire
+            // (validated against the declaration at execution).
+            let packageName = rest.first
+            guard let packageName, !packageName.hasPrefix("-") else {
+                throw Failure.usage("extractor fetch: name the acquisition package (see 'wikictl help extractor' for the grammar; `wikictl extractor list` shows the installed packages)")
+            }
+            let options = try Options(Array(rest.dropFirst()), options: CLIReference.options(forFamily: "extractor"))
+            guard let itemKey = options.value("--item"), !itemKey.isEmpty else {
+                throw Failure.usage("extractor fetch: --item <key> is required — the item key to acquire through the package (`wikictl extractor list` shows each package's key rules)")
+            }
+            return .extractor(.fetch(
+                packageName: packageName,
+                itemKey: itemKey,
+                force: options.flag("--force")))
         case "sync":
+            // The leaf's positional argument: the acquisition package name. It
+            // stays a RAW string here — which names are valid is catalog data
+            // (the sync declarations the machine has installed), resolved at
+            // execution time after wiki selection, never a compiled set. The
+            // remainder is flags; `--force` re-enqueues extraction for
+            // already-synced acquisition URLs.
+            let packageName = rest.first
+            guard let packageName, !packageName.hasPrefix("-") else {
+                throw Failure.usage("extractor sync: name the acquisition package to sync (see 'wikictl help extractor' for the grammar; syncable packages are the ones the catalog declares)")
+            }
+            let options = try Options(Array(rest.dropFirst()), options: CLIReference.options(forFamily: "extractor"))
             return .extractor(.sync(packageName: packageName, force: options.flag("--force")))
         default:
             // Unreachable: recognition is the CLIReference leaf table above.
@@ -895,6 +1015,80 @@ public enum ArgumentParser {
         }
     }
 
+    private static func parseStrategyCommand(_ args: [String]) throws -> Command {
+        guard let sub = args.first else {
+            throw Failure.usage(CLIReference.missingSubcommandMessage(familyName: "strategy"))
+        }
+        guard CLIReference.leaf(family: "strategy", named: sub) != nil else {
+            throw Failure.usage(CLIReference.unknownSubcommandMessage(familyName: "strategy", given: sub))
+        }
+        let options = try Options(Array(args.dropFirst()), options: CLIReference.options(forFamily: "strategy"))
+
+        switch sub {
+        case "read":
+            return .strategy(.read(json: options.flag("--json")))
+
+        case "save":
+            // `--content` is inline; `--file` defers to BodySource resolution
+            // (read at execution time, not parse time — the parser stays pure).
+            let contentValue = options.value("--content")
+            let fileValue = options.value("--file")
+            let content: BodySource
+            switch (contentValue, fileValue) {
+            case (.some, .some):
+                throw Failure.usage("strategy save: pass exactly one of --content / --file, not both")
+            case (.none, .none):
+                throw Failure.usage("strategy save: pass --content <text> or --file <path|->")
+            case (let inline?, nil):
+                content = .inline(inline)
+            case (nil, let file?):
+                content = .file(file)
+            }
+            let expect = try parseStrategyExpectation(options, sub: "save")
+            return .strategy(.save(
+                name: options.value("--name"),
+                content: content,
+                expect: expect,
+                json: options.flag("--json")))
+
+        case "reset":
+            let expect = try parseStrategyExpectation(options, sub: "reset")
+            return .strategy(.reset(expect: expect, json: options.flag("--json")))
+
+        default:
+            // Unreachable: recognition is the CLIReference leaf table above.
+            throw Failure.usage(CLIReference.unknownSubcommandMessage(familyName: "strategy", given: sub))
+        }
+    }
+
+    /// `--expect-revision` is REQUIRED for save/reset — the CAS token that
+    /// keeps a concurrent human/agent edit from being silently clobbered.
+    /// `absent` spells the never-written row (the store's `nil` expectation —
+    /// true absence, not a reset tombstone, which keeps a real revision); a
+    /// positive integer pins the committed revision. `0` is the floor no
+    /// committed row stores, so it is rejected with the `absent` spelling
+    /// pointed at rather than silently compared.
+    private static func parseStrategyExpectation(
+        _ options: Options, sub: String
+    ) throws -> StrategyCommand.ExpectedRevision {
+        guard let raw = options.value("--expect-revision"),
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw Failure.usage("""
+                strategy \(sub): --expect-revision <n|absent> is required — \
+                read the committed revision first (`strategy read` prints it), \
+                then retry with it. `absent` means no strategy row has ever \
+                been written. On exit 3 (conflict), re-read, reapply once, \
+                and retry once.
+                """)
+        }
+        if raw == "absent" { return .absent }
+        guard let value = Int64(raw), value >= 1 else {
+            throw Failure.usage(
+                "strategy \(sub): --expect-revision must be a committed revision number (≥ 1) or `absent`, got \(raw.debugDescription)")
+        }
+        return .revision(WikiStrategyRevision(rawValue: value))
+    }
+
     /// A tiny `--key value` / `--flag` option bag. Tolerates options in any
     /// order; rejects an unbalanced trailing `--key` with no value.
     ///
@@ -1029,6 +1223,10 @@ public enum ArgumentParser {
     ///   so agent-written pages are distinguishable from human-written ones. The
     ///   launcher injects `chat:<chatID>` (chat-driven) or `agent:<kind>` (one-shot
     ///   ingest/lint/query). An explicit `--author` flag always wins over the env.
+    ///   For `log append` (which takes no `--author` flag) the env value rides
+    ///   along as the row's author identity so `LogIndexCommand` can refuse an
+    ///   agent-authored `--source` Ingested stamp (#1367); the stamp gate keys
+    ///   on the typed `PageAuthor` parse of this value.
     public static func applyEnv(
         _ command: Command, env: [String: String]
     ) -> Command {
@@ -1038,19 +1236,27 @@ public enum ArgumentParser {
         case .page(.get(let selector, let json, let workspace))
             where workspace == nil && workspaceID?.isEmpty == false:
             return .page(.get(selector, json: json, workspace: workspaceID))
-        case .page(.add(let id, let title, let bodySource, let expectHead, let workspace, let existingAuthor, let provenance))
+        case .page(.add(let id, let title, let bodySource, let expectHead, let createOnly, let workspace, let existingAuthor, let provenance))
             where workspace == nil && workspaceID?.isEmpty == false:
             return .page(.add(id: id, title: title, body: bodySource,
-                             expectHead: expectHead, workspace: workspaceID,
+                             expectHead: expectHead, createOnly: createOnly, workspace: workspaceID,
                              author: existingAuthor ?? author, provenance: provenance))
-        case .page(.add(let id, let title, let bodySource, let expectHead, let workspace, let existingAuthor, let provenance))
+        case .page(.add(let id, let title, let bodySource, let expectHead, let createOnly, let workspace, let existingAuthor, let provenance))
             where existingAuthor == nil && author?.isEmpty == false:
             return .page(.add(id: id, title: title, body: bodySource,
-                             expectHead: expectHead, workspace: workspace,
+                             expectHead: expectHead, createOnly: createOnly, workspace: workspace,
                              author: author, provenance: provenance))
         case .indexSet(let bodyFile, let workspace)
             where workspace == nil && workspaceID?.isEmpty == false:
             return .indexSet(bodyFile: bodyFile, workspace: workspaceID)
+        case .logAppend(let kind, let title, let note, let source, let existingAuthor)
+            where existingAuthor == nil && author?.isEmpty == false:
+            // #1367: route the resolved run author onto `log append` so the
+            // stamp gate in `LogIndexCommand` can tell an agent-authored run
+            // (`agent:<kind>`) from the ad-hoc chat/shell path. `log append`
+            // takes no `--author` flag, so the env is the only source; the
+            // guard keeps the precedence shape (flag > env) if one is added.
+            return .logAppend(kind: kind, title: title, note: note, source: source, author: author)
         default:
             return command
         }

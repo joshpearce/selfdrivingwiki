@@ -607,7 +607,7 @@ private final class BunFixture: @unchecked Sendable {
         operation = ManagedExtractorProcessRequest(
             revision: revision,
             manifest: manifest,
-            protocolRequest: request,
+            request: .extractor(request),
             paths: ManagedExtractorProcessPaths(
                 operationRoot: operationRoot,
                 packageRoot: packageRoot,
@@ -767,7 +767,12 @@ private final class CapturingExtractorDiagnosticsSink: ExtractorDiagnosticsSink,
     var lines: [String] { lock.withLock { storage } }
 }
 
-private final class Fixture: @unchecked Sendable {
+/// The operation shape every managed-extractor process test launches: a
+/// real package layout plus the real fixture executable. Internal (not
+/// file-private) so the quit-backstop end-to-end suite can launch the same
+/// shape; the local `Fixture` name below keeps this file's call sites
+/// unchanged.
+final class ManagedExtractorOperationFixture: @unchecked Sendable {
     let root: URL
     let operationRoot: URL
     let packageRoot: URL
@@ -908,7 +913,7 @@ private final class Fixture: @unchecked Sendable {
         operation = ManagedExtractorProcessRequest(
             revision: revision,
             manifest: manifest,
-            protocolRequest: request,
+            request: .extractor(request),
             paths: ManagedExtractorProcessPaths(
                 operationRoot: operationRoot,
                 packageRoot: packageRoot,
@@ -943,6 +948,8 @@ private final class Fixture: @unchecked Sendable {
             repositoryRootFilePath: #filePath)
     }
 }
+
+private typealias Fixture = ManagedExtractorOperationFixture
 
 private struct TestFailure: Error, CustomStringConvertible {
     let description: String

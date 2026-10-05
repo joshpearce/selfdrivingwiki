@@ -81,8 +81,11 @@ struct WikiFSApp: App {
     @State private var showingLaunchLocationWarning: Bool
     @State private var optionalRuntimeSetupModel = OptionalRuntimeSetupModel()
     @State private var showingOptionalRuntimeSetup = false
-    @State private var fileProviderSetupWarning: FileProviderSetupWarning?
-    @State private var showingFileProviderSetupWarning = false
+    /// Reference-type alert model, not `@State` values: the launch Task that
+    /// presents this warning runs through a pre-install copy of the App
+    /// struct (see the model's doc comment). `@State` writes from that copy
+    /// are silently lost; mutations of this shared instance always land.
+    @State private var fileProviderSetupAlert = FileProviderSetupAlertModel()
     /// Issue #881: user-visible error shown when the local `queue.sqlite`
     /// could not be opened at launch (no silent `:memory:` fallback). Drives
     /// an alert over the main window so the user understands ingestion /
@@ -97,9 +100,6 @@ struct WikiFSApp: App {
     /// scene + `NSApp.appearance` for AppKit surfaces (NSAlert, menu bar).
     @AppStorage("backgroundIngestEnabled") private var backgroundIngestEnabled = false
     @AppStorage(AppearanceSettingsView.storageKey) private var appearanceModeRaw = AppearanceMode.system.rawValue
-    /// Built lazily after `bootstrap` (it needs the registered wikis) — see the
-    /// `.task` below. The change bridge observes `wikictl`'s Darwin notifications.
-    @State private var changeBridge: WikiChangeBridge?
     /// Bridges SwiftUI's `@Environment(\.openWindow)` to AppKit (menu bar,
     /// app delegate) so wiki windows can be reopened from the status item
     /// when no windows are visible (accessory mode). Wired by
@@ -481,11 +481,40 @@ struct WikiFSApp: App {
         // silently, and domain registration (with the WIKIFS_REENUMERATE
         // reset) only happens at the end.
         Task {
+            // Bridge FIRST, File Provider setup after: Darwin observation
+            // must start at launch. The setup awaits below
+            // (verifyAndRepair/migrateDomains/registerAllDomains) talk to the
+            // File Provider daemon and can stall indefinitely — a bridge that
+            // never gets created makes every cross-process wikictl/daemon
+            // write silently invisible to open sessions while all other
+            // subsystems look healthy.
+            let bridge = WikiChangeBridge(registry: registry, fileProvider: fileProvider)
+            bridge.sessionLookup = { [sessionManager] wikiID in
+                sessionManager.allSessions.filter { $0.wikiID == wikiID }
+            }
+            bridge.refreshObservations()
+            // Retain on the AppDelegate (AppKit-owned, app-lifetime), NOT in
+            // App `@State`: this Task runs from the `bootstrap` closure's copy
+            // of the App struct captured before SwiftUI installed `@State`
+            // storage (see the property's comment for the full failure mode).
+            appDelegate.changeBridge = bridge
+            // Chat-driven external writes (an agent tool call completing a
+            // shell command that may have committed, e.g. `wikictl source
+            // add`) refresh through the SAME coalesced bridge path as a
+            // Darwin change notification. The sink setter re-applies to a
+            // coordinator the transport may already have published.
+            chatDaemonHolder.suspectedExternalWriteSink = { [weak bridge] wikiID in
+                bridge?.noteSuspectedExternalWrite(forWikiID: wikiID)
+            }
+            appDelegate.sessionManager = sessionManager
+
             DebugLog.fileprovider("launch setup: started")
             if let warning = await FileProviderSetupVerifier.verifyAndRepairInstalledProvider() {
                 DebugLog.fileprovider("launch setup: provider check warning — \(warning.reason)")
-                fileProviderSetupWarning = warning
-                showingFileProviderSetupWarning = true
+                // Mutate the shared model, not `@State` — this Task runs from
+                // a pre-install copy of the App struct (see the model's doc
+                // comment); a `@State` write here would be silently lost.
+                fileProviderSetupAlert.present(warning)
             } else {
                 DebugLog.fileprovider("launch setup: provider check OK")
             }
@@ -494,14 +523,6 @@ struct WikiFSApp: App {
             DebugLog.fileprovider("launch setup: schema migration check done")
             await registry.registerAllDomains()
             DebugLog.fileprovider("launch setup: domain registration done")
-
-            let bridge = WikiChangeBridge(registry: registry, fileProvider: fileProvider)
-            bridge.sessionLookup = { [sessionManager] wikiID in
-                sessionManager.allSessions.filter { $0.wikiID == wikiID }
-            }
-            bridge.refreshObservations()
-            changeBridge = bridge
-            appDelegate.sessionManager = sessionManager
         }
 
         // Wire the quit-confirmation closures onto AppDelegate (the single app
@@ -561,6 +582,10 @@ struct WikiFSApp: App {
             // leaves a private operation root (input/output/home/cache); a
             // clean close is the moment to reclaim it. Stale sessions from
             // crashes are reclaimed by the daemon at its startup.
+            // #1330: the app runs its own managed operations, so the same
+            // quit backstop applies — kill every process group this process
+            // still owns, synchronously, before the session goes away.
+            OwnedProcessGroupRegistry.terminateAllOwnedGroups()
             do {
                 let layout = try ExtractorPackageStoreLayout(
                     appGroupContainerRoot: containerDirectory,
@@ -625,239 +650,16 @@ struct WikiFSApp: App {
         daemonTransportCoordinator.startIfNeeded()
     }
 
-    var body: some Scene {
-        // Main window: single-identity, opens on launch. Resolves the MRU
-        // wiki via the `registry.activeWikiID` → `wikiID` adoption flow in
-        // `RootScene`. This avoids the "empty window flash" that
-        // `WindowGroup(for:)` would show before `.task` runs.
-        //
-        // `id: "main"` lets `openWindow(id: "main")` reopen this window from
-        // the status bar menu / Dock click when all windows are closed
-        // (accessory mode) and there are no wikis to open via `openWindow(value:)`.
-        WindowGroup(id: "main") {
-            RootScene(
-                wikiID: nil,
-                registry: registry,
-                sessionManager: sessionManager,
-                fileProvider: fileProvider,
-                installedRendererHost: installedRendererHost
-            )
-            .background(WindowBridgeProbe(bridge: openWindowBridge))
-            .appEnvironment(
-                tracker: activityTracker,
-                openActivityWindow: { queue in openWindowBridge.openActivityWindow?(queue) },
-                chatDaemon: chatDaemonHolder.coordinator,
-                healthMonitor: healthMonitor)
-            .preferredColorScheme(appearanceColorScheme)
-            .sheet(isPresented: $showingOptionalRuntimeSetup) {
-                OptionalRuntimeSetupSheet(
-                    model: optionalRuntimeSetupModel,
-                    dismiss: { showingOptionalRuntimeSetup = false })
-            }
-            .alert(
-                "Install Self Driving Wiki in Applications",
-                isPresented: $showingLaunchLocationWarning,
-                presenting: launchLocationWarning
-            ) { warning in
-                Button("Open Installed Copy") {
-                    NSWorkspace.shared.open(warning.expectedURL)
-                }
-                Button("Reveal This Copy") {
-                    NSWorkspace.shared.activateFileViewerSelecting([warning.actualURL])
-                }
-                Button("OK", role: .cancel) {}
-            } message: { warning in
-                Text(warning.message)
-            }
-            .alert(
-                "File Provider Setup Needs Attention",
-                isPresented: $showingFileProviderSetupWarning,
-                presenting: fileProviderSetupWarning
-            ) { warning in
-                Button("Open Installed Copy") {
-                    NSWorkspace.shared.open(warning.expectedAppURL)
-                }
-                Button("Reveal Installed App") {
-                    NSWorkspace.shared.activateFileViewerSelecting([warning.expectedAppURL])
-                }
-                Button("OK", role: .cancel) {}
-            } message: { warning in
-                Text(warning.message)
-            }
-            // Issue #881: surface a queue-database open failure (the local
-            // `queue.sqlite` could not be opened). No silent in-memory
-            // fallback — ingestion / extraction are unavailable until the
-            // underlying issue is resolved.
-            .alert(
-                "Queue Database Unavailable",
-                isPresented: Binding(
-                    get: { queueStoreError != nil },
-                    set: { if !$0 { localQueueRuntimeController.dismissStartupError() } }
-                ),
-                presenting: queueStoreError
-            ) { _ in
-                Button("OK", role: .cancel) {}
-            } message: { message in
-                Text(message)
-            }
-            // Keep the bridge's Darwin observations in lockstep with the wiki
-            // set: a freshly-created wiki's CLI writes must be heard; a
-            // deleted wiki's notification name released.
-            .onChange(of: registry.wikis) { _, _ in
-                changeBridge?.refreshObservations()
-            }
-            .onChange(of: appearanceModeRaw) { _, _ in
-                applyAppKitAppearance()
-            }
-            .task {
-                await appLaunchTasks()
-            }
-        }
-        .windowToolbarStyle(.unified)
-        // Always PRESENT the main window at launch. Without this, a relaunch
-        // that restores a windowless session (quit with all windows closed)
-        // starts the app headless — only the status item exists — and the
-        // `OpenWindowBridge` closures are never created, because they only
-        // come into existence when the `WindowBridgeProbe`'s hosting window
-        // first appears. In that state every bridge-driven status-item entry
-        // (queue windows, wiki opens) silently no-ops until some other path
-        // opens a window (e.g. a Dock reopen). The closures survive a window
-        // CLOSE by design; this closes the never-opened gap.
-        .defaultLaunchBehavior(.presented)
-        .commands {
-            // Suppress the auto-generated File ▸ New Window command (Cmd-N).
-            // This app is single-window per wiki; Cmd-N would open a broken
-            // "No Wikis" empty-state window (issue #396).
-            CommandGroup(replacing: .newItem) { }
-            VacuumCommands(sessionManager: sessionManager)
-            // Window menu: open-windows list + Show Previous/Next Tab (⇧⌘[ / ⇧⌘]).
-            WindowMenuCommands(
-                sessionManager: sessionManager,
-                windowTracker: windowTracker,
-                registry: registry)
-        }
-        // Additional wiki windows: value-driven by wiki ID. Opened from the
-        // switcher via `openWindow(value: wiki.id)`. `WindowGroup(for:)`
-        // deduplicates by `==`, so opening a wiki that already has a window
-        // focuses it instead of spawning a duplicate.
-        WindowGroup(for: WikiID.self) { $wikiID in
-            RootScene(
-                wikiID: wikiID,
-                registry: registry,
-                sessionManager: sessionManager,
-                fileProvider: fileProvider,
-                installedRendererHost: installedRendererHost
-            )
-            .background(WindowBridgeProbe(bridge: openWindowBridge))
-            .appEnvironment(
-                tracker: activityTracker,
-                openActivityWindow: { queue in openWindowBridge.openActivityWindow?(queue) },
-                chatDaemon: chatDaemonHolder.coordinator,
-                healthMonitor: healthMonitor)
-            .preferredColorScheme(appearanceColorScheme)
-            .onAppear {
-                DebugLog.tabs("RootScene wiki-window onAppear: wikiID=\(wikiID?.rawValue ?? "nil")")
-            }
-            .task {
-                bootstrapApp()
-                startStatusItem()
-                // #929 follow-up: when macOS restores a per-wiki window
-                // directly on launch (a window was open at quit), the "main"
-                // WindowGroup's .task — the only other caller — never runs,
-                // so `connectToDaemon()` must be reachable from here too.
-                // Idempotent through the coordinator lifecycle, so calling it
-                // from both windows is safe regardless of which task fires.
-                connectToDaemon()
-            }
-            // The presented value can arrive AFTER first render (state
-            // restoration) or change in place (openWindow(value:) routing to
-            // an existing window). RootScene copies the value into @State at
-            // creation, so key the whole subtree on it — a changed value must
-            // rebuild RootScene, not be silently ignored.
-            .id(wikiID)
-        }
 
-        // Extraction compare: a real, resizable, non-modal window (one per
-        // source + wiki, opened via `openWindow(value:)` from
-        // SourceDetailView). Resolves the correct wiki's session via the
-        // shared `SessionManager`.
-        WindowGroup("Compare Extractions", for: ExtractionCompareContext.self) { $context in
-            ExtractionCompareWindow(sessionManager: sessionManager, context: context)
-                .preferredColorScheme(appearanceColorScheme)
-        }
-        .defaultSize(width: 1080, height: 740)
-        .windowResizability(.contentMinSize)
+    /// Builds the package settings view for one role focus. Both the
+    /// Extraction tab and the Fetch tab use this factory with IDENTICAL
+    /// snapshot, credential, import, and removal wiring — only the focus
+    /// differs, so the two tabs can never drift on lifecycle behavior.
+    private func packageSettingsView(
+        roleFocus: ExtractionSettingsRoleFocus
+    ) -> ExtractionSettingsView {
+        ExtractionSettingsView(
 
-        // Page versions: a real, resizable, non-modal window (one per page +
-        // wiki, opened via `openWindow(value:)` from `PageDetailView`'s
-        // inspector). Browse/diff/restore the page's version history (#817).
-        // Mirrors the "Compare Extractions" group above.
-        WindowGroup("Compare Versions", for: PageVersionCompareContext.self) { $context in
-            PageVersionCompareWindow(sessionManager: sessionManager, context: context)
-                .preferredColorScheme(appearanceColorScheme)
-        }
-        .defaultSize(width: 1080, height: 740)
-        .windowResizability(.contentMinSize)
-
-        // Renderers: a real, resizable, non-modal window per activated
-        // renderer + wiki, opened via `openWindow(value:)` from `RootView`
-        // when a reader card's control fires. Mirrors the two compare groups
-        // above. The group title is generic because every renderer arrives
-        // here — the content sets the window's own title.
-        WindowGroup("Renderer", for: RendererActivationPresentation.self) { $context in
-            RendererActivationWindow(
-                sessionManager: sessionManager,
-                installedRendererHost: installedRendererHost,
-                context: context)
-                .preferredColorScheme(appearanceColorScheme)
-        }
-        .defaultSize(width: 900, height: 640)
-        .windowResizability(.contentMinSize)
-
-        // Queue Activity windows: one per `QueueKind` (Ingestion + Extraction),
-        // opened via `openWindow(value:)` / `openWindowBridge.openQueueWindow`.
-        // `WindowGroup(for:)` deduplicates by `==`, so re-opening a queue's
-        // window focuses the existing one (#835). System-managed scene replaces
-        // the hand-built `NSWindow` — correct title-bar inset and frame
-        // persistence come for free. Scene restoration is DISABLED by design:
-        // the queue windows must always start closed on launch and require an
-        // explicit open (menu item, CTA, or deep link) each session — they are
-        // transient monitors, not documents. Durable queue data and reports
-        // live in the store, unaffected.
-        WindowGroup("Agent Queue", for: QueueKind.self) { $queue in
-            ActivityWindowView(
-                queue: queue ?? .ingestion,
-                queueEngine: queueEngine,
-                activityTracker: activityTracker,
-                sessionManager: sessionManager,
-                wikiDescriptors: registry.wikis,
-                openWindowBridge: openWindowBridge
-            )
-            .appEnvironment(
-                tracker: activityTracker,
-                openActivityWindow: { queue in
-                    openWindowBridge.openQueueWindow?(queue)
-                },
-                healthMonitor: healthMonitor)
-            .preferredColorScheme(appearanceColorScheme)
-        }
-        .defaultSize(width: 1040, height: 720)
-        .windowResizability(.contentMinSize)
-        // Always start closed across app restarts (see above). Explicit
-        // opens during a session are unaffected — this only opts the scene
-        // out of launch-time state restoration.
-        .restorationBehavior(.disabled)
-        // A unified window toolbar makes the toolbar region structurally
-        // reserved, so the sidebar column's List always gets its top
-        // safe-area inset — sidebar rows can never scroll up under the
-        // traffic lights, even when the detail column's layout changes
-        // (belt-and-braces with the #835 `toolbarBackground` pin in
-        // `ActivityWindowView`).
-        .windowToolbarStyle(.unified)
-
-        Settings {
-            TabView(selection: settingsSelectedTab) {
-                ExtractionSettingsView(
                     containerDirectory: containerDirectory,
                     launcher: settingsLauncher,
                     packageSnapshot: { [processProfileOwner] in
@@ -1017,9 +819,251 @@ struct WikiFSApp: App {
                         } catch {
                             return .failed(ExtractorPackageMutationMessage.describe(error))
                         }
-                    })
+                    },
+            roleFocus: roleFocus)
+    }
+
+    var body: some Scene {
+        // Main window: single-identity, opens on launch. Resolves the MRU
+        // wiki via the `registry.activeWikiID` → `wikiID` adoption flow in
+        // `RootScene`. This avoids the "empty window flash" that
+        // `WindowGroup(for:)` would show before `.task` runs.
+        //
+        // `id: "main"` lets `openWindow(id: "main")` reopen this window from
+        // the status bar menu / Dock click when all windows are closed
+        // (accessory mode) and there are no wikis to open via `openWindow(value:)`.
+        WindowGroup(id: "main") {
+            RootScene(
+                wikiID: nil,
+                registry: registry,
+                sessionManager: sessionManager,
+                fileProvider: fileProvider,
+                installedRendererHost: installedRendererHost
+            )
+            .background(WindowBridgeProbe(bridge: openWindowBridge))
+            .appEnvironment(
+                tracker: activityTracker,
+                openActivityWindow: { queue in openWindowBridge.openActivityWindow?(queue) },
+                chatDaemon: chatDaemonHolder.coordinator,
+                healthMonitor: healthMonitor)
+            .preferredColorScheme(appearanceColorScheme)
+            .sheet(isPresented: $showingOptionalRuntimeSetup) {
+                OptionalRuntimeSetupSheet(
+                    model: optionalRuntimeSetupModel,
+                    dismiss: { showingOptionalRuntimeSetup = false })
+            }
+            .alert(
+                "Install Self Driving Wiki in Applications",
+                isPresented: $showingLaunchLocationWarning,
+                presenting: launchLocationWarning
+            ) { warning in
+                Button("Open Installed Copy") {
+                    NSWorkspace.shared.open(warning.expectedURL)
+                }
+                Button("Reveal This Copy") {
+                    NSWorkspace.shared.activateFileViewerSelecting([warning.actualURL])
+                }
+                Button("OK", role: .cancel) {}
+            } message: { warning in
+                Text(warning.message)
+            }
+            .alert(
+                "File Provider Setup Needs Attention",
+                isPresented: Binding(
+                    get: { fileProviderSetupAlert.isPresented },
+                    set: { if !$0 { fileProviderSetupAlert.dismiss() } }
+                ),
+                presenting: fileProviderSetupAlert.warning
+            ) { warning in
+                Button("Open Installed Copy") {
+                    NSWorkspace.shared.open(warning.expectedAppURL)
+                }
+                Button("Reveal Installed App") {
+                    NSWorkspace.shared.activateFileViewerSelecting([warning.expectedAppURL])
+                }
+                Button("OK", role: .cancel) {}
+            } message: { warning in
+                Text(warning.message)
+            }
+            // Issue #881: surface a queue-database open failure (the local
+            // `queue.sqlite` could not be opened). No silent in-memory
+            // fallback — ingestion / extraction are unavailable until the
+            // underlying issue is resolved.
+            .alert(
+                "Queue Database Unavailable",
+                isPresented: Binding(
+                    get: { queueStoreError != nil },
+                    set: { if !$0 { localQueueRuntimeController.dismissStartupError() } }
+                ),
+                presenting: queueStoreError
+            ) { _ in
+                Button("OK", role: .cancel) {}
+            } message: { message in
+                Text(message)
+            }
+            // Keep the bridge's Darwin observations in lockstep with the wiki
+            // set: a freshly-created wiki's CLI writes must be heard; a
+            // deleted wiki's notification name released.
+            .onChange(of: registry.wikis) { _, _ in
+                appDelegate.changeBridge?.refreshObservations()
+            }
+            .onChange(of: appearanceModeRaw) { _, _ in
+                applyAppKitAppearance()
+            }
+            .task {
+                await appLaunchTasks()
+            }
+        }
+        .windowToolbarStyle(.unified)
+        // Always PRESENT the main window at launch. Without this, a relaunch
+        // that restores a windowless session (quit with all windows closed)
+        // starts the app headless — only the status item exists — and the
+        // `OpenWindowBridge` closures are never created, because they only
+        // come into existence when the `WindowBridgeProbe`'s hosting window
+        // first appears. In that state every bridge-driven status-item entry
+        // (queue windows, wiki opens) silently no-ops until some other path
+        // opens a window (e.g. a Dock reopen). The closures survive a window
+        // CLOSE by design; this closes the never-opened gap.
+        .defaultLaunchBehavior(.presented)
+        .commands {
+            // Suppress the auto-generated File ▸ New Window command (Cmd-N).
+            // This app is single-window per wiki; Cmd-N would open a broken
+            // "No Wikis" empty-state window (issue #396).
+            CommandGroup(replacing: .newItem) { }
+            VacuumCommands(sessionManager: sessionManager)
+            // Window menu: open-windows list + Show Previous/Next Tab (⇧⌘[ / ⇧⌘]).
+            WindowMenuCommands(
+                sessionManager: sessionManager,
+                windowTracker: windowTracker,
+                registry: registry)
+        }
+        // Additional wiki windows: value-driven by wiki ID. Opened from the
+        // switcher via `openWindow(value: wiki.id)`. `WindowGroup(for:)`
+        // deduplicates by `==`, so opening a wiki that already has a window
+        // focuses it instead of spawning a duplicate.
+        WindowGroup(for: WikiID.self) { $wikiID in
+            RootScene(
+                wikiID: wikiID,
+                registry: registry,
+                sessionManager: sessionManager,
+                fileProvider: fileProvider,
+                installedRendererHost: installedRendererHost
+            )
+            .background(WindowBridgeProbe(bridge: openWindowBridge))
+            .appEnvironment(
+                tracker: activityTracker,
+                openActivityWindow: { queue in openWindowBridge.openActivityWindow?(queue) },
+                chatDaemon: chatDaemonHolder.coordinator,
+                healthMonitor: healthMonitor)
+            .preferredColorScheme(appearanceColorScheme)
+            .onAppear {
+                DebugLog.tabs("RootScene wiki-window onAppear: wikiID=\(wikiID?.rawValue ?? "nil")")
+            }
+            .task {
+                bootstrapApp()
+                startStatusItem()
+                // #929 follow-up: when macOS restores a per-wiki window
+                // directly on launch (a window was open at quit), the "main"
+                // WindowGroup's .task — the only other caller — never runs,
+                // so `connectToDaemon()` must be reachable from here too.
+                // Idempotent through the coordinator lifecycle, so calling it
+                // from both windows is safe regardless of which task fires.
+                connectToDaemon()
+            }
+            // The presented value can arrive AFTER first render (state
+            // restoration) or change in place (openWindow(value:) routing to
+            // an existing window). RootScene copies the value into @State at
+            // creation, so key the whole subtree on it — a changed value must
+            // rebuild RootScene, not be silently ignored.
+            .id(wikiID)
+        }
+
+        // Extraction compare: a real, resizable, non-modal window (one per
+        // source + wiki, opened via `openWindow(value:)` from
+        // SourceDetailView). Resolves the correct wiki's session via the
+        // shared `SessionManager`.
+        WindowGroup("Compare Extractions", for: ExtractionCompareContext.self) { $context in
+            ExtractionCompareWindow(sessionManager: sessionManager, context: context)
+                .preferredColorScheme(appearanceColorScheme)
+        }
+        .defaultSize(width: 1080, height: 740)
+        .windowResizability(.contentMinSize)
+
+        // Page versions: a real, resizable, non-modal window (one per page +
+        // wiki, opened via `openWindow(value:)` from `PageDetailView`'s
+        // inspector). Browse/diff/restore the page's version history (#817).
+        // Mirrors the "Compare Extractions" group above.
+        WindowGroup("Compare Versions", for: PageVersionCompareContext.self) { $context in
+            PageVersionCompareWindow(sessionManager: sessionManager, context: context)
+                .preferredColorScheme(appearanceColorScheme)
+        }
+        .defaultSize(width: 1080, height: 740)
+        .windowResizability(.contentMinSize)
+
+        // Renderers: a real, resizable, non-modal window per activated
+        // renderer + wiki, opened via `openWindow(value:)` from `RootView`
+        // when a reader card's control fires. Mirrors the two compare groups
+        // above. The group title is generic because every renderer arrives
+        // here — the content sets the window's own title.
+        WindowGroup("Renderer", for: RendererActivationPresentation.self) { $context in
+            RendererActivationWindow(
+                sessionManager: sessionManager,
+                installedRendererHost: installedRendererHost,
+                context: context)
+                .preferredColorScheme(appearanceColorScheme)
+        }
+        .defaultSize(width: 900, height: 640)
+        .windowResizability(.contentMinSize)
+
+        // Queue Activity windows: one per `QueueKind` (Ingestion + Extraction),
+        // opened via `openWindow(value:)` / `openWindowBridge.openQueueWindow`.
+        // `WindowGroup(for:)` deduplicates by `==`, so re-opening a queue's
+        // window focuses the existing one (#835). System-managed scene replaces
+        // the hand-built `NSWindow` — correct title-bar inset and frame
+        // persistence come for free. Scene restoration is DISABLED by design:
+        // the queue windows must always start closed on launch and require an
+        // explicit open (menu item, CTA, or deep link) each session — they are
+        // transient monitors, not documents. Durable queue data and reports
+        // live in the store, unaffected.
+        WindowGroup("Agent Queue", for: QueueKind.self) { $queue in
+            ActivityWindowView(
+                queue: queue ?? .ingestion,
+                queueEngine: queueEngine,
+                activityTracker: activityTracker,
+                sessionManager: sessionManager,
+                wikiDescriptors: registry.wikis,
+                openWindowBridge: openWindowBridge
+            )
+            .appEnvironment(
+                tracker: activityTracker,
+                openActivityWindow: { queue in
+                    openWindowBridge.openQueueWindow?(queue)
+                },
+                healthMonitor: healthMonitor)
+            .preferredColorScheme(appearanceColorScheme)
+        }
+        .defaultSize(width: 1040, height: 720)
+        .windowResizability(.contentMinSize)
+        // Always start closed across app restarts (see above). Explicit
+        // opens during a session are unaffected — this only opts the scene
+        // out of launch-time state restoration.
+        .restorationBehavior(.disabled)
+        // A unified window toolbar makes the toolbar region structurally
+        // reserved, so the sidebar column's List always gets its top
+        // safe-area inset — sidebar rows can never scroll up under the
+        // traffic lights, even when the detail column's layout changes
+        // (belt-and-braces with the #835 `toolbarBackground` pin in
+        // `ActivityWindowView`).
+        .windowToolbarStyle(.unified)
+
+        Settings {
+            TabView(selection: settingsSelectedTab) {
+                packageSettingsView(roleFocus: .extractors)
                     .tag(SettingsTab.extraction)
                     .tabItem { Label("Extraction", systemImage: "doc.viewfinder") }
+                packageSettingsView(roleFocus: .fetchers)
+                    .tag(SettingsTab.fetch)
+                    .tabItem { Label("Fetch", systemImage: "arrow.down.circle") }
                 AgentsSettingsView(
                     containerDirectory: containerDirectory,
                     providerServices: agentProviderServices)
@@ -1054,6 +1098,7 @@ struct WikiFSApp: App {
     /// zotero package's pane), not as its own tab.
     enum SettingsTab: String {
         case extraction
+        case fetch
         case agents
         case operations
         case appearance
@@ -1090,6 +1135,30 @@ struct WikiFSApp: App {
     }
 }
 
+/// Presents the launch-time File Provider setup warning from alert state that
+/// lives OUTSIDE `@State` value writes. The launch Task that produces the
+/// warning runs through the `AppDelegate.bootstrap` closure's copy of the App
+/// struct — captured during `init()`, before SwiftUI installs `@State`
+/// storage — so `@State` writes from it are silently lost (the same trap that
+/// silently killed `WikiChangeBridge`; see `AppDelegate.changeBridge`). A
+/// reference-type model created at init is shared by every copy of the App
+/// struct, so mutations always land.
+@MainActor
+@Observable
+final class FileProviderSetupAlertModel {
+    var warning: FileProviderSetupWarning?
+    var isPresented = false
+
+    func present(_ warning: FileProviderSetupWarning) {
+        self.warning = warning
+        isPresented = true
+    }
+
+    func dismiss() {
+        isPresented = false
+    }
+}
+
 /// Minimal app delegate: drains ALL sessions' pending saves on app background
 /// (the R3 safety net from `plans/multi-window-ui.md`). Per-window `scenePhase`
 /// in `RootScene` only flushes the active window's session; this catches the
@@ -1110,6 +1179,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// so without a strong owner it deallocates the moment `start()` returns
     /// (same pattern as `menuBarItemController`).
     @MainActor var operationNotifier: OperationNotifier?
+    /// Strong on purpose — same lifetime trap as `menuBarItemController` and
+    /// `operationNotifier`: the bridge must outlive `startStatusItem()`.
+    /// It is the app's ONLY subscriber to the per-wiki Darwin change
+    /// notifications (`org.sockpuppet.wiki.changed.<id>`) that cross-process
+    /// writers (`wikictl`, the `wikid` daemon and its ingestion agents) post
+    /// after committing; its `deinit` unregisters every observer. Storing it
+    /// in App-struct `@State` is NOT enough: `startStatusItem()` is reached
+    /// through the `bootstrap` closure, which captures a copy of the App
+    /// struct taken during `init()` — before SwiftUI installs `@State`
+    /// storage — so a `@State` write from that copy can land in throwaway
+    /// storage, the bridge deallocates, and every daemon/CLI write becomes
+    /// invisible to open windows (stale sidebar lists) until relaunch.
+    @MainActor var changeBridge: WikiChangeBridge?
     /// Window-independent launch work (status item, appearance sync, daemon
     /// connect) — wired in `WikiFSApp.init()`, invoked from
     /// `applicationDidFinishLaunching` below. This is the ONE call site

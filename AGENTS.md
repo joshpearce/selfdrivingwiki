@@ -105,6 +105,15 @@ Last verified: 2026-08-13
   protocols and their `prepare…` functions may keep kind names — their
   operation shapes genuinely differ — and kind-to-value mapping tables
   (MIME fallbacks, labels) are data, not policy.
+  **Package roles are package data too.** Whether a registration is an
+  `extractor` (converts content) or a `fetcher` (acquires one remote
+  source, stating `source-bytes` or `markdown`) is the manifest's explicit
+  `role` — the host must not infer a role from URL transport, MIME,
+  provider, or package ID, and must not gate acquisition on an origin
+  provider. Acquisition eligibility derives from the active fetcher
+  registrations' claimed input MIME set (`FetchRouteDecision`); fetchers
+  route through their own kind-free namespaces (`FetcherRouteID`,
+  `.installedFetcher`), never through `ExtractorKind`.
   `ExtractorKindNeutralityContractTests` enforces this.
 
 ## Design skills — sources
@@ -355,6 +364,17 @@ agents, NOT Polytoken):
   without approval. Use `tmp/` for plan docs, PR drafts, issue bodies, debug
   output, and any other throwaway artifacts. The directory is gitignored
   (`.gitignore` line 24) so nothing lands in the tree.
+
+## Wiki strategy and cumulative writes
+
+* Store editorial instructions in the per-wiki strategy singleton, not a page or the compiled system prompt.
+  Strategy mutations must use `mutate(event:)` and emit `.strategy` only after a changed save commits.
+  Reset keeps the revision. Compare the expected revision inside the transaction.
+* Use `WikiStrategyRenderer` for captured strategy context and the mounted strategy document.
+  Orchestrated runs keep their captured strategy. Mounted standalone agents see the current strategy at read time.
+* Use the composed `WikiStore.upsertPage` seam for content, provenance, and parsed links.
+  Keep embedding work outside the transaction. A failed expectation or link write must not emit a page event.
+* Scripted ingestion tests check infrastructure, not model obedience. Live evaluation and human rubric decisions remain separate evidence.
 
 ## Agent prompts
 

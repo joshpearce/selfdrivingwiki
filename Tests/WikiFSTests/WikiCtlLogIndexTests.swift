@@ -40,6 +40,31 @@ struct WikiCtlLogIndexTests {
             == .logAppend(kind: .ingest, title: "T", note: nil, source: SourceID(rawValue: "FILE123")))
     }
 
+    /// `--source` is the completed-ingest switch; on any other kind it must
+    /// fail loudly instead of silently taking no effect. The message is the
+    /// agent-facing deliverable, so pin it too.
+    @Test func logAppendRejectsSourceOnNonIngestKind() throws {
+        for kind in ["query", "lint"] {
+            do {
+                _ = try ArgumentParser.parse(
+                    ["--wiki", "W", "log", "append", "--kind", kind, "--title", "T", "--source", "FILE123"],
+                    env: noEnv)
+                Issue.record("expected usage failure for --kind \(kind)")
+            } catch let failure as ArgumentParser.Failure {
+                #expect(
+                    String(describing: failure).contains("--source is only valid with --kind ingest"))
+            }
+        }
+    }
+
+    @Test func logAppendRejectsEmptySource() {
+        #expect(throws: ArgumentParser.Failure.self) {
+            try ArgumentParser.parse(
+                ["--wiki", "W", "log", "append", "--kind", "ingest", "--title", "T", "--source", ""],
+                env: noEnv)
+        }
+    }
+
     @Test func logAppendRejectsBadKind() {
         #expect(throws: ArgumentParser.Failure.self) {
             try ArgumentParser.parse(
@@ -113,6 +138,29 @@ struct WikiCtlLogIndexTests {
         #expect(try store.markedSourceIDs() == [file.id.rawValue])
     }
 
+    /// #1344: the first stamp wins — `markSourceIngested` only touches rows
+    /// whose `ingested_at` is NULL, so a host re-drain or a late agent
+    /// `--source` ritual stamp never rewrites the timestamp. `ingested_at`
+    /// is not exposed on `SourceSummary`; `updatedAt` is the public-API
+    /// observable for "no rewrite" (the old unconditional UPDATE always
+    /// wrote a later `updated_at`).
+    @Test func markSourceIngestedKeepsFirstTimestamp() async throws {
+        let store = try tempStore()
+        let file = try store.addSource(filename: "paper.pdf", data: Data("%PDF".utf8))
+        try store.markSourceIngested(id: file.id)
+        let firstStamp = try #require(try store.listSources().first { $0.id == file.id })
+
+        // Guarantee the wall clock advances so a rewrite would be observable
+        // (cooperative sleep — never Thread.sleep).
+        try await Task.sleep(for: .milliseconds(20))
+        try store.markSourceIngested(id: file.id)
+
+        let secondStamp = try #require(try store.listSources().first { $0.id == file.id })
+        #expect(try store.markedSourceIDs() == [file.id.rawValue])
+        #expect(secondStamp.updatedAt.timeIntervalSince1970
+            == firstStamp.updatedAt.timeIntervalSince1970)
+    }
+
     @Test func logAppendWithoutSourceLeavesFileUnmarked() throws {
         let store = try tempStore()
         let file = try store.addSource(filename: "paper.pdf", data: Data("%PDF".utf8))
@@ -123,6 +171,223 @@ struct WikiCtlLogIndexTests {
         #expect(try store.markedSourceIDs().isEmpty)
         _ = file
     }
+
+    /// Defense-in-depth for the command-level gate (the parser rejects this
+    /// shape first): a non-ingest entry that names a source must never flip
+    /// its ingest state — the Ingested badge is the completed-ingest switch.
+    /// The gate suppresses the STAMP, not the entry: the log row still lands.
+    @Test func logAppendWithSourceOnNonIngestKindDoesNotMark() throws {
+        let store = try tempStore()
+        let file = try store.addSource(filename: "paper.pdf", data: Data("%PDF".utf8))
+
+        _ = try LogIndexCommand.run(
+            .logAppend(kind: .query, title: "Cited paper.pdf", note: nil, source: file.id), in: store)
+
+        #expect(try store.markedSourceIDs().isEmpty)
+        #expect(try store.listAllLogEntriesOrderedByID().count == 1)
+    }
+
+    /// A typo'd or unknown --source must fail loudly BEFORE anything commits:
+    /// markSourceIngested is a no-op UPDATE on a missing id, so accepting it
+    /// would append the row, exit 0, and leave the file unmarked.
+    @Test func logAppendWithUnknownSourceFailsLoudlyAndCommitsNothing() throws {
+        let store = try tempStore()
+        let ghost = SourceID(rawValue: "DOESNOTEXIST")
+
+        #expect(throws: PageCommand.Failure.self) {
+            _ = try LogIndexCommand.run(
+                .logAppend(kind: .ingest, title: "Anything", note: nil, source: ghost), in: store)
+        }
+        #expect(try store.listAllLogEntriesOrderedByID().isEmpty)
+        #expect(try store.markedSourceIDs().isEmpty)
+    }
+
+    // MARK: - Author-gated stamp refusal (#1367)
+
+    /// A queued pipeline agent runs with `WIKI_AUTHOR=agent:<kind>`. Its
+    /// mid-run `--source` stamps survived job failures (issue #1367: 62
+    /// stamps seconds before a failed job), so the stamp is refused for
+    /// agent-authored runs. Refusal does NOT fail the command: the log row
+    /// still lands and one stdout notice names the rule.
+    @Test func logAppendAgentAuthorRefusesStampButCommitsRow() throws {
+        let store = try tempStore()
+        let file = try store.addSource(filename: "paper.pdf", data: Data("%PDF".utf8))
+
+        let result = try LogIndexCommand.run(
+            .logAppend(kind: .ingest, title: "Ingested paper.pdf", note: nil,
+                       source: file.id, author: .agent("ingest")),
+            in: store)
+
+        #expect(result.didCommit)
+        #expect(try store.markedSourceIDs().isEmpty)
+        let all = try store.listAllLogEntriesOrderedByID()
+        #expect(all.count == 1)
+        #expect(all[0].title == "Ingested paper.pdf")
+        // Two output lines: the echoed entry id, then the refusal notice.
+        #expect(result.output.hasPrefix(all[0].id.rawValue + "\n"))
+        #expect(result.output.contains(LogIndexCommand.agentStampRefusalNotice(source: file.id)))
+    }
+
+    /// The refusal path also skips the unknown-`--source` existence check:
+    /// that check protects the STAMP (a typo'd id must not look like it
+    /// worked), and an agent-authored run never stamps — the notice already
+    /// says so. The row must still land and the command must still succeed.
+    @Test func logAppendAgentAuthorWithUnknownSourceStillCommitsRow() throws {
+        let store = try tempStore()
+        let ghost = SourceID(rawValue: "DOESNOTEXIST")
+
+        let result = try LogIndexCommand.run(
+            .logAppend(kind: .ingest, title: "Anything", note: nil,
+                       source: ghost, author: .agent("ingest")),
+            in: store)
+
+        #expect(result.didCommit)
+        #expect(try store.listAllLogEntriesOrderedByID().count == 1)
+        #expect(result.output.contains(LogIndexCommand.agentStampRefusalNotice(source: ghost)))
+    }
+
+    /// An agent-authored run that passes NO `--source` is not attempting a
+    /// stamp, so there is nothing to refuse and nothing to notice — the row
+    /// lands exactly as before.
+    @Test func logAppendAgentAuthorWithoutSourceIsQuiet() throws {
+        let store = try tempStore()
+
+        let result = try LogIndexCommand.run(
+            .logAppend(kind: .ingest, title: "Ingested paper.pdf", note: nil,
+                       source: nil, author: .agent("ingest")),
+            in: store)
+
+        #expect(result.didCommit)
+        #expect(try store.listAllLogEntriesOrderedByID().count == 1)
+        #expect(!result.output.contains("\n"), "no notice line when no stamp was attempted")
+    }
+
+    /// `chat:` authors keep the ad-hoc path exactly: the stamp applies.
+    @Test func logAppendChatAuthorStillStamps() throws {
+        let store = try tempStore()
+        let file = try store.addSource(filename: "paper.pdf", data: Data("%PDF".utf8))
+
+        let result = try LogIndexCommand.run(
+            .logAppend(kind: .ingest, title: "Anything", note: nil,
+                       source: file.id, author: .chat("01CHAT")),
+            in: store)
+
+        #expect(result.didCommit)
+        #expect(try store.markedSourceIDs() == [file.id.rawValue])
+        #expect(!result.output.contains("note:"), "no refusal notice on the ad-hoc path")
+    }
+
+    /// Unset author (shell use / programmatic default) keeps today's
+    /// behavior: the stamp applies and no notice prints.
+    @Test func logAppendUnsetAuthorStillStamps() throws {
+        let store = try tempStore()
+        let file = try store.addSource(filename: "paper.pdf", data: Data("%PDF".utf8))
+
+        let result = try LogIndexCommand.run(
+            .logAppend(kind: .ingest, title: "Anything", note: nil, source: file.id),
+            in: store)
+
+        #expect(result.didCommit)
+        #expect(try store.markedSourceIDs() == [file.id.rawValue])
+        #expect(!result.output.contains("note:"))
+    }
+
+    /// The typed parse drives the gate: an author value that merely STARTS
+    /// with "agent" (`.other`, not `.agent`) must not trip the refusal —
+    /// this pins the modeling rule that the gate never string-matches.
+    @Test func logAppendAgentLookalikeAuthorStillStamps() throws {
+        let store = try tempStore()
+        let file = try store.addSource(filename: "paper.pdf", data: Data("%PDF".utf8))
+
+        _ = try LogIndexCommand.run(
+            .logAppend(kind: .ingest, title: "Anything", note: nil,
+                       source: file.id, author: .other("agent-lookalike")),
+            in: store)
+
+        #expect(try store.markedSourceIDs() == [file.id.rawValue])
+    }
+
+#if os(macOS)
+    /// End to end through the scripted production pipeline (parse → applyEnv
+    /// → `LogIndexCommand`): an agent-authored `--source` stamp attempt exits
+    /// 0, lands the log row, refuses the stamp, and prints the notice on
+    /// stdout — the same resolved-author path the real CLI takes.
+    @Test func scriptedAgentAuthoredStampAttemptSucceedsWithoutStamping() throws {
+        let store = try tempStore()
+        let file = try store.addSource(filename: "paper.pdf", data: Data("%PDF".utf8))
+
+        let outcome = ScriptedWikiCtl.dispatch(
+            ["--wiki", ScriptedWikiCtl.wikiSelector,
+             "log", "append", "--kind", "ingest", "--title", "Ingested paper.pdf",
+             "--source", file.id.rawValue],
+            in: store,
+            env: ["WIKI_AUTHOR": "agent:ingest"])
+
+        #expect(outcome.exitCode == ScriptedCLIOutcome.Code.success)
+        #expect(outcome.stdout.contains(LogIndexCommand.agentStampRefusalNotice(source: file.id)))
+        #expect(try store.listAllLogEntriesOrderedByID().count == 1)
+        #expect(try store.markedSourceIDs().isEmpty)
+    }
+
+    /// #1367 review (PR #1369): a `chat:` author through the REAL parse →
+    /// `applyEnv` → run seam keeps the ad-hoc path — the stamp applies and no
+    /// notice prints. Pins the env shape interactive chats actually run with
+    /// (`AgentLauncher.startInteractiveQuery` sets `chat:<chatULID>`).
+    @Test func scriptedChatAuthorStillStampsThroughRealParseSeam() throws {
+        let store = try tempStore()
+        let file = try store.addSource(filename: "paper.pdf", data: Data("%PDF".utf8))
+
+        let outcome = ScriptedWikiCtl.dispatch(
+            ["--wiki", ScriptedWikiCtl.wikiSelector,
+             "log", "append", "--kind", "ingest", "--title", "Ingested paper.pdf",
+             "--source", file.id.rawValue],
+            in: store,
+            env: ["WIKI_AUTHOR": "chat:01JGYZXQATP4H8Z5C9R2M3N6B0"])
+
+        #expect(outcome.exitCode == ScriptedCLIOutcome.Code.success)
+        #expect(!outcome.stdout.contains("note:"), "chat authors keep the ad-hoc stamp")
+        #expect(try store.markedSourceIDs() == [file.id.rawValue])
+    }
+
+    /// #1367 review (PR #1369): the typed parse is case-sensitive at the real
+    /// seam — `AGENT:ingest` does not parse as `.agent` (it is `.other`), so
+    /// the stamp applies. A case-insensitive prefix check here would refuse
+    /// legitimate non-agent authors.
+    @Test func scriptedUppercaseAgentAuthorStillStampsThroughRealParseSeam() throws {
+        let store = try tempStore()
+        let file = try store.addSource(filename: "paper.pdf", data: Data("%PDF".utf8))
+
+        let outcome = ScriptedWikiCtl.dispatch(
+            ["--wiki", ScriptedWikiCtl.wikiSelector,
+             "log", "append", "--kind", "ingest", "--title", "Ingested paper.pdf",
+             "--source", file.id.rawValue],
+            in: store,
+            env: ["WIKI_AUTHOR": "AGENT:ingest"])
+
+        #expect(outcome.exitCode == ScriptedCLIOutcome.Code.success)
+        #expect(!outcome.stdout.contains("note:"), "an .other author is not an agent run")
+        #expect(try store.markedSourceIDs() == [file.id.rawValue])
+    }
+
+    /// #1367 review (PR #1369): a plain username (human shell use) is `.other`
+    /// — the stamp applies through the real seam. Only the typed `.agent`
+    /// (and only the lowercase `agent:` prefix) trips the refusal.
+    @Test func scriptedPlainUsernameAuthorStillStampsThroughRealParseSeam() throws {
+        let store = try tempStore()
+        let file = try store.addSource(filename: "paper.pdf", data: Data("%PDF".utf8))
+
+        let outcome = ScriptedWikiCtl.dispatch(
+            ["--wiki", ScriptedWikiCtl.wikiSelector,
+             "log", "append", "--kind", "ingest", "--title", "Ingested paper.pdf",
+             "--source", file.id.rawValue],
+            in: store,
+            env: ["WIKI_AUTHOR": "wsargent"])
+
+        #expect(outcome.exitCode == ScriptedCLIOutcome.Code.success)
+        #expect(!outcome.stdout.contains("note:"))
+        #expect(try store.markedSourceIDs() == [file.id.rawValue])
+    }
+#endif
 
     @Test func indexSetCommitsAndPersistsBody() throws {
         let store = try tempStore()

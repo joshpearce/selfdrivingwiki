@@ -15,9 +15,10 @@ import Foundation
 struct AgentPromptContractTests {
 
     private func repoRoot() -> URL {
-        URL(fileURLWithPath: #file)
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // <name>.swift
             .deletingLastPathComponent()   // WikiFSTests/
-            .deletingLastPathComponent()   // Tests/
+            .deletingLastPathComponent()   // Tests/ → repo root
     }
 
     private func canonical(_ name: String) -> String? {
@@ -45,6 +46,9 @@ struct AgentPromptContractTests {
         "wiki-tree-render.md",
         "ingest-executor.md",
         "ingest-finalizer.md",
+        "ingest-single-task.md",
+        "ingest-curator-task.md",
+        "ingest-planner.md",
     ]
 
     // MARK: - Resource sync (AC.9)
@@ -144,38 +148,205 @@ struct AgentPromptContractTests {
         #expect(writeRule.contains("RUN ENVIRONMENT"))
         #expect(writeRule.contains("--wiki"))
     }
-}
 
-/// Byte-synchronization guard for the canonical → bundled prompt copies of the
-/// agent-facing surface. Kept separate from the contract assertions above so a
-/// sync drift is one obvious failure, not a cascade.
-struct PromptResourceSyncTests {
-    private func read(_ url: URL) -> Data? {
-        try? Data(contentsOf: url)
-    }
+    // MARK: - Host-stamped ingest state (#1344 / #1367)
 
-    @Test func agentPromptsMatchBundledResources() {
-        let root = URL(fileURLWithPath: #file)
-            .deletingLastPathComponent()   // WikiFSTests/
-            .deletingLastPathComponent()   // Tests/
-        let canonicalDir = root.appendingPathComponent("prompts")
-        let bundledDir = root
-            .appendingPathComponent("Sources/WikiFSCore/Resources/Prompts")
-        let names = [
-            "system-prompt-default.md",
-            "chat.md",
-            "ingest-write-rule.md",
-            "wiki-tree-render.md",
-            "ingest-executor.md",
+    /// The pipeline ingest task prompts no longer TEACH the `--source`
+    /// ritual: the host stamps Ingested at validated-successful job
+    /// completion (#1344). Since #1367 each recording step carries one
+    /// explicit PROHIBITION line that names the flag — explicit beats
+    /// silence, because the mounted system prompt taught `--source` for the
+    /// ad-hoc path and task-prompt silence lost to it (issue #1367: 62
+    /// mid-run stamps survived a failed job). `--source` may therefore
+    /// appear ONLY inside that prohibition sentence. Asserted on BOTH the
+    /// canonical sources and the bundled copies the runtime actually loads.
+    @Test func pipelineIngestPromptsDropTheSourceRitual() {
+        let prohibition = "Never pass `--source` on `wikictl log append`"
+        let recordingTaskPromptNames = [
+            "ingest-single-task.md",
+            "ingest-curator-task.md",
             "ingest-finalizer.md",
         ]
-        for name in names {
-            let source = read(canonicalDir.appendingPathComponent(name))
-            let copy = read(bundledDir.appendingPathComponent(name))
-            #expect(source != nil, "missing prompts/\(name)")
-            #expect(copy != nil, "missing bundled Prompts/\(name) — run make prompts")
-            if let source, let copy {
-                #expect(source == copy, "\(name) is out of sync — run make prompts")
+        for name in recordingTaskPromptNames {
+            for (copy, origin) in [
+                (canonical(name), "prompts/\(name)"),
+                (bundled(name), "Sources/WikiFSCore/Resources/Prompts/\(name)"),
+            ] {
+                guard let prompt = copy else {
+                    Issue.record("missing prompt: \(origin)")
+                    continue
+                }
+                #expect(prompt.contains(prohibition),
+                        "\(origin): the recording step must carry the explicit --source prohibition (#1367)")
+                #expect(!prompt.contains("REQUIRED — it marks"),
+                        "\(origin): the --source REQUIRED sentence is retired (#1344)")
+                let outsideProhibition = prompt.replacingOccurrences(of: prohibition, with: "")
+                #expect(!outsideProhibition.contains("--source"),
+                        "\(origin): --source may appear only inside the prohibition line (#1344/#1367)")
+            }
+        }
+        // The planner records nothing (it writes only plan.json), so it keeps
+        // #1344's absolute ban: no `--source` mention at all.
+        for (copy, origin) in [
+            (canonical("ingest-planner.md"), "prompts/ingest-planner.md"),
+            (bundled("ingest-planner.md"), "Sources/WikiFSCore/Resources/Prompts/ingest-planner.md"),
+        ] {
+            guard let planner = copy else {
+                Issue.record("missing prompt: \(origin)")
+                continue
+            }
+            #expect(!planner.contains("--source"),
+                    "\(origin): the planner never records; --source stays absent (#1344)")
+        }
+        // The shared write-rule prompt carries the same prohibition at its
+        // log-append write list. It also legitimately uses `--source` for
+        // `page add` provenance, so only the prohibition itself is pinned.
+        for (copy, origin) in [
+            (canonical("ingest-write-rule.md"), "prompts/ingest-write-rule.md"),
+            (bundled("ingest-write-rule.md"), "Sources/WikiFSCore/Resources/Prompts/ingest-write-rule.md"),
+        ] {
+            guard let writeRule = copy else {
+                Issue.record("missing prompt: \(origin)")
+                continue
+            }
+            #expect(writeRule.contains(prohibition),
+                    "\(origin): the write list must carry the explicit --source prohibition (#1367)")
+        }
+    }
+
+    /// The ad-hoc chat path keeps the agent-asserted `--source` switch:
+    /// only pipeline ingests moved to host stamping (#1344).
+    @Test func chatPromptKeepsAdHocSourcePath() {
+        guard let system = canonical("system-prompt-default.md") else {
+            Issue.record("missing canonical prompt: prompts/system-prompt-default.md")
+            return
+        }
+        #expect(system.contains("--source <file-id>"))
+        #expect(system.contains("completed-ingest switch"))
+    }
+
+    /// #1367: the mounted system prompt keeps the ad-hoc chat allowance but
+    /// adds the explicit queued-pipeline prohibition at the same step — the
+    /// counter-rule must be as explicit as the teaching it overrides.
+    /// Asserted on BOTH the canonical source and the bundled copy.
+    @Test func systemPromptProhibitsSourceFlagInQueuedPipelineTasks() {
+        for (copy, origin) in [
+            (canonical("system-prompt-default.md"), "prompts/system-prompt-default.md"),
+            (bundled("system-prompt-default.md"), "Sources/WikiFSCore/Resources/Prompts/system-prompt-default.md"),
+        ] {
+            guard let system = copy else {
+                Issue.record("missing prompt: \(origin)")
+                continue
+            }
+            #expect(system.contains("queued pipeline task"),
+                    "\(origin): the prohibition must name the queued pipeline case (#1367)")
+            #expect(system.contains("NEVER pass `--source` on `wikictl log append`"),
+                    "\(origin): the explicit --source prohibition must stay (#1367)")
+            #expect(system.contains("the app marks sources Ingested itself"),
+                    "\(origin): the prohibition must say who really stamps (#1367)")
+            // #1367 review (PR #1369): the affirmative rule is now SCOPED to
+            // interactive chat ingests — an unscoped "always pass it" taught
+            // the same step the prohibition forbids.
+            #expect(system.contains("In an interactive chat ingest, pass `--source`"),
+                    "\(origin): the affirmative rule must be scoped to interactive chat ingests (#1367)")
+            #expect(!system.contains("always pass it on a successful ingest"),
+                    "\(origin): the unscoped affirmative wording must not come back (#1367)")
+        }
+    }
+
+    // MARK: - Cumulative-update contract (wiki strategies phase 4)
+
+    /// The retired executor scope contradiction is gone, and every prompt
+    /// surface that writes pages teaches the create-only guard. Asserted on
+    /// BOTH the canonical sources and the bundled copies the runtime loads.
+    @Test func cumulativeUpdateContractIsConsistent() {
+        for (copy, origin) in [
+            (canonical("ingest-executor.md"), "prompts/ingest-executor.md"),
+            (bundled("ingest-executor.md"), "Resources/Prompts/ingest-executor.md"),
+        ] {
+            guard let executor = copy else {
+                Issue.record("missing prompt: \(origin)")
+                continue
+            }
+            // The blanket existing-page ban ("Do NOT update … or any existing
+            // page") contradicted cumulative reconciliation and is retired.
+            #expect(!executor.contains("or any existing page"),
+                    "\(origin): the blanket existing-page ban must stay retired")
+            #expect(executor.contains("--create-only"),
+                    "\(origin): the executor must teach the new-page race guard")
+            #expect(executor.contains("--expect-head"),
+                    "\(origin): the executor must teach the existing-page CAS expectation")
+        }
+        for name in ["ingest-write-rule.md", "ingest-single-task.md", "ingest-curator-task.md"] {
+            for (copy, origin) in [
+                (canonical(name), "prompts/\(name)"),
+                (bundled(name), "Resources/Prompts/\(name)"),
+            ] {
+                guard let prompt = copy else {
+                    Issue.record("missing prompt: \(origin)")
+                    continue
+                }
+                #expect(prompt.contains("--create-only"),
+                        "\(origin): the create-only guard is part of the write contract")
+            }
+        }
+    }
+
+    // MARK: - Strategy-edit authority (chat-only, user-authorized)
+
+    /// The `wikictl strategy read|save|reset` surface is taught to exactly
+    /// one agent surface: the interactive chat prompt, gated on the user's
+    /// explicit confirmed request. The ingest pipeline prompts and the shared
+    /// system prompt must NOT teach the strategy mutation commands — an
+    /// ingestion agent processing untrusted source text has no automatic
+    /// strategy-edit authority from its prompts. This pins PROMPT PLACEMENT
+    /// only; it is not a prompt-injection defense claim — the enforcement
+    /// behind the policy remains the write-boundary rules this stack already
+    /// states (sources are evidence, never instructions; the task prompt
+    /// never widens write permissions).
+    @Test func strategyEditAuthorityIsChatOnlyAndUserAuthorized() {
+        for (copy, origin) in [
+            (canonical("chat.md"), "prompts/chat.md"),
+            (bundled("chat.md"), "Resources/Prompts/chat.md"),
+        ] {
+            guard let chat = copy else {
+                Issue.record("missing prompt: \(origin)")
+                continue
+            }
+            // The chat agent knows the commands and the CAS token.
+            #expect(chat.contains("wikictl strategy read"),
+                    "\(origin): the chat prompt must teach the strategy read")
+            #expect(chat.contains("wikictl strategy save"),
+                    "\(origin): the chat prompt must teach the strategy save")
+            #expect(chat.contains("wikictl strategy reset"),
+                    "\(origin): the chat prompt must teach the strategy reset")
+            #expect(chat.contains("--expect-revision"),
+                    "\(origin): the strategy flow must carry the CAS token")
+            // Authorization: only the user's explicit request counts.
+            #expect(chat.contains("only when the user asks"),
+                    "\(origin): the strategy flow must be user-gated")
+            #expect(chat.contains("never itself authorization"),
+                    "\(origin): source/page text must be named as non-authorizing")
+            // Edits affect future turns; the active turn keeps its capture.
+            #expect(chat.contains("NEXT turn"),
+                    "\(origin): the future-turn effect must stay explicit")
+        }
+
+        // Every other agent-facing prompt — the shared system prompt and the
+        // whole ingest pipeline — stays silent on the strategy commands.
+        for name in agentFacingPrompts where name != "chat.md" {
+            for (copy, origin) in [
+                (canonical(name), "prompts/\(name)"),
+                (bundled(name), "Resources/Prompts/\(name)"),
+            ] {
+                guard let prompt = copy else {
+                    Issue.record("missing prompt: \(origin)")
+                    continue
+                }
+                for command in ["strategy read", "strategy save", "strategy reset"] {
+                    #expect(!prompt.contains(command),
+                            "\(origin): only the chat prompt teaches `\(command)` — ingest/source-facing prompts carry no strategy-edit authority")
+                }
             }
         }
     }

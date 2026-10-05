@@ -129,10 +129,29 @@ func run() async -> Int32 {
         }
     }
 
+    // `extractor list` is read-only and wiki-independent: no store, no
+    // wiki selection — only the machine catalog (App Group container) and
+    // describe-only credential presence checks. Dispatching it before the
+    // writable runner keeps discovery available even with no wiki selected.
+    if case .extractor(.list(let json)) = invocation.command {
+        do {
+            let containerDirectory = try DatabaseLocation.appGroupContainerDirectory()
+            let catalog = try ExtractorSyncCommand.productionCatalogReader(
+                containerDirectory: containerDirectory,
+                reviewedPackageRoot: ExtractorSyncCommand.reviewedPackageRoot())
+            print(try ExtractorListCommand.run(catalog: catalog, json: json))
+            return 0
+        } catch {
+            FileHandle.standardError.write(Data("wikictl: \(error.localizedDescription)\n".utf8))
+            return 1
+        }
+    }
+
     do {
         let output = try await makeRunner().runOrdinary(
             command: invocation.command,
             wikiSelector: invocation.wikiSelector,
+            databasePath: invocation.databasePath,
             environment: ProcessInfo.processInfo.environment)
         write(output)
         return 0
@@ -152,6 +171,37 @@ func run() async -> Int32 {
         """
         FileHandle.standardError.write(Data(message.utf8))
         return 3
+    } catch let conflict as PageCreateConflictError {
+        // Create-only conflict (cumulative ingestion, phase 4 §4): the caller's
+        // read found no page under the title, but one exists now. Same exit
+        // code 3 as the CAS conflict — the agent re-reads the page, reconciles
+        // against its head, and writes with --expect-head. Nothing was written.
+        let actual = conflict.actualVersionID?.rawValue ?? "(none)"
+        let message = """
+        wikictl: create-only conflict on page \(conflict.pageID.rawValue) — \
+        --create-only requires the title to be absent, \
+        but a page now exists under \(conflict.title) (head \(actual)). \
+        Read that page, reconcile against its head, and write with --expect-head. \
+        Nothing was written.
+
+        """
+        FileHandle.standardError.write(Data(message.utf8))
+        return 3
+    } catch let conflict as PageExpectedTargetMissingError {
+        // Expected-head write whose target no longer exists (deleted or
+        // renamed away since the caller's read) — same exit code 3 family:
+        // re-read, reconcile, write again. Nothing was written, and no page
+        // was silently created.
+        let target = conflict.pageID?.rawValue ?? "title \(conflict.title)"
+        let message = """
+        wikictl: expected-head conflict — the page you pinned (\(target)) \
+        does not exist anymore (deleted or renamed since your read). \
+        Re-read (`page list` / `page get`), reconcile, and write again. \
+        Nothing was written.
+
+        """
+        FileHandle.standardError.write(Data(message.utf8))
+        return 3
     } catch let conflict as SourceMarkdownConflictError {
         // CAS conflict on a processed-markdown rewrite — the chain's head
         // moved after the caller read it (another writer won the race). Exit
@@ -166,6 +216,26 @@ func run() async -> Int32 {
         head_version_id (`source info`), reapply your edit, and retry once. \
         Nothing was written. If it conflicts again, report the conflict \
         instead of retrying.
+
+        """
+        FileHandle.standardError.write(Data(message.utf8))
+        return 3
+    } catch let conflict as WikiStrategyConflictError {
+        // CAS conflict on the strategy singleton — another editor committed
+        // since the caller's read (the app's strategy editor, another agent,
+        // another wikictl). Exit code 3 (same convention as the page/source
+        // CAS families) signals the agent to re-read, reapply once, and
+        // retry once — never loop. The write threw before any row change.
+        let expected = conflict.expectedRevision.map { "revision \($0.rawValue)" }
+            ?? "absent (no strategy row ever written)"
+        let current = conflict.currentRevision.map { "revision \($0.rawValue)" }
+            ?? "absent (no strategy row has ever been written)"
+        let message = """
+        wikictl: CAS conflict on strategy — \
+        expected \(expected), \
+        but the committed revision is \(current). \
+        Re-read (`strategy read`), reapply your edit, and retry once with the \
+        new revision. Nothing was written.
 
         """
         FileHandle.standardError.write(Data(message.utf8))
@@ -216,8 +286,16 @@ func execute(
             didCommit: r.didCommit,
             stderrOutput: r.stderrOutput
         )
-    case .logAppend(let kind, let title, let note, let source):
-        let r = try LogIndexCommand.run(.logAppend(kind: kind, title: title, note: note, source: source), in: store)
+    case .logAppend(let kind, let title, let note, let source, let author):
+        // The author arrived resolved (flag > env) via `applyEnv` in
+        // `WikiCtlRunner.runOrdinary`. Parse it through the typed `PageAuthor`
+        // seam HERE — the single boundary between parse-land strings and
+        // command-land types — so the #1367 stamp gate in `LogIndexCommand`
+        // never string-matches the author.
+        let r = try LogIndexCommand.run(
+            .logAppend(kind: kind, title: title, note: note, source: source,
+                       author: PageAuthor(rawValue: author)),
+            in: store)
         return SourceCommand.Result(payload: .text(r.output), didCommit: r.didCommit)
     case .indexSet(let bodyFile, let workspace):
         let body = try readBodyFile(from: bodyFile)
@@ -249,6 +327,13 @@ func execute(
         return try await runExtractorSync(
             packageName: packageName, force: force, in: store,
             wikiID: wikiID, containerDirectory: containerDirectory)
+    case .extractor(.fetch(let packageName, let itemKey, let force)):
+        return try await runExtractorFetch(
+            packageName: packageName, itemKey: itemKey, force: force, in: store,
+            wikiID: wikiID, containerDirectory: containerDirectory)
+    case .extractor(.list):
+        // Handled before wiki resolution in `run()` — unreachable here.
+        return SourceCommand.Result(payload: .text(""), didCommit: false)
     case .job:
         // Handled before the writable ordinary-command runner.
         return SourceCommand.Result(payload: .text(""), didCommit: false)
@@ -267,6 +352,12 @@ func execute(
     case .workspace(let action):
         let r = try WorkspaceCommand.run(action, in: store)
         return SourceCommand.Result(payload: .text(r.output), didCommit: r.didCommit)
+    case .strategy(let action):
+        let r = try StrategyCommand.run(action, in: store)
+        return SourceCommand.Result(
+            payload: .text(r.output),
+            didCommit: r.didCommit,
+            stderrOutput: r.stderrOutput)
     case .help, .version, .dumpConfig:
         // Handled before wiki resolution in `run()` — unreachable here.
         return SourceCommand.Result(payload: .text(""), didCommit: false)
@@ -310,6 +401,40 @@ private func runExtractorSync(
         reviewedPackageRoot: reviewedRoot)
     let output = try await ExtractorSyncCommand.run(
         packageName: packageName,
+        force: force,
+        in: store,
+        containerDirectory: containerDirectory,
+        catalog: catalog,
+        enqueueJob: { sourceID in
+            try queueStore.enqueue(QueueItemRequest(
+                queue: .extraction,
+                wikiID: wikiID,
+                payload: QueueItemPayload(sourceIDs: [sourceID]))).id
+        })
+    return SourceCommand.Result(payload: .text(output), didCommit: true)
+}
+
+/// `wikictl extractor fetch <package> --item <key>` dispatch: the same
+/// enqueue-only wiring as `runExtractorSync` — durable queue write, no
+/// `QueueEngine`, no waiting (the daemon-side drain owns completion).
+private func runExtractorFetch(
+    packageName: String,
+    itemKey: String,
+    force: Bool,
+    in store: GRDBWikiStore,
+    wikiID: WikiID,
+    containerDirectory: URL
+) async throws -> SourceCommand.Result {
+    let queueStore = try QueueStore(
+        databaseURL: try DatabaseLocation.queueDatabaseURL())
+    defer { queueStore.close() }
+    let reviewedRoot = ExtractorSyncCommand.reviewedPackageRoot()
+    let catalog = try ExtractorSyncCommand.productionCatalogReader(
+        containerDirectory: containerDirectory,
+        reviewedPackageRoot: reviewedRoot)
+    let output = try await ExtractorFetchCommand.run(
+        packageName: packageName,
+        itemKey: itemKey,
         force: force,
         in: store,
         containerDirectory: containerDirectory,
