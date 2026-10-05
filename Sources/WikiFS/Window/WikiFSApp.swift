@@ -70,8 +70,11 @@ struct WikiFSApp: App {
     @State private var showingLaunchLocationWarning: Bool
     @State private var optionalRuntimeSetupModel = OptionalRuntimeSetupModel()
     @State private var showingOptionalRuntimeSetup = false
-    @State private var fileProviderSetupWarning: FileProviderSetupWarning?
-    @State private var showingFileProviderSetupWarning = false
+    /// Reference-type alert model, not `@State` values: the launch Task that
+    /// presents this warning runs through a pre-install copy of the App
+    /// struct (see the model's doc comment). `@State` writes from that copy
+    /// are silently lost; mutations of this shared instance always land.
+    @State private var fileProviderSetupAlert = FileProviderSetupAlertModel()
     /// Issue #881: user-visible error shown when the local `queue.sqlite`
     /// could not be opened at launch (no silent `:memory:` fallback). Drives
     /// an alert over the main window so the user understands ingestion /
@@ -86,9 +89,6 @@ struct WikiFSApp: App {
     /// scene + `NSApp.appearance` for AppKit surfaces (NSAlert, menu bar).
     @AppStorage("backgroundIngestEnabled") private var backgroundIngestEnabled = false
     @AppStorage(AppearanceSettingsView.storageKey) private var appearanceModeRaw = AppearanceMode.system.rawValue
-    /// Built lazily after `bootstrap` (it needs the registered wikis) — see the
-    /// `.task` below. The change bridge observes `wikictl`'s Darwin notifications.
-    @State private var changeBridge: WikiChangeBridge?
     /// Bridges SwiftUI's `@Environment(\.openWindow)` to AppKit (menu bar,
     /// app delegate) so wiki windows can be reopened from the status item
     /// when no windows are visible (accessory mode). Wired by
@@ -479,7 +479,11 @@ struct WikiFSApp: App {
                 sessionManager.allSessions.filter { $0.wikiID == wikiID }
             }
             bridge.refreshObservations()
-            changeBridge = bridge
+            // Retain on the AppDelegate (AppKit-owned, app-lifetime), NOT in
+            // App `@State`: this Task runs from the `bootstrap` closure's copy
+            // of the App struct captured before SwiftUI installed `@State`
+            // storage (see the property's comment for the full failure mode).
+            appDelegate.changeBridge = bridge
             // Chat-driven external writes (an agent tool call completing a
             // shell command that may have committed, e.g. `wikictl source
             // add`) refresh through the SAME coalesced bridge path as a
@@ -491,8 +495,10 @@ struct WikiFSApp: App {
             appDelegate.sessionManager = sessionManager
 
             if let warning = await FileProviderSetupVerifier.verifyAndRepairInstalledProvider() {
-                fileProviderSetupWarning = warning
-                showingFileProviderSetupWarning = true
+                // Mutate the shared model, not `@State` — this Task runs from
+                // a pre-install copy of the App struct (see the model's doc
+                // comment); a `@State` write here would be silently lost.
+                fileProviderSetupAlert.present(warning)
             }
             await fileProvider.migrateDomainsIfNeeded(
                 wikiIDs: registry.wikis.map(\.id))
@@ -843,8 +849,11 @@ struct WikiFSApp: App {
             }
             .alert(
                 "File Provider Setup Needs Attention",
-                isPresented: $showingFileProviderSetupWarning,
-                presenting: fileProviderSetupWarning
+                isPresented: Binding(
+                    get: { fileProviderSetupAlert.isPresented },
+                    set: { if !$0 { fileProviderSetupAlert.dismiss() } }
+                ),
+                presenting: fileProviderSetupAlert.warning
             ) { warning in
                 Button("Open Installed Copy") {
                     NSWorkspace.shared.open(warning.expectedAppURL)
@@ -876,7 +885,7 @@ struct WikiFSApp: App {
             // set: a freshly-created wiki's CLI writes must be heard; a
             // deleted wiki's notification name released.
             .onChange(of: registry.wikis) { _, _ in
-                changeBridge?.refreshObservations()
+                appDelegate.changeBridge?.refreshObservations()
             }
             .onChange(of: appearanceModeRaw) { _, _ in
                 applyAppKitAppearance()
@@ -1106,6 +1115,30 @@ struct WikiFSApp: App {
     }
 }
 
+/// Presents the launch-time File Provider setup warning from alert state that
+/// lives OUTSIDE `@State` value writes. The launch Task that produces the
+/// warning runs through the `AppDelegate.bootstrap` closure's copy of the App
+/// struct — captured during `init()`, before SwiftUI installs `@State`
+/// storage — so `@State` writes from it are silently lost (the same trap that
+/// silently killed `WikiChangeBridge`; see `AppDelegate.changeBridge`). A
+/// reference-type model created at init is shared by every copy of the App
+/// struct, so mutations always land.
+@MainActor
+@Observable
+final class FileProviderSetupAlertModel {
+    var warning: FileProviderSetupWarning?
+    var isPresented = false
+
+    func present(_ warning: FileProviderSetupWarning) {
+        self.warning = warning
+        isPresented = true
+    }
+
+    func dismiss() {
+        isPresented = false
+    }
+}
+
 /// Minimal app delegate: drains ALL sessions' pending saves on app background
 /// (the R3 safety net from `plans/multi-window-ui.md`). Per-window `scenePhase`
 /// in `RootScene` only flushes the active window's session; this catches the
@@ -1126,6 +1159,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// so without a strong owner it deallocates the moment `start()` returns
     /// (same pattern as `menuBarItemController`).
     @MainActor var operationNotifier: OperationNotifier?
+    /// Strong on purpose — same lifetime trap as `menuBarItemController` and
+    /// `operationNotifier`: the bridge must outlive `startStatusItem()`.
+    /// It is the app's ONLY subscriber to the per-wiki Darwin change
+    /// notifications (`org.sockpuppet.wiki.changed.<id>`) that cross-process
+    /// writers (`wikictl`, the `wikid` daemon and its ingestion agents) post
+    /// after committing; its `deinit` unregisters every observer. Storing it
+    /// in App-struct `@State` is NOT enough: `startStatusItem()` is reached
+    /// through the `bootstrap` closure, which captures a copy of the App
+    /// struct taken during `init()` — before SwiftUI installs `@State`
+    /// storage — so a `@State` write from that copy can land in throwaway
+    /// storage, the bridge deallocates, and every daemon/CLI write becomes
+    /// invisible to open windows (stale sidebar lists) until relaunch.
+    @MainActor var changeBridge: WikiChangeBridge?
     /// Window-independent launch work (status item, appearance sync, daemon
     /// connect) — wired in `WikiFSApp.init()`, invoked from
     /// `applicationDidFinishLaunching` below. This is the ONE call site
