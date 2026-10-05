@@ -803,7 +803,9 @@ def run(args: argparse.Namespace) -> int:
     problems = {s.key: check_slot(s, cfg, udid, local_sha1s) for s in slots}
     healthy = cfg.get("TEAM_ID") and not any(problems.values())
 
-    if args.status or healthy:
+    # An explicit --repair goes online even when this Mac's profiles are fine:
+    # only the online pass sees a newly registered Mac the profiles omit.
+    if args.status or (healthy and not args.repair):
         report(slots, problems, cfg, udid, identities, verbose=args.status)
         if healthy:
             PENDING_PATH.unlink(missing_ok=True)
