@@ -186,6 +186,7 @@ help:
 	@echo "  notary-setup      One-time: store notary creds in keychain ($(NOTARY_PROFILE))"
 	@echo "  dist              Build → sign → notarize → staple → zip → checksum"
 	@echo "  github-release    Upload \$$(RELEASE_ZIP) + .sha256 to a GitHub release"
+	@echo "  dev-release       Dev-signed build → GitHub pre-release on origin (registered Macs only)"
 	@echo "  sign              codesign Developer ID + hardened runtime + timestamp"
 	@echo "  notarize          Submit to Apple (keychain profile $(NOTARY_PROFILE))"
 	@echo "  staple            xcrun stapler staple"
@@ -902,3 +903,61 @@ github-release:
 	  --title "$(APP_NAME) $(VERSION)" \
 	  $(if $(NOTES_FILE),--notes-file "$(NOTES_FILE)",--generate-notes)
 	@echo "✓ published v$(VERSION)"
+
+# ---------------------------------------------------------------------------
+# Dev release: an optimized build signed with DEV_IDENTITY (Apple Development)
+# and the development provisioning profiles, published as a GitHub pre-release
+# on the origin fork. No Developer ID, no notarization — the build launches
+# only on the Macs listed in signing/*.provisionprofile (`make signing-repair`
+# after registering a new one). Tagged dev-<count>-<sha> so it never collides
+# with a vX.Y.Z release tag.
+# ---------------------------------------------------------------------------
+
+DEV_RELEASE_TAG := dev-$(shell git rev-list --count HEAD)-$(shell git rev-parse --short=8 HEAD)
+DEV_RELEASE_ZIP := $(DIST_DIR)/$(APP_NAME)-$(DEV_RELEASE_TAG)-macos.zip
+DEV_RELEASE_NOTES := $(DIST_DIR)/$(DEV_RELEASE_TAG)-notes.md
+DEV_RELEASE_REPO ?= $(shell git remote get-url origin | sed -E 's#^(git@github.com:|https://github.com/)##; s#\.git$$##')
+
+.PHONY: dev-release-zip dev-release
+
+dev-release-zip:
+	@if [ -n "$$(git status --porcelain)" ]; then echo "✗ working tree is dirty — commit first so the tag matches the build"; exit 1; fi
+	$(MAKE) build CONFIG=release
+	codesign --verify --deep --strict "$(APP)"
+	@mkdir -p "$(DIST_DIR)"
+	rm -f "$(DEV_RELEASE_ZIP)"
+	ditto -c -k --keepParent "$(APP)" "$(DEV_RELEASE_ZIP)"
+	cd "$(DIST_DIR)" && shasum -a 256 "$$(basename "$(DEV_RELEASE_ZIP)")" > "$$(basename "$(DEV_RELEASE_ZIP)").sha256"
+	@echo "✓ wrote $(DEV_RELEASE_ZIP)"
+
+dev-release: dev-release-zip
+	@command -v gh >/dev/null 2>&1 || { echo "✗ gh CLI not installed (brew install gh)"; exit 1; }
+	@git fetch -q origin
+	@if [ -z "$$(git branch -r --contains HEAD --list 'origin/*')" ]; then echo "✗ HEAD is not on origin — push first"; exit 1; fi
+	@{ \
+	  echo "Personal build signed with an Apple Development certificate. Not notarized."; \
+	  echo "It launches only on these registered Macs:"; \
+	  echo ""; \
+	  security cms -D -i signing/WikiFS.provisionprofile | plutil -extract ProvisionedDevices json -o - - \
+	    | tr -d '[]"' | tr ',' '\n' | sed 's/^/- `/; s/$$/`/'; \
+	  echo ""; \
+	  echo "## Install"; \
+	  echo ""; \
+	  echo '```sh'; \
+	  echo 'cd ~/Downloads && gh release download "$(DEV_RELEASE_TAG)" --repo "$(DEV_RELEASE_REPO)"'; \
+	  echo 'bash install-dev-build.sh'; \
+	  echo '```'; \
+	  echo ""; \
+	  echo "Or download the zip, its .sha256 and install-dev-build.sh into one folder and run"; \
+	  echo "\`bash install-dev-build.sh\` there. No sudo needed."; \
+	  echo ""; \
+	  echo "Commit: $$(git rev-parse HEAD)"; \
+	} > "$(DEV_RELEASE_NOTES)"
+	gh release create "$(DEV_RELEASE_TAG)" \
+	  "$(DEV_RELEASE_ZIP)" "$(DEV_RELEASE_ZIP).sha256" scripts/install-dev-build.sh \
+	  --repo "$(DEV_RELEASE_REPO)" \
+	  --target "$$(git rev-parse HEAD)" \
+	  --title "$(APP_NAME) $(DEV_RELEASE_TAG)" \
+	  --notes-file "$(DEV_RELEASE_NOTES)" \
+	  --prerelease
+	@echo "✓ published $(DEV_RELEASE_TAG) to $(DEV_RELEASE_REPO)"
