@@ -74,7 +74,12 @@ final class FileProviderFacade: ChangeSignaler {
     /// can tell "empty directory" apart from "listing failed".
     private static func defaultListDirectory(_ url: URL) async -> [String]? {
         await Task.detached(priority: .utility) {
-            try? FileManager.default.contentsOfDirectory(atPath: url.path)
+            do {
+                return try FileManager.default.contentsOfDirectory(atPath: url.path)
+            } catch {
+                DebugLog.fileprovider("projection check: listing \(url.path) failed: \(error)")
+                return nil
+            }
         }.value
     }
 
