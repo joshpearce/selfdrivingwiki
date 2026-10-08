@@ -70,28 +70,32 @@ public enum UserEnvironmentPath {
         #endif
     }
 
-    /// Run `<shell> -l -c 'printf %s "$PATH"'` and return the trimmed stdout.
+    /// Run `<shell> -l -c '/usr/bin/printenv PATH'` and return the trimmed
+    /// stdout. `printenv` reads the exported (always colon-joined) PATH, so
+    /// the output does not depend on the shell's own list syntax.
     /// Login mode (`-l`) sources the account's startup files — that is the
     /// PATH the user's interactive shell would have. nil on a non-zero exit,
-    /// a throw, or an implausible output (empty / whitespace, which is not a
-    /// colon-separated PATH — fish renders `$PATH` space-separated).
+    /// a throw, or an implausible output (empty, multi-line, or an entry that
+    /// is not an absolute path).
     public static func loginShellPATH(
         shellPath: String,
         runProcess: (AsyncProcessRequest) async throws -> AsyncProcessResult = AsyncProcessRunner.run
     ) async -> String? {
         let request = AsyncProcessRequest(
             executableURL: URL(fileURLWithPath: shellPath),
-            arguments: ["-l", "-c", "printf %s \"$PATH\""])
+            arguments: ["-l", "-c", "/usr/bin/printenv PATH"])
         do {
             let result = try await runProcess(request)
             guard result.terminationStatus == 0 else { return nil }
             let path = String(data: result.stdoutData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard let path, !path.isEmpty else { return nil }
-            // A plausible PATH is colon-separated with no whitespace. A space
-            // (fish list rendering, or a shell error banner) means the output
-            // is not usable as PATH.
-            guard !path.contains(where: { $0 == " " || $0 == "\t" || $0 == "\n" }) else {
+            // A plausible PATH is a single line of colon-separated absolute
+            // directories. Spaces are legal inside an entry (e.g.
+            // `/Applications/Visual Studio Code.app/...`); a newline or a
+            // relative entry means a shell banner or error leaked into stdout.
+            guard !path.contains(where: { $0 == "\n" || $0 == "\r" }),
+                  path.split(separator: ":").allSatisfy({ $0.hasPrefix("/") }) else {
                 return nil
             }
             return path
