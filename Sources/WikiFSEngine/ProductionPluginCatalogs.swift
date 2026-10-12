@@ -9,7 +9,11 @@ import WikiFSCore
 /// the legacy extraction assembly while it remains during the migration.
 public enum ExtractionPluginFactory {
     public typealias CredentialReader = @Sendable (ExtractionSecret) -> String?
-    public typealias ACPResolver = @Sendable (ExtractionConfig) -> (any MarkdownExtractor)?
+    /// Resolves the ACP extractor for a configuration. ASYNC because the ACP
+    /// resolver needs the user's login-shell `PATH` (#1368) — both to resolve
+    /// the provider's command and to hand that same PATH to the child, which
+    /// would otherwise inherit the daemon's minimal one.
+    public typealias ACPResolver = @Sendable (ExtractionConfig) async -> (any MarkdownExtractor)?
 }
 
 /// One process-scoped service and the cleanup that owns its concrete runtime.
@@ -64,7 +68,10 @@ public struct AgentProviderProcessInput: Sendable {
             AgentBackendFactory.makeBackend(policy: policy, budget: budget, turnCeilingTimeout: ceiling, idleStallTimeout: idleStall)
         },
         probeCatalog: @escaping AgentProviderRuntime.CatalogProbe = { provider, command, apiKey in
-            try await ACPProviderModelProbe(provider: provider, resolvedCommand: command, apiKey: apiKey)
+            try await ACPProviderModelProbe(provider: provider, resolvedCommand: command, apiKey: apiKey,
+                                            // #1368: probe launches see the same login-shell PATH chat
+                                            // launches do (see AgentProviderRuntime's default).
+                                            loginShellPATH: await PathPreflight.loginShellPATH())
                 .discoverObservation()
         }
     ) {
@@ -502,10 +509,18 @@ public actor DaemonProcessProfileOwner {
                     readConfiguration: { ExtractionConfig.load(from: containerDirectory) },
                     readCredential: { extractionCredentialStore.secret($0) },
                     resolveACP: { configuration in
-                        ACPExtractionClient.resolveProvider(
+                        // #1368: resolve the login-shell PATH ONCE per
+                        // provider resolution — it both finds the provider's
+                        // command and rides the extraction profile into the
+                        // child, so the ACP extraction spawn gets the same
+                        // PATH a chat spawn does instead of the daemon's
+                        // minimal one.
+                        let loginShellPATH = await PathPreflight.loginShellPATH()
+                        return ACPExtractionClient.resolveProvider(
                             containerDirectory: containerDirectory,
                             acpProviderId: configuration.acpProviderId,
-                            acpCredentialStore: acpCredentialStore)
+                            acpCredentialStore: acpCredentialStore,
+                            searchPath: loginShellPATH)
                     },
                     httpFetcher: URLSessionRequestFetcher(),
                     packageContainerDirectory: containerDirectory,

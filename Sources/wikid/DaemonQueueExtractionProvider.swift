@@ -38,19 +38,33 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider, @unchecked S
     /// store-only fallback below applies (construction sites without an
     /// engine; the row is still visible to any later scan).
     private let engineEnqueue: (@Sendable (QueueItemRequest) async throws -> QueueItem.ID)?
+    /// The injected host speech engine and its locale for explicit speech
+    /// jobs, mirroring the app provider's seam.
+    private let speechEngine: any SpeechTranscribing
+    private let speechLocaleID: String
+    /// The host-owned private stage root for speech jobs.
+    private let speechStageRoot: URL
 
     init(
         extractionServices: any ExtractionServices,
         storeResolver: @escaping @Sendable (WikiID) -> GRDBWikiStore?,
         openStore: @escaping @Sendable (WikiID) async -> Bool = { _ in false },
         queueStore: QueueStore? = nil,
-        engineEnqueue: (@Sendable (QueueItemRequest) async throws -> QueueItem.ID)? = nil
+        engineEnqueue: (@Sendable (QueueItemRequest) async throws -> QueueItem.ID)? = nil,
+        speechEngine: any SpeechTranscribing = SystemSpeechTranscriber(),
+        speechLocaleID: String = Locale.current.identifier(.bcp47),
+        speechStageRoot: URL? = nil
     ) {
         self.extractionServices = extractionServices
         self.storeResolver = storeResolver
         self.openStore = openStore
         self.queueStore = queueStore
         self.engineEnqueue = engineEnqueue
+        self.speechEngine = speechEngine
+        self.speechLocaleID = speechLocaleID
+        self.speechStageRoot = speechStageRoot
+            ?? FileManager.default.temporaryDirectory
+                .appendingPathComponent("wikid-speech-stages-\(UUID().uuidString)", isDirectory: true)
     }
 
     // MARK: - QueueExtractionProvider
@@ -58,7 +72,8 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider, @unchecked S
     func resolveExtraction(
         wikiID: WikiID,
         sourceID: SourceID,
-        backendOverride: ExtractionBackend?
+        backendOverride: ExtractionBackend?,
+        transcriptionIntent: QueueItemPayload.TranscriptionIntent?
     ) async throws -> ExtractionResolution? {
         var store = storeResolver(wikiID)
         if store == nil {
@@ -77,6 +92,12 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider, @unchecked S
         // wiki; the dedupe keys match the app's, so a concurrent app scan
         // cannot create a second item.
         await recoverStrandedFormatJobs(wikiID: wikiID, store: store)
+
+        // The EXPLICIT speech arm dispatches BEFORE every caption and
+        // generic arm — identical semantics to the app provider.
+        if transcriptionIntent == .onDeviceSpeech {
+            return try await resolveSpeech(store: store, sourceID: sourceID)
+        }
 
         if let origin = DebugLog.trying("sourceOrigin", operation: { try store.sourceOrigin(sourceID: sourceID) }),
            let providerKind = origin.provider {
@@ -244,6 +265,81 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider, @unchecked S
             packageProducer: preparation.packageProvenance))
     }
 
+    /// The EXPLICIT speech arm — identical semantics to the app provider:
+    /// YouTube sources only (the operator's v1 scope gate, checked only for
+    /// the `.onDeviceSpeech` intent), the active synthetic fetcher
+    /// selection, and the injected host engine.
+    private func resolveSpeech(
+        store: GRDBWikiStore,
+        sourceID: SourceID
+    ) async throws -> ExtractionResolution {
+        guard let origin = DebugLog.trying("sourceOrigin", operation: {
+            try store.sourceOrigin(sourceID: sourceID)
+        }), origin.provider == .youtube else {
+            throw SpeechResolutionError.sourceOutsideSpeechScope
+        }
+        guard let sourceURL = YouTubeSourceURL.resolveOperationURL(
+            plan: origin.plan,
+            externalIdentity: origin.externalIdentity) else {
+            throw SpeechResolutionError.sourceURLInvalid
+        }
+        guard let claimedMIME = AudioAcquireAdapter.claimedMIMEType else {
+            throw SpeechResolutionError.speechFetcherUnavailable(
+                "the synthetic audio route is not configured")
+        }
+        let fetcher = try await extractionServices.prepareFetcher(
+            sourceMIMEType: claimedMIME)
+        let adapter = try AudioAcquireAdapter(fetcher: fetcher)
+        let engine = speechEngine
+        switch await engine.readiness(localeID: speechLocaleID) {
+        case .ready:
+            break
+        case .needsSetup(let guidance):
+            throw SpeechResolutionError.engineNotReady(guidance.message)
+        }
+        let stageRoot = speechStageRoot
+        let localeID = speechLocaleID
+        return .speech(SpeechExtractionResolution(
+            acquire: { onProgress in
+                try await adapter.acquireAudio(for: sourceURL, onProgress: onProgress)
+            },
+            speechEngine: engine,
+            stageRoot: stageRoot,
+            localeID: localeID,
+            sourceURL: sourceURL))
+    }
+
+    @discardableResult
+    func persistSpeechExtraction(
+        wikiID: WikiID,
+        sourceID: SourceID,
+        outcome: SpeechOutcome
+    ) async throws -> QueueExtractionOutputReference? {
+        guard let store = storeResolver(wikiID) else {
+            DebugLog.extraction("DaemonQueueExtractionProvider: persistSpeechExtraction — no store for wikiID=\(wikiID.rawValue)")
+            throw DaemonStoreUnavailableError(wikiID: wikiID)
+        }
+        guard let initialVersion = try store.initialContentVersion(sourceID: sourceID) else {
+            DebugLog.store("DaemonQueueExtractionProvider: speech transcript has no initial source version (source=\(sourceID.rawValue))")
+            throw AppendDerivedMarkdownError.missingInitialSourceVersion(sourceID)
+        }
+        let producer = try ExtractionHostSpeechProducer(
+            engine: outcome.transcription.engine,
+            localeID: outcome.transcription.localeID,
+            acquisitionFetcher: outcome.acquisitionFetcher)
+        do {
+            let version = try store.appendHostSpeechTranscript(
+                sourceID: sourceID,
+                content: outcome.transcription.text,
+                producer: producer,
+                sourceVersionID: initialVersion.id)
+            return QueueExtractionOutputReference(versionID: version.id.rawValue)
+        } catch {
+            DebugLog.store("DaemonQueueExtractionProvider: speech transcript write failed (source=\(sourceID.rawValue)): \(error)")
+            throw error
+        }
+    }
+
     @discardableResult
     func persistBytesExtraction(
         wikiID: WikiID,
@@ -275,7 +371,7 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider, @unchecked S
                     // backstop that settles a stale marker.
                     DebugLog.store("DaemonQueueExtractionProvider: fetch-state settle skipped (source=\(sourceID.rawValue)): \(error)")
                 }
-                DarwinNotifier.postChange(forWikiID: wikiID.rawValue)
+                DarwinNotifier.postChange()
                 return QueueExtractionOutputReference(versionID: version.id.rawValue)
             } catch {
                 DebugLog.store("DaemonQueueExtractionProvider: package write failed (source=\(sourceID.rawValue)): \(error)")
@@ -290,7 +386,7 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider, @unchecked S
             }) else {
                 return nil
             }
-            DarwinNotifier.postChange(forWikiID: wikiID.rawValue)
+            DarwinNotifier.postChange()
             return QueueExtractionOutputReference(versionID: version.id.rawValue)
         }
     }
@@ -318,7 +414,7 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider, @unchecked S
             }) else {
                 return nil
             }
-            DarwinNotifier.postChange(forWikiID: wikiID.rawValue)
+            DarwinNotifier.postChange()
             return QueueExtractionOutputReference(versionID: version.id.rawValue)
 
         case .installedPackage(let baseProducer):
@@ -338,7 +434,7 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider, @unchecked S
                     sourceID: sourceID, content: outcome.markdown, package: producer,
                     origin: .transcript, toolVersion: nil,
                     sourceVersionID: initialVersion.id, note: nil)
-                DarwinNotifier.postChange(forWikiID: wikiID.rawValue)
+                DarwinNotifier.postChange()
                 return QueueExtractionOutputReference(versionID: version.id.rawValue)
             } catch {
                 DebugLog.store("DaemonQueueExtractionProvider: package transcript write failed (source=\(sourceID.rawValue)): \(error)")
@@ -426,7 +522,7 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider, @unchecked S
                 package: fetchProducer(resolution, outcome),
                 externalItemKey: itemKey, externalItemTitle: itemTitle,
                 sourceVersionID: initialVersion.id)
-            DarwinNotifier.postChange(forWikiID: wikiID.rawValue)
+            DarwinNotifier.postChange()
             return QueueExtractionOutputReference(versionID: version.id.rawValue)
 
         case .sourceBytes(let bytes):
@@ -445,7 +541,7 @@ final class DaemonQueueExtractionProvider: QueueExtractionProvider, @unchecked S
                 externalItemKey: itemKey,
                 externalItemTitle: itemTitle,
                 producer: fetchProducer(resolution, outcome))
-            DarwinNotifier.postChange(forWikiID: wikiID.rawValue)
+            DarwinNotifier.postChange()
             return QueueExtractionOutputReference(versionID: version.id.rawValue)
         }
     }

@@ -142,7 +142,7 @@ struct LLMSpawnSandboxExhaustivenessTests {
         ),
         (
             "ACPProviderModelProbe.swift",
-            "BackendProfile(providerHints: hints)",
+            "BackendProfile(providerHints: hints, loginShellPATH: loginShellPATH)",
             // Configuration-only: the profile exists so
             // ACPBackend.resolveSpawnConfig can extract the adapter path/args/
             // env. The probe launch itself consumes the typed sandboxed launch
@@ -182,6 +182,7 @@ struct LLMSpawnSandboxExhaustivenessTests {
         ("ManagedExtractorProcessExecutor.swift", "ManagedExtractorProcessError", "enum case construction in a throw, not a launch"),
         ("ManagedExtractorProcessExecutor.swift", "RaceFreeProcessGroupRunner", "verified process-safety boundary (re-verified PID, new group)"),
         ("RuntimeCommandLocator.swift", "RaceFreeProcessGroupRunner", "verified process-safety boundary (re-verified PID, new group)"),
+        ("AuxiliaryRuntimeVersionProbe.swift", "RaceFreeProcessGroupRunner", "verified process-safety boundary (re-verified PID, new group): bounded `<executable> --version` probe of the host-resolved auxiliary runtime"),
         ("RendererAssetReferenceExtractorClient.swift", "RaceFreeProcessGroupRunner", "verified process-safety boundary (re-verified PID, new group)"),
         ("WikiDaemon.swift", "RaceFreeProcessGroupRunner", "verified process-safety boundary (re-verified PID, new group)"),
     ]

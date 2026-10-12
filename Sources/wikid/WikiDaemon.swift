@@ -306,10 +306,18 @@ final class WikiDaemon: @unchecked Sendable {
                     readConfiguration: { ExtractionConfig.load(from: containerDirectory) },
                     readCredential: { extractionCredentialStore.secret($0) },
                     resolveACP: { configuration in
-                        ACPExtractionClient.resolveProvider(
+                        // #1368: resolve the login-shell PATH ONCE per
+                        // provider resolution — it both finds the provider's
+                        // command and rides the extraction profile into the
+                        // child, so the ACP extraction spawn gets the same
+                        // PATH a chat spawn does instead of the daemon's
+                        // minimal one.
+                        let loginShellPATH = await PathPreflight.loginShellPATH()
+                        return ACPExtractionClient.resolveProvider(
                             containerDirectory: containerDirectory,
                             acpProviderId: configuration.acpProviderId,
-                            acpCredentialStore: acpCredentialStore)
+                            acpCredentialStore: acpCredentialStore,
+                            searchPath: loginShellPATH)
                     },
                     httpFetcher: URLSessionRequestFetcher(),
                     packageContainerDirectory: containerDirectory,
@@ -1145,7 +1153,7 @@ final class WikiDaemon: @unchecked Sendable {
     /// The daemon's stores live in a separate process from the app, so the
     /// store's own `ResourceChangeEvent` emissions (from `mutate()`) can't
     /// reach the app directly. This wiring bridges them: each event →
-    /// `DarwinNotifier.postChange(forWikiID:)` → the app's `WikiChangeBridge`
+    /// `DarwinNotifier.postChange()` → the app's `WikiChangeBridge`
     /// receives the cross-process Darwin notification → coalesces → reloads.
     ///
     /// Without it, daemon-only writes that never pass through an agent
@@ -1164,7 +1172,7 @@ final class WikiDaemon: @unchecked Sendable {
         if store.eventBus == nil {
             let bus = WikiEventBus(wikiID: wikiID)
             bus.subscribe(nil) { event in
-                DarwinNotifier.postChange(forWikiID: event.wikiID.rawValue)
+                DarwinNotifier.postChange()
             }
             store.eventBus = bus
         }
@@ -1440,7 +1448,10 @@ final class WikiDaemon: @unchecked Sendable {
                     self?.pushChatEnvelope(envelope)
                 },
                 diagnosticTrace: daemonChatDiagnostics,
-                providerServices: runtime.provider)
+                providerServices: runtime.provider,
+                makeLauncher: {
+                    services.launcherFactory(wikiID: wikiID).launcher
+                })
         }
         try Task.checkCancellation()
 
