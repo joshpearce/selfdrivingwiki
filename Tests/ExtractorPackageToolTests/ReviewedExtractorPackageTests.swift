@@ -211,10 +211,11 @@ struct ReviewedExtractorPackageTests {
         }
     }
 
-    /// The reviewed YouTube transcript package: manifest revision 1 with
-    /// protocol revision 3, one `youtube-transcript` registration over the
-    /// synthetic `video/youtube` MIME, and the `network` capability only.
-    /// Media download and speech-to-text are not registered.
+    /// The reviewed YouTube transcript package: manifest revision 5 (the
+    /// `wantsAgentCleanup` claim, issue #1379) with protocol revision 3, one
+    /// `youtube-transcript` registration over the synthetic `video/youtube`
+    /// MIME, and the `network` capability only. Media download and
+    /// speech-to-text are not registered.
     @Test func youtubeTranscriptRevisionMatchesGolden() throws {
         let output = try validate("YouTubeTranscript")
 
@@ -223,11 +224,14 @@ struct ReviewedExtractorPackageTests {
         #expect(output.registrationIDs == ["captions"])
 
         let manifest = try manifest("YouTubeTranscript")
-        #expect(manifest.manifestRevision == .v1)
+        #expect(manifest.manifestRevision == .v5)
         let registration = try #require(manifest.registrations.first)
         #expect(registration.kinds == [.youtubeTranscript])
         #expect(registration.mimeTypes == [try ExtractorMIMEType(validating: "video/youtube")])
         #expect(registration.credentialRequirements.isEmpty)
+        // Issue #1379: the raw auto-captions want the host's best-effort
+        // agent cleanup pass after they land.
+        #expect(registration.wantsAgentCleanup)
         // Network for the caption fetch; shared-runtime-cache keeps uv's
         // CPython install and wheel cache warm across operations.
         #expect(manifest.capabilities == [.network, .sharedRuntimeCache])
@@ -242,7 +246,7 @@ struct ReviewedExtractorPackageTests {
         // The exact reviewed identity is pinned byte-for-byte; a regenerated
         // package whose digest changed fails this gate with the new value.
         #expect(output.packageDigest
-            == "23e987d6ee3207ff89fb506a23c5ccef8e2693410dd14bc7f8e47e4f8acd7679")
+            == "8baac5e4c4d78a6869a0acf2ca9d1bf7503f65a7a5c61889aab33df492347a52")
     }
 
     /// The reviewed YouTube package never claims model download: it fetches
@@ -289,6 +293,17 @@ struct ReviewedExtractorPackageTests {
             fixtures.appendingPathComponent("frames-blocked.jsonl").path,
         ])
         #expect(blocked.terminalKind == "failure")
+
+        // The yt-dlp fallback route: the "trying the caption fallback"
+        // progress step and the yt-dlp tool provenance on the result.
+        let fallback = try ExtractorPackageToolExecutor().execute(arguments: [
+            "protocol-smoke",
+            Self.packageURL("YouTubeTranscript").path,
+            request,
+            fixtures.appendingPathComponent("frames-ytdlp-fallback.jsonl").path,
+        ])
+        #expect(fallback.terminalKind == "result")
+        #expect(fallback.progressEventCount == 4)
     }
 
     /// A malformed frame document (two terminal frames) must fail the
@@ -427,6 +442,72 @@ struct ReviewedExtractorPackageTests {
                 fixtures.appendingPathComponent("frames.jsonl").path,
             ])
         }
+    }
+
+    /// The reviewed audio-acquire package: manifest revision 4 with the
+    /// FETCHER role (no operation kinds — its claim is the synthetic
+    /// `audio/x-wiki-audio-acquire` source MIME), protocol revision 5 with
+    /// a typed `source-bytes` result declaring `audio/mp4`, and the
+    /// acquisition-only capability set. The package downloads ONE audio
+    /// stream for the speech arm's transient analysis; it never converts
+    /// formats, never runs speech-to-text, and never stores audio as a
+    /// source blob.
+    @Test func audioAcquireRevisionMatchesGolden() throws {
+        let output = try validate("AudioAcquire")
+
+        #expect(output.packageID == "org.selfdrivingwiki.audio-acquire")
+        #expect(output.protocolRevision == 5)
+        #expect(output.registrationIDs == ["audio"])
+
+        let manifest = try manifest("AudioAcquire")
+        #expect(manifest.manifestRevision == .v4)
+        let registration = try #require(manifest.registrations.first)
+        // Fetcher: role declared by the package, no kinds, and the claimed
+        // input MIME set is exactly the synthetic source route.
+        #expect(registration.role == .fetcher)
+        #expect(registration.kinds.isEmpty)
+        #expect(registration.mimeTypes == [try ExtractorMIMEType(validating: "audio/x-wiki-audio-acquire")])
+        #expect(registration.filenameExtensions.isEmpty)
+        #expect(registration.credentialRequirements.isEmpty)
+        // Acquisition only: network (REQUIRED for a fetcher) + shared
+        // runtime cache, no model.
+        #expect(manifest.capabilities == [.network, .sharedRuntimeCache])
+        #expect(manifest.capabilities.contains(.modelDownload) == false)
+        // The output bound stays ABOVE the package's 120 MiB download cap,
+        // and the 30-minute duration bound covers a full-length download.
+        #expect(manifest.limits.maximumMarkdownOutputByteCount == 134_217_728)
+        #expect(manifest.limits.maximumMarkdownOutputByteCount > 120 * 1024 * 1024)
+        #expect(manifest.limits.maximumDurationMilliseconds == 1_800_000)
+        guard case .runtime(let command, let arguments) = manifest.launch else {
+            Issue.record("audio-acquire must launch through a runtime")
+            return
+        }
+        #expect(command.rawValue == "uv")
+        #expect(arguments == ["run", "--script"])
+
+        // The exact reviewed identity is pinned byte-for-byte; a regenerated
+        // package whose digest changed fails this gate with the new value.
+        #expect(output.packageDigest
+            == "6261283f01b4fa1ddfa272c99060a84962ac9dfffd8034b0f1a775a62bc4c249")
+    }
+
+    /// The recorded audio-acquire protocol frames replay through the
+    /// revision-5 sequence: progress frames, then one terminal `result`
+    /// carrying the `source-bytes` tag and the concrete `audio/mp4` MIME.
+    @Test func audioAcquireProtocolSmoke() throws {
+        let fixtures = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/AudioAcquire", isDirectory: true)
+
+        let success = try ExtractorPackageToolExecutor().execute(arguments: [
+            "protocol-smoke",
+            Self.packageURL("AudioAcquire").path,
+            fixtures.appendingPathComponent("request.json").path,
+            fixtures.appendingPathComponent("frames.jsonl").path,
+        ])
+        #expect(success.packageID == "org.selfdrivingwiki.audio-acquire")
+        #expect(success.terminalKind == "result")
+        #expect(success.progressEventCount == 5)
     }
 
     @Test func reviewedDigestsAreStableAcrossRepeatedValidation() throws {

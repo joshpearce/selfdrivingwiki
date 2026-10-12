@@ -567,6 +567,16 @@ public struct ExtractorCredentialInputEnvelope: Codable, Hashable, Sendable {
 ///   RELATIVE to the operation root and names a host-staged, owner-private
 ///   executable (see the engine's operation-support staging); it is not a
 ///   secret and is never an absolute path.
+/// - `.reviewedYouTubeBunRuntime` encodes the tagged shape
+///   (`{"kind": "reviewed-youtube-bun-runtime", "executablePath": …}`). The
+///   path IS absolute: it names the host-resolved auxiliary JavaScript
+///   runtime (Bun) that the reviewed YouTube package's caption fallback
+///   hands to its pinned retrieval library. The host resolves the path
+///   through its own login-shell locator, verifies the version and
+///   executable identity at preparation, and rechecks the identity before
+///   writing the configuration — the package never supplies or influences
+///   the path. Admission happens at the exact-revision provider; the wire
+///   shape itself stays decodable so the host can round-trip it.
 public enum ExtractorOperationConfiguration: Hashable, Sendable {
     /// The Docling Serve endpoint + timeout. Both fields optional; the
     /// package reports a clear setup failure when its endpoint is missing.
@@ -576,10 +586,23 @@ public enum ExtractorOperationConfiguration: Hashable, Sendable {
     /// argument, no endpoint — the package resolves it against its own
     /// operation root.
     case applePodcastTranscript(helperPath: ExtractorRelativePath)
+    /// The reviewed YouTube package's auxiliary JavaScript runtime: the
+    /// absolute path of the host-resolved Bun executable. The package uses
+    /// it only for its caption-fallback retrieval; a missing grant never
+    /// fails the primary caption route.
+    case reviewedYouTubeBunRuntime(executablePath: String)
+    /// The reviewed audio-acquire package's auxiliary JavaScript runtime:
+    /// the same host-resolved Bun, under a DISTINCT wire kind. A grant is
+    /// per reviewed revision — the audio package's exact digest receives
+    /// its own case and never the caption package's.
+    case audioAcquireBunRuntime(executablePath: String)
 
     public static let maximumEndpointByteCount = 2_048
     public static let maximumTimeoutMilliseconds = ExtractorHostLimits.maximumDurationMilliseconds
+    public static let maximumExecutablePathByteCount = 4_096
     static let appleKindValue = "apple-podcast-transcript"
+    static let youTubeBunKindValue = "reviewed-youtube-bun-runtime"
+    static let audioAcquireBunKindValue = "reviewed-audio-acquire-bun-runtime"
 
     /// The legacy-compatible Docling construction. Validation matches the
     /// original struct: bounded http/https endpoint, in-policy timeout.
@@ -608,11 +631,49 @@ public enum ExtractorOperationConfiguration: Hashable, Sendable {
         }
         self = .doclingServe(endpoint: endpoint, timeoutMilliseconds: timeoutMilliseconds)
     }
+
+    /// The reviewed YouTube Bun construction. Validation: one bounded,
+    /// absolute, control-character-free path. The host — never a package —
+    /// supplies the value; the exact-revision provider decides which
+    /// prepared operation may receive it.
+    public init(reviewedYouTubeBunRuntimeExecutablePath path: String) throws {
+        guard path.isEmpty == false,
+              path.utf8.count <= Self.maximumExecutablePathByteCount,
+              path.hasPrefix("/"),
+              path.contains("\0") == false,
+              path.allSatisfy({ character in
+                  character.unicodeScalars.allSatisfy { scalar in
+                      scalar.value >= 0x20 && scalar.value != 0x7F
+                  }
+              }) else {
+            throw ExtractorValidationError.invalidManifest(
+                "reviewed-youtube-bun-runtime executable path")
+        }
+        self = .reviewedYouTubeBunRuntime(executablePath: path)
+    }
+
+    /// The reviewed audio-acquire Bun construction. Same validation shape
+    /// as the caption sibling under its own wire kind.
+    public init(reviewedAudioAcquireBunRuntimeExecutablePath path: String) throws {
+        guard path.isEmpty == false,
+              path.utf8.count <= Self.maximumExecutablePathByteCount,
+              path.hasPrefix("/"),
+              path.contains("\0") == false,
+              path.allSatisfy({ character in
+                  character.unicodeScalars.allSatisfy { scalar in
+                      scalar.value >= 0x20 && scalar.value != 0x7F
+                  }
+              }) else {
+            throw ExtractorValidationError.invalidManifest(
+                "reviewed-audio-acquire-bun-runtime executable path")
+        }
+        self = .audioAcquireBunRuntime(executablePath: path)
+    }
 }
 
 extension ExtractorOperationConfiguration: Codable {
     private enum CodingKeys: String, CodingKey {
-        case kind, endpoint, timeoutMilliseconds, helperPath
+        case kind, endpoint, timeoutMilliseconds, helperPath, executablePath
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -628,6 +689,12 @@ extension ExtractorOperationConfiguration: Codable {
         case .applePodcastTranscript(let helperPath):
             try container.encode(Self.appleKindValue, forKey: .kind)
             try container.encode(helperPath, forKey: .helperPath)
+        case .reviewedYouTubeBunRuntime(let executablePath):
+            try container.encode(Self.youTubeBunKindValue, forKey: .kind)
+            try container.encode(executablePath, forKey: .executablePath)
+        case .audioAcquireBunRuntime(let executablePath):
+            try container.encode(Self.audioAcquireBunKindValue, forKey: .kind)
+            try container.encode(executablePath, forKey: .executablePath)
         }
     }
 
@@ -641,9 +708,11 @@ extension ExtractorOperationConfiguration: Codable {
         }
         switch raw[CodingKeys.kind.rawValue]?.stringValue {
         case nil:
-            // Legacy flat shape (Docling). A helper path or a known field with
-            // an invalid value type makes the shape invalid.
-            guard raw[CodingKeys.helperPath.rawValue] == nil else {
+            // Legacy flat shape (Docling). A helper path, an executable
+            // path, or a known field with an invalid value type makes the
+            // shape invalid.
+            guard raw[CodingKeys.helperPath.rawValue] == nil,
+                  raw[CodingKeys.executablePath.rawValue] == nil else {
                 throw ExtractorValidationError.invalidManifest(
                     "invalid legacy operation configuration")
             }
@@ -661,10 +730,11 @@ extension ExtractorOperationConfiguration: Codable {
             let timeout = raw[CodingKeys.timeoutMilliseconds.rawValue]?.intValue
             try self.init(endpoint: endpoint, timeoutMilliseconds: timeout)
         case Self.appleKindValue:
-            // Tagged Apple shape: helper path required; Docling fields must
-            // be absent.
+            // Tagged Apple shape: helper path required; Docling and
+            // YouTube-Bun fields must be absent.
             guard raw[CodingKeys.endpoint.rawValue] == nil,
-                  raw[CodingKeys.timeoutMilliseconds.rawValue] == nil else {
+                  raw[CodingKeys.timeoutMilliseconds.rawValue] == nil,
+                  raw[CodingKeys.executablePath.rawValue] == nil else {
                 throw ExtractorValidationError.invalidManifest(
                     "apple-podcast-transcript configuration accepts a helper path only")
             }
@@ -674,6 +744,36 @@ extension ExtractorOperationConfiguration: Codable {
                     "apple-podcast-transcript helper path")
             }
             self = .applePodcastTranscript(helperPath: helperPath)
+        case Self.youTubeBunKindValue:
+            // Tagged YouTube-Bun shape: exactly one absolute executable
+            // path; every other field must be absent.
+            guard raw[CodingKeys.endpoint.rawValue] == nil,
+                  raw[CodingKeys.timeoutMilliseconds.rawValue] == nil,
+                  raw[CodingKeys.helperPath.rawValue] == nil else {
+                throw ExtractorValidationError.invalidManifest(
+                    "reviewed-youtube-bun-runtime configuration accepts an executable path only")
+            }
+            guard let pathRaw = raw[CodingKeys.executablePath.rawValue]?.stringValue else {
+                throw ExtractorValidationError.invalidManifest(
+                    "reviewed-youtube-bun-runtime executable path")
+            }
+            try self = .init(reviewedYouTubeBunRuntimeExecutablePath: pathRaw)
+        case Self.audioAcquireBunKindValue:
+            // Tagged audio-acquire-Bun shape: exactly one absolute
+            // executable path; every other field must be absent. The kind
+            // is distinct from the caption package's — a grant never
+            // crosses reviewed lineages.
+            guard raw[CodingKeys.endpoint.rawValue] == nil,
+                  raw[CodingKeys.timeoutMilliseconds.rawValue] == nil,
+                  raw[CodingKeys.helperPath.rawValue] == nil else {
+                throw ExtractorValidationError.invalidManifest(
+                    "reviewed-audio-acquire-bun-runtime configuration accepts an executable path only")
+            }
+            guard let pathRaw = raw[CodingKeys.executablePath.rawValue]?.stringValue else {
+                throw ExtractorValidationError.invalidManifest(
+                    "reviewed-audio-acquire-bun-runtime executable path")
+            }
+            try self = .init(reviewedAudioAcquireBunRuntimeExecutablePath: pathRaw)
         case .some:
             throw ExtractorValidationError.invalidManifest(
                 "unknown operation configuration kind")

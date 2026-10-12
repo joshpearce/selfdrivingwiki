@@ -1341,6 +1341,20 @@ public final class WikiStoreModel {
         setActiveTab(id)
     }
 
+    /// Move a tab to a new position in the bar (drag-to-reorder, #1388).
+    /// `newIndex` is the FINAL index in the array after the move (clamped to
+    /// bounds). The active tab is tracked by ID, so it stays active through the
+    /// move; per-tab state (pin, edit mode, drafts) travels with the tab.
+    /// Unknown IDs and no-op moves are ignored.
+    public func moveTab(id: UUID, to newIndex: Int) {
+        guard let from = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let to = min(max(newIndex, 0), tabs.count - 1)
+        guard from != to else { return }
+        let tab = tabs.remove(at: from)
+        tabs.insert(tab, at: to)
+        DebugLog.tabs("[tabs] moveTab: tab \(id) moved \(from) → \(to)")
+    }
+
     /// Persist the editor's edit-mode state to the given tab so that
     /// switching back to it can restore the mode.
     public func setTabEditing(tabID: UUID, isEditing: Bool) {
@@ -2510,18 +2524,25 @@ public final class WikiStoreModel {
                 }
             }
             // No transcript markdown is written — the source's
-            // `source_markdown_versions` stays empty until the user transcribes.
-            // The reader shows the embed player (the source has an
-            // `embedTarget`); the Transcribe button is the sole affordance to
-            // surface a transcript. No manual reload — the bus fires
-            // reloadFromStore() async after the store writes. The tab title is
-            // passed explicitly so tabTitle (which reads `sources`) needs no
-            // synchronous freshness.
+            // `source_markdown_versions` stays empty until the extraction
+            // queue item lands. The reader shows the embed player (the
+            // source has an `embedTarget`). No manual reload — the bus fires
+            // reloadFromStore() async after the store writes. The tab title
+            // is passed explicitly so tabTitle (which reads `sources`) needs
+            // no synchronous freshness.
             openTab(.source(summary.id), title: resolvedTitle ?? summary.effectiveName)
+            // Issue #1379: report "transcript extraction wanted" when an
+            // installed registration claims the created source's MIME —
+            // kind-free, registration-derived. The UI layer that called
+            // addURL enqueues the standard `.extraction` queue item.
+            let transcriptExtractionWanted = transcriptExtractionWanted(
+                mimeType: Self.podcastEmbedMIME)
             return URLFetchService.FetchOutcome(
                 filename: summary.filename,
                 byteSize: 0,
-                kind: .audioEmbed)
+                kind: .audioEmbed,
+                transcriptExtractionWanted: transcriptExtractionWanted,
+                sourceID: summary.id)
         }
         // Phase 5b: byteless external-embed media (provider iframes + direct-
         // remote). YouTube routes uniformly through `bytelessMediaOutcome`
@@ -2585,10 +2606,18 @@ public final class WikiStoreModel {
         // `source_markdown_versions` stays empty until the user transcribes.
         // Mirrors the Apple PR4 + YouTube PR5 byteless-only ingest contract.
         openTab(.source(summary.id), title: summary.effectiveName)
+        // Issue #1379 consistency: same claim + route-policy signal as the
+        // addURL byteless branches — the PodcastTranscript package claims
+        // `audio/podcast` AND the bundled import-transcription policy covers
+        // the podcast-transcript route, so the caller can auto-enqueue the
+        // extraction.
         return URLFetchService.FetchOutcome(
             filename: summary.filename,
             byteSize: 0,
-            kind: .audioEmbed)
+            kind: .audioEmbed,
+            transcriptExtractionWanted: transcriptExtractionWanted(
+                mimeType: Self.rssPodcastEmbedMIME),
+            sourceID: summary.id)
     }
 
     /// Build the byteless-source filename for a generic RSS podcast feed
@@ -2677,8 +2706,43 @@ public final class WikiStoreModel {
         // appendDerivedMarkdown). The tab title is passed explicitly (the
         // resolved title when available) so it needs no synchronous freshness.
         openTab(.source(summary.id), title: metadata?.title ?? summary.effectiveName)
+        // Issue #1379, revised: report "transcript extraction wanted" only
+        // when an installed registration claims the created source's MIME
+        // AND the claimed route is in the bundled import-transcription
+        // policy. Caption routes are covered (podcast, Apple Podcasts,
+        // YouTube); speech-to-text never is. The UI layer that called
+        // addURL enqueues the standard `.extraction` queue item for the
+        // covered routes — the same request the manual Transcribe button
+        // builds.
+        let transcriptExtractionWanted = transcriptExtractionWanted(
+            mimeType: match.mimeType)
         return URLFetchService.FetchOutcome(
-            filename: match.filename, byteSize: 0, kind: kind)
+            filename: match.filename, byteSize: 0, kind: kind,
+            transcriptExtractionWanted: transcriptExtractionWanted,
+            sourceID: summary.id)
+    }
+
+    /// Registration-derived, route-policy-gated "should this source's
+    /// transcript be fetched automatically at import?" — `true` only when
+    /// BOTH hold: an active installed registration claims the MIME (an
+    /// unambiguous claim, matching `autoExtractIfRegistered`'s gate
+    /// philosophy) AND the claimed route appears in the bundled
+    /// import-transcription policy. Names no extractor kind; claims data
+    /// and bundled route policy decide. Caption routes (podcast, Apple
+    /// Podcasts, YouTube) are covered; speech-to-text is not in the table
+    /// and runs only on an explicit user action. Issue #1379.
+    private func transcriptExtractionWanted(mimeType: String) -> Bool {
+        guard let claim = registeredExtractionInputs
+            .registeredMIME(forNormalizedMIME: mimeType),
+            // Claims are normalized registration data, so this reparse
+            // always succeeds in practice; a failure means the route
+            // cannot be named and the import stays manual (deliberately
+            // inert, not swallowed).
+            // swiftlint:disable:next silent_try_optional
+            let claimedMIME = try? ExtractorMIMEType(validating: claim.mimeType)
+        else { return false }
+        return ExtractorRouteDefaults.bundled.importTranscriptionWanted(
+            for: ExtractorRouteID(kind: claim.kind, mimeType: claimedMIME))
     }
 
     /// Off-main oEmbed metadata fetch for a byteless media match. The GET
@@ -2841,6 +2905,13 @@ public final class WikiStoreModel {
         //    version, so the reader tab shows rendered content with inlined
         //    images alongside the original-HTML HTML tab.
         appendExtractedMarkdown(to: pageSummary, from: snapshot.page)
+        // 5. Issue #1380: the snapshot sidecar is the ingest-time FALLBACK
+        //    (image-rewritten tag-based text). The gated import extraction
+        //    still runs for snapshot sources, so the route-selected package
+        //    (Defuddle) lands and is nominated active when available. The
+        //    gate closes without a live claiming package and the sidecar
+        //    stays the active readable version — the pre-#1380 behavior.
+        autoExtractIfRegistered(pageSummary)
         return pageSummary
     }
 
@@ -3786,6 +3857,22 @@ public final class WikiStoreModel {
                 return
             }
             _ = await extractDocx(for: sourceID, extractor: extractor)
+        case .html(let extractor):
+            // HtmlMarkdownExtractor has no readiness probe: preparation
+            // resolves the adapter or throws, and a runtime failure (bun
+            // missing, SPA page with no article body) surfaces as an empty
+            // result `extractHtml` already treats as skip-and-log. The
+            // source then keeps landing verbatim with the Extract button
+            // available — the issue #799 manual-retry contract.
+            let version = await extractHtml(for: sourceID, backend: .defuddle, extractor: extractor)
+            // Snapshot ingests land with the image-rewritten materializer
+            // sidecar as the default head; nominate the package version so
+            // the route selection, not the ingest fallback, is the active
+            // readable text. On sidecar-less paths the import version is
+            // already the head and this is a no-op.
+            if let version {
+                setActiveMarkdown(for: sourceID, to: version.id)
+            }
         }
     }
 

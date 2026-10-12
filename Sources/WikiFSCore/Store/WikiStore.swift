@@ -679,6 +679,14 @@ public protocol WikiStore: AnyObject, Sendable {
     /// `ExternalEmbed.target(for:)` for byteless external embeds.
     func embedDescriptors() throws -> [SourceID: SourceEmbedDescriptor]
 
+    /// Batched `sourceOrigin(sourceID:)` for ALL sources in one query —
+    /// `[SourceID: SourceOrigin]`, same shared column list and `originFrom`
+    /// mapper, refs-preferred + MAX(id) fallback, NO blob filter (origins are
+    /// visible for fetched sources WITH bytes too, e.g. website snapshots).
+    /// READ seam — no mutate/emit. Enumeration callers MUST use this map
+    /// instead of per-source `sourceOrigin` calls (N+1).
+    func sourceOriginsBySource() throws -> [SourceID: SourceOrigin]
+
     // MARK: - Phase 4: website snapshot store primitives
 
     /// Create the shared fetch activity for a website snapshot. Commits the
@@ -762,6 +770,17 @@ public protocol WikiStore: AnyObject, Sendable {
         package: ExtractionInstalledPackageProducer,
         origin: SourceMarkdownOrigin, toolVersion: String?,
         sourceVersionID: SourceVersionID?, note: String?
+    ) throws -> SourceMarkdownVersion
+
+    /// Append one HOST-produced on-device speech transcript as ONE
+    /// `.transcript` version with the typed host-speech producer and the
+    /// REQUIRED initial source-version link (same lineage rule as a package
+    /// transcript). Never attaches a blob and never claims agent cleanup.
+    @discardableResult
+    func appendHostSpeechTranscript(
+        sourceID: SourceID, content: String,
+        producer: ExtractionHostSpeechProducer,
+        sourceVersionID: SourceVersionID
     ) throws -> SourceMarkdownVersion
 
     /// Revert to an older version by appending a NEW version whose content
@@ -1247,6 +1266,13 @@ public protocol WikiStore: AnyObject, Sendable {
     /// was removed.
     @discardableResult
     func removePersistedQueuedChatTurn(chatID: ChatID, turnID: ChatTurnID) throws -> Bool
+
+    /// Atomically cancel one unclaimed queued turn in place. The row, ordinal,
+    /// and submission identity are retained; the returned row has terminal
+    /// `cancelled` state, a cancellation timestamp, and cancellation metadata.
+    /// Returns nil when the matching row is absent or is no longer queued.
+    @discardableResult
+    func cancelUnclaimedPersistedChatTurn(chatID: ChatID, turnID: ChatTurnID) throws -> PersistedChatTurn?
 
     /// Atomically claim the oldest currently-queued turn for provider
     /// submission. Returns nil when no queued turn remains.

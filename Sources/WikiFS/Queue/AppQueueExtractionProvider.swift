@@ -86,15 +86,40 @@ final class AppQueueExtractionProvider: QueueExtractionProvider {
     private var followOnQueueStore: QueueStore?
     /// Wikis this process already recovery-scanned (one-shot per wiki).
     private var recoveredWikis: Set<WikiID> = []
+    /// The injectable agent seam for the manifest-claimed transcript
+    /// cleanup (issue #1379). `nil` disables the pass (tests, or a host
+    /// without agent services) — the raw transcript stays canonical.
+    private let transcriptCleanupAgent: (any TranscriptCleanupAgent)?
+    /// The injected host speech engine and its locale for explicit
+    /// speech jobs. Tests inject a scripted engine; production uses the
+    /// system speech analyzer.
+    private let speechEngine: any SpeechTranscribing
+    private let speechLocaleID: String
+    /// The host-owned private stage root for speech jobs.
+    private let speechStageRoot: URL
 
     init(
         extractionServices: any ExtractionServices,
         sessionBox: SessionLookupBox,
-        queueDatabaseURL: URL? = nil
+        queueDatabaseURL: URL? = nil,
+        transcriptCleanupAgent: (any TranscriptCleanupAgent)? = nil,
+        speechEngine: any SpeechTranscribing = SystemSpeechTranscriber(),
+        speechLocaleID: String = Locale.current.identifier(.bcp47),
+        speechStageRoot: URL? = nil
     ) {
         self.extractionServices = extractionServices
         self.sessionBox = sessionBox
         self.queueDatabaseURL = queueDatabaseURL
+        self.transcriptCleanupAgent = transcriptCleanupAgent
+        self.speechEngine = speechEngine
+        self.speechLocaleID = speechLocaleID
+        // Default stage root: beside the queue database inside the app
+        // group container (host-owned, private). Tests pass an explicit root.
+        self.speechStageRoot = speechStageRoot
+            ?? queueDatabaseURL?.deletingLastPathComponent()
+                .appendingPathComponent("SpeechStages", isDirectory: true)
+            ?? FileManager.default.temporaryDirectory
+                .appendingPathComponent("wikifs-speech-stages-\(UUID().uuidString)", isDirectory: true)
     }
 
     // MARK: - QueueExtractionProvider
@@ -102,11 +127,19 @@ final class AppQueueExtractionProvider: QueueExtractionProvider {
     func resolveExtraction(
         wikiID: WikiID,
         sourceID: SourceID,
-        backendOverride: ExtractionBackend?
+        backendOverride: ExtractionBackend?,
+        transcriptionIntent: QueueItemPayload.TranscriptionIntent?
     ) async throws -> ExtractionResolution? {
         guard let store = sessionBox.resolve(wikiID: wikiID) else {
             DebugLog.extraction("AppQueueExtractionProvider: no session for wikiID=\(wikiID)")
             return nil
+        }
+
+        // The EXPLICIT speech arm dispatches BEFORE every caption and
+        // generic arm. A caption failure starts no speech, and a speech
+        // item never resolves through the caption routes.
+        if transcriptionIntent == .onDeviceSpeech {
+            return try await resolveSpeech(store: store, sourceID: sourceID)
         }
 
         // Transcript sources have no local bytes; the markdown comes from a
@@ -273,6 +306,92 @@ final class AppQueueExtractionProvider: QueueExtractionProvider {
             packageProducer: preparation.packageProvenance))
     }
 
+    /// The EXPLICIT speech arm: YouTube sources only (v1 scope gate, checked
+    /// only for the `.onDeviceSpeech` intent), resolved through the active
+    /// synthetic fetcher selection and the injected host engine. This is
+    /// NOT an origin gate in `FetchRouteDecision` or the generic fetch
+    /// pipeline — generic fetch behavior stays provider-neutral.
+    private func resolveSpeech(
+        store: WikiStoreModel,
+        sourceID: SourceID
+    ) async throws -> ExtractionResolution {
+        // v1 scope: the source must be a YouTube source with a validated
+        // operation URL.
+        guard let origin = store.sourceOrigin(for: sourceID),
+              origin.provider == .youtube else {
+            throw SpeechResolutionError.sourceOutsideSpeechScope
+        }
+        guard let sourceURL = YouTubeSourceURL.resolveOperationURL(
+            plan: origin.plan,
+            externalIdentity: origin.externalIdentity) else {
+            throw SpeechResolutionError.sourceURLInvalid
+        }
+        // The active, unambiguous synthetic fetcher selection. A missing,
+        // disabled, or ambiguous selection throws the typed extraction
+        // error — the speech item fails visibly, never falls back.
+        guard let claimedMIME = AudioAcquireAdapter.claimedMIMEType else {
+            throw SpeechResolutionError.speechFetcherUnavailable(
+                "the synthetic audio route is not configured")
+        }
+        let fetcher = try await extractionServices.prepareFetcher(
+            sourceMIMEType: claimedMIME)
+        let adapter = try AudioAcquireAdapter(fetcher: fetcher)
+        // The host engine must be ready for the locale BEFORE any network
+        // work; asset installation is never started here.
+        let engine = speechEngine
+        switch await engine.readiness(localeID: speechLocaleID) {
+        case .ready:
+            break
+        case .needsSetup(let guidance):
+            throw SpeechResolutionError.engineNotReady(guidance.message)
+        }
+        let stageRoot = speechStageRoot
+        let localeID = speechLocaleID
+        return .speech(SpeechExtractionResolution(
+            acquire: { onProgress in
+                try await adapter.acquireAudio(
+                    for: sourceURL, onProgress: onProgress)
+            },
+            speechEngine: engine,
+            stageRoot: stageRoot,
+            localeID: localeID,
+            sourceURL: sourceURL))
+    }
+
+    @discardableResult
+    func persistSpeechExtraction(
+        wikiID: WikiID,
+        sourceID: SourceID,
+        outcome: SpeechOutcome
+    ) async throws -> QueueExtractionOutputReference? {
+        guard let store = sessionBox.resolve(wikiID: wikiID) else {
+            DebugLog.extraction("AppQueueExtractionProvider: persistSpeechExtraction — no session for wikiID=\(wikiID)")
+            throw AppendDerivedMarkdownError.missingSource(sourceID)
+        }
+        // The source's immutable initial version is REQUIRED (same lineage
+        // rule as a package transcript): the write fails before persisting
+        // when absent.
+        guard let initialVersion = store.initialContentVersion(for: sourceID) else {
+            DebugLog.store("AppQueueExtractionProvider: speech transcript has no initial source version (source=\(sourceID.rawValue))")
+            throw AppendDerivedMarkdownError.missingInitialSourceVersion(sourceID)
+        }
+        let producer = try ExtractionHostSpeechProducer(
+            engine: outcome.transcription.engine,
+            localeID: outcome.transcription.localeID,
+            acquisitionFetcher: outcome.acquisitionFetcher)
+        do {
+            let version = try store.internalStore.appendHostSpeechTranscript(
+                sourceID: sourceID,
+                content: outcome.transcription.text,
+                producer: producer,
+                sourceVersionID: initialVersion.id)
+            return QueueExtractionOutputReference(versionID: version.id.rawValue)
+        } catch {
+            DebugLog.store("AppQueueExtractionProvider: speech transcript write failed (source=\(sourceID.rawValue)): \(error)")
+            throw error
+        }
+    }
+
     @discardableResult
     func persistBytesExtraction(
         wikiID: WikiID,
@@ -356,11 +475,74 @@ final class AppQueueExtractionProvider: QueueExtractionProvider {
                     sourceID: sourceID, content: outcome.markdown, package: producer,
                     origin: .transcript, toolVersion: nil,
                     sourceVersionID: initialVersion.id, note: nil)
+                // Issue #1379: best-effort agent cleanup when the package's
+                // registration declares the claim. The raw transcript above
+                // is already canonical; a cleanup failure is logged and the
+                // extraction item still completes successfully (no retry in
+                // v1 — the manual Transcribe button re-runs both).
+                await runTranscriptCleanupIfClaimed(
+                    store: store, sourceID: sourceID)
                 return QueueExtractionOutputReference(versionID: version.id.rawValue)
             } catch {
                 DebugLog.store("AppQueueExtractionProvider: package transcript write failed (source=\(sourceID.rawValue)): \(error)")
                 throw error
             }
+        }
+    }
+
+    /// The manifest-claimed cleanup pass (issue #1379). Runs in the SAME
+    /// extraction task, after the raw transcript is canonical. The claim is
+    /// registration data — an active claim on the source's stored MIME —
+    /// never a kind comparison. Best-effort on purpose: every failure path
+    /// logs through DebugLog and returns; the raw head stays canonical.
+    private func runTranscriptCleanupIfClaimed(
+        store: WikiStoreModel,
+        sourceID: SourceID
+    ) async {
+        guard let cleanupAgent = transcriptCleanupAgent else { return }
+        // No claim (or an ambiguous claim set) → nothing to do, silently:
+        // the claim's absence is the normal case for every other package.
+        guard let source = store.sources.first(where: { $0.id == sourceID }),
+              let mimeType = source.mimeType,
+              store.registeredExtractionInputs.wantsAgentCleanup(
+                  forNormalizedMIME: mimeType) else { return }
+        // Clean from the just-landed head so the pass always sees the exact
+        // canonical bytes.
+        let rawHead: SourceMarkdownVersion?
+        do {
+            rawHead = try store.internalStore.processedMarkdownHead(sourceID: sourceID)
+        } catch {
+            DebugLog.extraction("Transcript cleanup skipped: raw head unreadable (source=\(sourceID.rawValue)): \(error)")
+            return
+        }
+        guard let rawTranscript = rawHead?.content,
+              rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        else {
+            DebugLog.extraction("Transcript cleanup skipped: raw transcript empty (source=\(sourceID.rawValue))")
+            return
+        }
+        let cleaned: String
+        do {
+            cleaned = try await cleanupAgent.clean(rawTranscript: rawTranscript)
+        } catch {
+            DebugLog.extraction("Transcript cleanup failed; raw transcript stays canonical (source=\(sourceID.rawValue)): \(error)")
+            return
+        }
+        // An unchanged output needs no second version — the raw head is
+        // already the cleaned text.
+        guard cleaned != rawTranscript else { return }
+        do {
+            // Append semantics parent the cleaned copy to the current head
+            // (the raw transcript), which stays in history. The technique
+            // marker is how the alternatives UI surfaces the producer; the
+            // note names the pass.
+            _ = try store.internalStore.appendProcessedMarkdown(
+                sourceID: sourceID, content: cleaned,
+                origin: .transcript,
+                note: "auto transcript cleanup",
+                technique: "transcript-cleanup")
+        } catch {
+            DebugLog.extraction("Transcript cleanup append failed; raw transcript stays canonical (source=\(sourceID.rawValue)): \(error)")
         }
     }
 

@@ -292,6 +292,59 @@ struct AgentPromptContractTests {
         }
     }
 
+    // MARK: - Canonical source citation targets (#1381)
+
+    /// The executor sees both staged filenames and bare source IDs. Citations
+    /// must use the bare IDs because staged filenames are not canonical source
+    /// references and can include a slug prefix.
+    @Test func executorCitationsUseBareSourceIDs() {
+        for (copy, origin) in [
+            (canonical("ingest-executor.md"), "prompts/ingest-executor.md"),
+            (bundled("ingest-executor.md"), "Resources/Prompts/ingest-executor.md"),
+        ] {
+            guard let executor = copy else {
+                Issue.record("missing prompt: \(origin)")
+                continue
+            }
+            #expect(executor.contains("Use the bare source ID from this list"),
+                    "\(origin): citations must use the injected bare source IDs")
+            #expect(executor.contains("Do NOT use the staged source filename"),
+                    "\(origin): citations must reject staged filenames")
+            #expect(executor.contains("slug--ULID"),
+                    "\(origin): the staged filename failure mode must stay explicit")
+        }
+    }
+
+    // MARK: - Lint citation targets (#1381)
+
+    /// Lint repairs source links and must write canonical SourceIDs rather than
+    /// staged filenames or filesystem paths.
+    @Test func lintCitationsUseBareSourceIDs() {
+        for (copy, origin) in [
+            (canonical("lint-page-task.md"), "prompts/lint-page-task.md"),
+            (bundled("lint-page-task.md"), "Resources/Prompts/lint-page-task.md"),
+        ] {
+            guard let lintPrompt = copy else {
+                Issue.record("missing prompt: \(origin)")
+                continue
+            }
+            #expect(lintPrompt.contains("bare canonical SourceID"),
+                    "\(origin): lint citations must use canonical source IDs")
+            #expect(lintPrompt.contains("first `id` column from `wikictl source list`"),
+                    "\(origin): lint must identify the canonical source ID field")
+            #expect(lintPrompt.contains("display name"),
+                    "\(origin): lint citations must reject display names")
+            #expect(lintPrompt.contains("staged `slug--ULID` filename"),
+                    "\(origin): lint citations must reject staged filenames")
+            #expect(lintPrompt.contains("filesystem path"),
+                    "\(origin): lint citations must reject filesystem paths")
+            #expect(lintPrompt.contains("Audit every `[[source:…]]` citation"),
+                    "\(origin): lint must audit citations that preflight does not flag")
+            #expect(lintPrompt.contains("preserve its fragment, quote, or alias"),
+                    "\(origin): citation repair must preserve link context")
+        }
+    }
+
     // MARK: - Job-local supporting sources (#1370)
 
     /// The planner may name ONLY this task's staged files in
