@@ -335,10 +335,15 @@ private final class LegacyExtractionServices: ExtractionServices {
         case .acp:
             // An absent provider is an unavailable selection: fail closed
             // instead of substituting the retired in-process adapter.
+            // #1368: resolve the login-shell PATH ONCE here — it both finds
+            // the provider's command and rides the extraction profile into
+            // the child, so this legacy seam's spawns match production.
+            let loginShellPATH = await PathPreflight.loginShellPATH()
             guard let provider = ACPExtractionClient.resolveProvider(
                 containerDirectory: containerDirectory,
                 acpProviderId: configuration.acpProviderId,
-                acpCredentialStore: acpCredentialStore) else {
+                acpCredentialStore: acpCredentialStore,
+                searchPath: loginShellPATH) else {
                 throw ExtractionServicesError.unavailable
             }
             extractor = provider
@@ -440,6 +445,27 @@ public final class ExtractionCoordinator {
         case .docx:
             do {
                 return .docx(try await prepareDOCX())
+            } catch {
+                DebugLog.extraction(
+                    "Import auto-extraction could not prepare an extractor for kind \(kind.rawValue): \(error.localizedDescription)")
+                return nil
+            }
+        case .html:
+            do {
+                let extractor = try await prepareHTML(backendOverride: nil)
+                // Import-time conversion runs installed-package selections
+                // only. A built-in execution floor (the tag-based adapter a
+                // nil selection resolves to) or an explicit disable never
+                // converts at import — with the reviewed package removed the
+                // preparation above fails closed, so removal lands the
+                // source verbatim and the manual Extract button stays the
+                // surfaced retry (issue #1380's fallback contract).
+                guard extractor is any ProcessPackageProvenanceProviding else {
+                    DebugLog.extraction(
+                        "Import auto-extraction skipped: the route selection resolved to a non-package extractor (kind \(kind.rawValue))")
+                    return nil
+                }
+                return .html(extractor)
             } catch {
                 DebugLog.extraction(
                     "Import auto-extraction could not prepare an extractor for kind \(kind.rawValue): \(error.localizedDescription)")

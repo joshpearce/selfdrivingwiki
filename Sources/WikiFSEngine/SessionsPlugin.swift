@@ -160,12 +160,19 @@ extension AppProcessProfileOwner {
         // registrations' declared inputs make registered zip-container
         // content (a `.docx`) recognizable at ingestion, and package-only
         // kinds convert on import instead of waiting for a manual Extract
-        // tap. The kinds set is DERIVED, never enumerated: an active
-        // registration claims the kind AND the host has no backend of its
-        // own for it (hostBackendKinds reads the choice categories, not the
-        // route display rows). A future package-only kind starts converting
-        // on import with no host-policy change — only its typed adapter
-        // joins `prepareImportExtractor`.
+        // tap. Two derivation rules, both data-driven:
+        // 1. package-only kinds — an active registration claims the kind AND
+        //    the host has no backend of its own for it (hostBackendKinds
+        //    reads the choice categories, not the route display rows);
+        // 2. bundled route data selecting import conversion for a
+        //    host-backend kind (`default-routes.json` routeAutoExtraction;
+        //    HTML converts at ingest via the reviewed Defuddle package,
+        //    issue #1380). The claim still gates rule 2: removing the
+        //    package drops `text/html` from the claims and the source lands
+        //    verbatim as before the feature.
+        // The kinds set is DERIVED, never enumerated: a future package-only
+        // kind starts converting on import with no host-policy change — only
+        // its typed adapter joins `prepareImportExtractor`.
         let extractionCoordinator = ExtractionCoordinator(services: processServices.extraction)
         let registeredInputs = await processServices.extraction
             .registeredExtractionInputs()
@@ -177,8 +184,12 @@ extension AppProcessProfileOwner {
             DebugLog.store("Renderer catalog preparation failed during wiki startup: \(error)")
             model.registeredRendererSourceTypes = .none
         }
-        model.importAutoExtractionKinds = Set(registeredInputs.claims.map(\.kind))
+        let claimedKinds = Set(registeredInputs.claims.map(\.kind))
+        let packageOnlyKinds = claimedKinds
             .subtracting(ExtractorRouteHostCatalog.hostBackendKinds)
+        let dataSelectedKinds = claimedKinds
+            .intersection(ExtractorRouteDefaults.bundled.autoExtractKinds)
+        model.importAutoExtractionKinds = packageOnlyKinds.union(dataSelectedKinds)
         model.importExtractorProvider = { [extractionCoordinator] kind in
             await extractionCoordinator.prepareImportExtractor(kind: kind)
         }
@@ -274,10 +285,12 @@ public enum PerWikiRuntimePlugin {
                 }
                 let wikiID = WikiID(rawValue: config.wikiID)
                 let containerDirectory = URL(fileURLWithPath: config.containerDirectory, isDirectory: true)
+                let sharedGate = await MainActor.run {
+                    GenerationGate(laneLimits: LauncherAdmissionPolicy.laneLimits)
+                }
                 let launcherFactory = LauncherFactory { _ in
-                    let gate = GenerationGate(laneLimits: LauncherAdmissionPolicy.laneLimits)
                     let launcher = AgentLauncher(
-                        generationGate: gate,
+                        generationGate: sharedGate,
                         extractionCoordinator: ExtractionCoordinator(services: extractionServices),
                         providerServices: providerServices,
                         agentLoopService: agentLoopService)
@@ -297,7 +310,7 @@ public enum PerWikiRuntimePlugin {
                     // no legacy pdf2md subprocess for the agent seatbelt to
                     // deny (extraction runs through the registry's reviewed
                     // package plugins). The launcher default `{ nil }` stands.
-                    return LauncherPair(gate: gate, launcher: launcher)
+                    return LauncherPair(gate: sharedGate, launcher: launcher)
                 }
                 let changeStreamFactory = await MainActor.run {
                     BusSearchChangeStreamFactory(bus: eventBus)

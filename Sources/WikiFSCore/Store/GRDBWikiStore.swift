@@ -221,6 +221,12 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     /// writer queue.
     public var eventBus: WikiEventBus?
 
+    /// Test-only fault injection for terminal chat-turn writes. When set, the
+    /// next `finishPersistedChatTurn` throws instead of committing, which lets
+    /// tests prove that a failed cancellation keeps its row and claim and
+    /// remains retryable. Never set in production.
+    var failNextTerminalChatTurnWrite = false
+
     /// The wiki ID this store belongs to (stamped onto emitted events).
     /// Defaults to empty when the bus is nil (mirrors `SQLiteWikiStore`'s
     /// `localEvent` fallback).
@@ -6059,26 +6065,30 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         return NonEmptyProvenanceDeletionBlockers(blockers)
     }
 
+    /// Column list shared by `sourceOrigin(sourceID:)` and
+    /// `sourceOriginsBySource()` so the single and batched reads cannot
+    /// drift. Positional — `originFrom(row:)` maps indices 0–8; the batched
+    /// query appends the `sources.id` key at index 9. The trailing `runTitle`
+    /// subquery is the same one `pageOrigin` uses (#745): it resolves the
+    /// chat title for `chat:<id>` agents, NULL for other agent kinds.
+    /// Raw 'chat:' prefix stripping — format owned by
+    /// `PageAuthor.chat(_:).rawValue`. Do not change the SQL prefix without
+    /// updating PageAuthor too (#797).
+    static let sourceOriginCols = """
+    sv.id,
+    a.name, a.kind,
+    act.kind, act.plan, act.external_ref,
+    sv.external_identity, sv.fetched_at,
+    (SELECT c.title FROM chats c WHERE c.id = substr(a.name, 6) AND a.name LIKE 'chat:%')
+    """
+
     public func sourceOrigin(sourceID: SourceID) throws -> SourceOrigin? {
         try dbWriter.read { db in
-            // Same `runTitle` subquery as `pageOrigin` (#745) — resolves the
-            // chat title for `chat:<id>` agents; NULL for other agent kinds.
-            //
-            // Raw 'chat:' prefix stripping — format owned by
-            // `PageAuthor.chat(_:).rawValue`. Do not change the SQL prefix
-            // without updating PageAuthor too (#797).
-            let cols = """
-            sv.id,
-            a.name, a.kind,
-            act.kind, act.plan, act.external_ref,
-            sv.external_identity, sv.fetched_at,
-            (SELECT c.title FROM chats c WHERE c.id = substr(a.name, 6) AND a.name LIKE 'chat:%')
-            """
             // 1. Prefer the active ref.
             if let row = try Row.fetchOne(
                 db,
                 sql: """
-                SELECT \(cols)
+                SELECT \(Self.sourceOriginCols)
                 FROM refs r
                 JOIN source_versions sv ON sv.id = r.version_id
                 LEFT JOIN activities act ON act.id = sv.activity_id
@@ -6093,7 +6103,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             guard let row = try Row.fetchOne(
                 db,
                 sql: """
-                SELECT \(cols)
+                SELECT \(Self.sourceOriginCols)
                 FROM source_versions sv
                 LEFT JOIN activities act ON act.id = sv.activity_id
                 LEFT JOIN agents a ON a.id = act.agent_id
@@ -6102,6 +6112,41 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
                 arguments: [sourceID.rawValue]
             ) else { return nil }
             return Self.originFrom(row: row)
+        }
+    }
+
+    /// Batched `sourceOrigin(sourceID:)` for ALL sources in one query:
+    /// `[SourceID: SourceOrigin]`. Same shared column list, the same
+    /// refs-preferred (COALESCE MAX(id)) version resolution, and the same
+    /// `originFrom(row:)` mapper as the single-source read, so the two
+    /// cannot drift. The key column (`s.id`) is appended LAST (index 9) so
+    /// `originFrom(row:)`'s positional indices stay aligned. READ seam — no
+    /// mutate/emit. Enumeration must use THIS map, not per-source
+    /// `sourceOrigin` calls (N+1).
+    public func sourceOriginsBySource() throws -> [SourceID: SourceOrigin] {
+        try dbWriter.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+            SELECT \(Self.sourceOriginCols), s.id
+            FROM sources s
+            JOIN source_versions sv ON sv.source_id = s.id
+                AND sv.id = (
+                    SELECT COALESCE(
+                        (SELECT r.version_id FROM refs r
+                         WHERE r.kind = 'source-content' AND r.owner_id = s.id),
+                        (SELECT MAX(sv2.id) FROM source_versions sv2
+                         WHERE sv2.source_id = s.id)
+                    )
+                )
+            LEFT JOIN activities act ON act.id = sv.activity_id
+            LEFT JOIN agents a ON a.id = act.agent_id;
+            """)
+            var out: [SourceID: SourceOrigin] = [:]
+            out.reserveCapacity(rows.count)
+            for row in rows {
+                let sourceID: String = row[9]
+                out[SourceID(rawValue: sourceID)] = Self.originFrom(row: row)
+            }
+            return out
         }
     }
 
@@ -7301,6 +7346,42 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             toolVersion: toolVersion, sourceVersionID: sourceVersionID, note: note)
     }
 
+    /// Read-only preflight for CLI tools enqueueing on-device speech: does
+    /// this wiki contain `sourceID`, and is it a YouTube video source (the
+    /// explicit speech scope)? Opens a read-only connection; throws when the
+    /// store cannot be read. Implemented here so the store boundary stays
+    /// inside its owning file (see the Cordis boundary contract).
+    public static func youtubeSpeechPreflight(
+        readOnlyURL: URL, sourceID: SourceID
+    ) throws -> Bool {
+        let store = try GRDBWikiStore(readOnlyURL: readOnlyURL)
+        defer { store.close() }
+        let summaries = try store.listSources()
+        guard summaries.contains(where: { $0.id == sourceID }) else {
+            return false
+        }
+        let origin = try store.sourceOrigin(sourceID: sourceID)
+        return origin?.provider == SourceProvider.youtube
+    }
+
+    /// Append one HOST-produced on-device speech transcript. The speech floor
+    /// runs in the host process, so the producer is the typed host-speech
+    /// identity (engine, locale, exact acquisition fetcher) — never
+    /// `.installedPackage`, never an agent-cleanup claim. The transcript
+    /// REQUIRES the source's immutable initial version (the same lineage
+    /// rule as a package transcript) and lands as ONE `.transcript` version
+    /// in one store transaction with its derived output reference.
+    public func appendHostSpeechTranscript(
+        sourceID: SourceID, content: String,
+        producer: ExtractionHostSpeechProducer,
+        sourceVersionID: SourceVersionID
+    ) throws -> SourceMarkdownVersion {
+        try appendDerivedMarkdown(
+            sourceID: sourceID, content: content, origin: .transcript,
+            producer: .hostSpeech(producer), providerID: nil, modelID: nil,
+            toolVersion: nil, sourceVersionID: sourceVersionID, note: nil)
+    }
+
     /// `db:`-taking HEAD read for use inside `mutate` (cannot call the public
     /// `processedMarkdownHead` — it re-enters `dbWriter.read` and deadlocks).
 
@@ -7387,7 +7468,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         case .backend:
             modelID = modelVersion.map(ModelID.init(rawValue:))
             toolVersion = nil
-        case .tool, .legacy, .installedPackage:
+        case .tool, .legacy, .installedPackage, .hostSpeech:
             modelID = nil
             toolVersion = modelVersion
         }
@@ -10368,6 +10449,44 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     }
 
     @discardableResult
+    public func cancelUnclaimedPersistedChatTurn(chatID: ChatID, turnID: ChatTurnID) throws -> PersistedChatTurn? {
+        let result: (turn: PersistedChatTurn?, didMutate: Bool) = try mutate(event: { result in
+            result.didMutate ? self.localEvent(.chat, id: chatID.rawValue, change: .updated) : nil
+        }) { db in
+            let finishedAt = Date()
+            try db.execute(sql: """
+            UPDATE chat_turns
+            SET state = ?, terminal_message = ?, finished_at = ?
+            WHERE chat_id = ? AND turn_id = ? AND state = ? AND claim_id IS NULL;
+            """, arguments: [
+                ChatTurnPersistenceState.cancelled.rawValue,
+                "Cancelled before provider claim",
+                finishedAt.timeIntervalSince1970,
+                chatID.rawValue,
+                turnID.rawValue,
+                ChatTurnPersistenceState.queued.rawValue,
+            ])
+            guard db.changesCount > 0 else { return (nil, false) }
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                SELECT chat_id, turn_id, command_id, ordinal, state, user_text, context_refs_json,
+                       submitted_at, edited_at, claim_id, claimed_at, provider_submitted_at,
+                       provider_session_id, terminal_message, provider_id, model_id, finished_at,
+                       input_tokens, output_tokens, thought_tokens, cache_read_tokens,
+                       cache_write_tokens, cost_decimal, currency
+                FROM chat_turns WHERE chat_id = ? AND turn_id = ?;
+                """,
+                arguments: [chatID.rawValue, turnID.rawValue]
+            ) else {
+                throw WikiStoreError.unexpected("failed to reload cancelled persisted turn")
+            }
+            return (try Self.readPersistedChatTurn(from: row), true)
+        }
+        return result.turn
+    }
+
+    @discardableResult
     public func claimNextPersistedChatTurn(
         chatID: ChatID,
         claimID: ChatTurnClaimID,
@@ -10543,6 +10662,10 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
     ) throws -> PersistedChatTurn {
         guard [.completed, .cancelled, .failed].contains(state) else {
             throw WikiStoreError.unexpected("invalid terminal persisted turn state")
+        }
+        if failNextTerminalChatTurnWrite {
+            failNextTerminalChatTurnWrite = false
+            throw WikiStoreError.unexpected("injected terminal chat-turn write failure")
         }
         let result: (turn: PersistedChatTurn, didMutate: Bool) = try mutate(event: { result in
             result.didMutate ? self.localEvent(.chat, id: chatID.rawValue, change: .updated) : nil
@@ -12116,6 +12239,10 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             name = "extractor-package:\(package.packageID)"
             version = package.version
             externalRef = package.digest
+        case .hostSpeech(let speech):
+            name = "\(ExtractionHostSpeechProducer.technique):\(speech.engine)"
+            version = speech.localeID
+            externalRef = speech.acquisitionFetcher.digest
         }
         if let id = try String.fetchOne(
             db,
@@ -12171,6 +12298,17 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
             }
             // The package may report model metadata. It is not a provider model
             // and therefore does not use `modelID`.
+        case .hostSpeech(let speech):
+            if providerID != nil || modelID != nil || toolVersion != nil {
+                throw AppendDerivedMarkdownError.providerFieldsUnsupportedForLocalTool
+            }
+            guard speech.engine.isEmpty == false,
+                  speech.localeID.isEmpty == false,
+                  speech.acquisitionFetcher.packageID.isEmpty == false,
+                  speech.acquisitionFetcher.digest.isEmpty == false,
+                  speech.acquisitionFetcher.protocolRevision.rawValue > 0 else {
+                throw AppendDerivedMarkdownError.invalidHostSpeechProducer
+            }
         }
     }
 
@@ -12181,6 +12319,7 @@ public final class GRDBWikiStore: WikiStore, LegacyRendererWikiEnablementCompati
         case .tool(let tool): return tool.rawValue
         case .legacy(let rawTechnique): return rawTechnique
         case .installedPackage(let package): return "extractor-package:\(package.packageID)"
+        case .hostSpeech: return ExtractionHostSpeechProducer.technique
         }
     }
 
